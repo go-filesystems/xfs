@@ -36,9 +36,9 @@ type readerWriterAt interface {
 // blockBackend is the interface backing xfsFS. The XFS read /
 // write paths already speak io.ReaderAt + io.WriterAt; this
 // interface adds the lifecycle + capacity methods (Sync / Size
-// / Truncate / Close) needed by GrowTo and Close so any
-// layered block source (LUKS Device, qcow2 wrapper, in-memory
-// fixture) can back an XFS filesystem.
+// / Truncate / Close) needed by Grow and Close so any layered
+// block source (LUKS Device, qcow2 wrapper, in-memory fixture)
+// can back an XFS filesystem.
 type blockBackend interface {
 	io.ReaderAt
 	io.WriterAt
@@ -91,14 +91,27 @@ var (
 	_ filesystem.Truncater      = (*xfsFS)(nil)
 	_ filesystem.MetadataSetter = (*xfsFS)(nil)
 	_ filesystem.Grower         = (*xfsFS)(nil)
+	_ filesystem.Resizer        = (*xfsFS)(nil)
 )
 
 // FS is the public interface returned by Open. Extends
 // filesystem.Filesystem with the XFS-specific operations — image
-// resize (GrowTo) plus inode metadata setters and the rich
-// ExtendedStat reader.
+// resize (Grow/Resize/GrowTo) plus inode metadata setters and the
+// rich ExtendedStat reader.
 type FS interface {
 	filesystem.Filesystem
+	// Grow is the canonical "extend to newSizeBytes" entry point. It
+	// requires newSizeBytes to be at least the current filesystem size
+	// and to align to a whole number of allocation groups (each AG =
+	// sb_agblocks × blockSize). Equal sizes are a no-op.
+	Grow(newSizeBytes int64) error
+	// Resize routes the uniform filesystem.Resizer call to Grow when
+	// expanding; shrink is intentionally not supported in XFS (matches
+	// the kernel + xfsprogs semantics) and returns
+	// filesystem.ErrShrinkUnsupported when newSizeBytes < current.
+	Resize(newSizeBytes int64) error
+	// GrowTo is the historical name kept for callers that target the
+	// filesystem.Grower interface. It is a thin alias of Grow.
 	GrowTo(newSizeBytes int64) error
 
 	ExtendedStat(path string) (*InodeStat, error)
@@ -145,11 +158,26 @@ func OpenFromDevice(dev BlockBackend, partIndex int) (FS, error) {
 // Close releases the file handle.
 func (fs *xfsFS) Close() error { return fs.f.Close() }
 
-// GrowTo expands the filesystem to the absolute size newSizeBytes. The
-// size must be larger than the current filesystem size and an integral
-// number of allocation groups (AGs). The method truncates the backing
-// file and writes per-AG metadata and an updated superblock.
-func (fs *xfsFS) GrowTo(newSizeBytes int64) error {
+// Grow extends the filesystem to the absolute size newSizeBytes,
+// matching the canonical xfs_growfs semantics:
+//
+//  1. newSizeBytes must be a multiple of the filesystem block size and
+//     of the per-AG byte size (sb_agblocks × blockSize). Partial-AG
+//     growth is rejected — the XFS spec only adds whole AGs.
+//  2. newSizeBytes < current size returns an error. The kernel's XFS
+//     and xfsprogs both forbid shrink; use Resize() for the typed
+//     filesystem.ErrShrinkUnsupported variant.
+//  3. The backing file is extended to newSizeBytes via Truncate.
+//  4. For each newly-appended AG, the per-AG metadata is written
+//     (secondary superblock at block 0, AGF/AGI at blocks 1/2, bno/cnt/
+//     inobt leaves at blocks 3/4/5).
+//  5. The primary superblock's sb_agcount is rewritten and re-CRC'd.
+//
+// Concurrency: takes the FS write lock for the duration of the call.
+// On any I/O failure mid-grow the on-disk state is left as far as the
+// operation got; callers may re-run Grow to retry — the writer is
+// idempotent on a per-AG basis (each AG is initialised from scratch).
+func (fs *xfsFS) Grow(newSizeBytes int64) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
@@ -163,12 +191,12 @@ func (fs *xfsFS) GrowTo(newSizeBytes int64) error {
 		return nil
 	}
 	if newSizeBytes < curSize {
-		return fmt.Errorf("xfs: shrinking filesystem not supported")
+		return fmt.Errorf("xfs: grow: size %d < current size %d (shrink not supported)", newSizeBytes, curSize)
 	}
 
 	agSize := int64(fs.sb.agBlocks) * blockSize
 	if newSizeBytes%agSize != 0 {
-		return fmt.Errorf("xfs: grow: size %d is not a multiple of AG size %d", newSizeBytes, agSize)
+		return fmt.Errorf("xfs: grow: size %d is not a multiple of AG size %d (XFS only adds whole AGs)", newSizeBytes, agSize)
 	}
 	newAgCount := uint32(newSizeBytes / agSize)
 
@@ -177,19 +205,47 @@ func (fs *xfsFS) GrowTo(newSizeBytes int64) error {
 		return fmt.Errorf("xfs: grow: truncate: %w", err)
 	}
 
-	// Initialize each newly appended AG.
+	// Initialize each newly appended AG (per-AG metadata at blocks 1..5
+	// + secondary SB at block 0).
 	for ag := fs.sb.agCount; ag < newAgCount; ag++ {
 		if err := fmtWriteAG(fs.f, fs.sb, ag, fs.sb.uuid); err != nil {
 			return fmt.Errorf("xfs: grow: write AG %d: %w", ag, err)
 		}
+		if err := fmtWriteSecondarySB(fs.f, fs.partOffset, fs.sb, ag, newAgCount, fs.sb.uuid, fs.sb.label); err != nil {
+			return fmt.Errorf("xfs: grow: write AG %d secondary SB: %w", ag, err)
+		}
 	}
 
-	// Rewrite primary superblock with updated AG count.
+	// Rewrite primary superblock with the updated AG count and re-CRC.
 	if err := fmtWriteSuperblock(fs.f, fs.sb, newAgCount, fs.sb.uuid, fs.sb.label); err != nil {
 		return fmt.Errorf("xfs: grow: write superblock: %w", err)
 	}
+	if err := fs.f.Sync(); err != nil {
+		return fmt.Errorf("xfs: grow: sync: %w", err)
+	}
 	fs.sb.agCount = newAgCount
 	return nil
+}
+
+// GrowTo is the historical name for Grow and is kept for callers that
+// target the filesystem.Grower interface. New code should call Grow.
+func (fs *xfsFS) GrowTo(newSizeBytes int64) error {
+	return fs.Grow(newSizeBytes)
+}
+
+// Resize implements filesystem.Resizer. For XFS shrink is intentionally
+// not supported (matching the kernel + xfsprogs semantics); the function
+// returns filesystem.ErrShrinkUnsupported when newSizeBytes is smaller
+// than the current filesystem size. Equal sizes are a no-op; larger
+// sizes route to Grow.
+func (fs *xfsFS) Resize(newSizeBytes int64) error {
+	fs.mu.RLock()
+	curSize := int64(fs.sb.agCount) * int64(fs.sb.agBlocks) * int64(fs.sb.blockSize)
+	fs.mu.RUnlock()
+	if newSizeBytes < curSize {
+		return filesystem.ErrShrinkUnsupported
+	}
+	return fs.Grow(newSizeBytes)
 }
 
 // ReadFile reads and returns the full contents of the regular file at path.
