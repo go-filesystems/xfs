@@ -290,6 +290,17 @@ func fmtWriteRootInode(f fmtFile, sb *superblock) error {
 // ──────────────────── Superblock writer ────────────────────────────────────
 
 func fmtWriteSuperblock(f fmtFile, sb *superblock, agCount uint32, uuid [16]byte, label string) error {
+	buf := buildSuperblockBuffer(sb, agCount, uuid, label)
+	if _, err := f.WriteAt(buf, 0); err != nil {
+		return fmt.Errorf("write superblock: %w", err)
+	}
+	return nil
+}
+
+// buildSuperblockBuffer assembles the 512-byte on-disk superblock buffer
+// (v5, CRC-stamped). Shared by the primary-SB writer and the per-AG
+// secondary-SB writer so the two never drift.
+func buildSuperblockBuffer(sb *superblock, agCount uint32, uuid [16]byte, label string) []byte {
 	buf := make([]byte, 512)
 	be := binary.BigEndian
 
@@ -316,9 +327,32 @@ func fmtWriteSuperblock(f fmtFile, sb *superblock, agCount uint32, uuid [16]byte
 
 	// CRC (v5 only, __le32 at offset 224, covers bytes [0, 224)).
 	updateCRC(buf, sbOffCRC, sbCRCLen)
+	return buf
+}
 
-	if _, err := f.WriteAt(buf, 0); err != nil {
-		return fmt.Errorf("write superblock: %w", err)
+// writerAtOnly is the minimal writer interface fmtWriteSecondarySB needs.
+// Both fmtFile (used by Format) and the blockBackend used by xfsFS.Grow
+// satisfy it without requiring the lifecycle methods.
+type writerAtOnly interface {
+	WriteAt(p []byte, off int64) (int, error)
+}
+
+// fmtWriteSecondarySB writes a secondary superblock at block 0 of AG
+// `ag` (absolute byte offset partOff + ag×agBlocks×blockSize). XFS keeps
+// a secondary SB in every AG so xfs_repair and the kernel can recover
+// from a corrupted primary, and SetLabel iterates them to keep the label
+// consistent. Grow uses this for each newly-appended AG.
+//
+// Calling with ag == 0 is a no-op: AG 0's "secondary" SB is the primary
+// itself, written by fmtWriteSuperblock.
+func fmtWriteSecondarySB(w writerAtOnly, partOff int64, sb *superblock, ag uint32, agCount uint32, uuid [16]byte, label string) error {
+	if ag == 0 {
+		return nil
+	}
+	buf := buildSuperblockBuffer(sb, agCount, uuid, label)
+	off := partOff + int64(ag)*int64(sb.agBlocks)*int64(sb.blockSize)
+	if _, err := w.WriteAt(buf, off); err != nil {
+		return fmt.Errorf("write secondary SB AG %d: %w", ag, err)
 	}
 	return nil
 }
