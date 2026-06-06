@@ -40,6 +40,7 @@ import (
 	"time"
 
 	disk_qcow2 "github.com/go-diskimages/qcow2"
+	filesystem "github.com/go-filesystems/interface"
 	filesystem_xfs "github.com/go-filesystems/xfs"
 )
 
@@ -781,6 +782,106 @@ func TestStress_AGParallelism(t *testing.T) {
 // the whole extent list on each WriteFile, so growing the file in steps
 // here just exercises the realloc-and-write path repeatedly — the read
 // after each step must still verify.
+// TestStress_GrowCycle exercises the Grow() path under read/write
+// pressure: start with a small image, write a working set, Grow,
+// keep writing into the freshly-extended AGs, then verify that every
+// file produced before AND after the grow is readable with byte-exact
+// content. Validates that Grow() does not perturb pre-existing AG
+// metadata while extending the filesystem geometry.
+//
+// Skip-gated under -short to keep the default suite tight.
+func TestStress_GrowCycle(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping grow-cycle in -short mode")
+	}
+
+	// Start at 2 AGs and grow to 6 AGs in two steps (2 -> 4 -> 6).
+	img := formatImage(t, 2)
+	fs := openFS(t, img)
+
+	type fileSpec struct {
+		path string
+		body []byte
+	}
+	var files []fileSpec
+
+	writeAndRecord := func(prefix string, count int) {
+		t.Helper()
+		for i := 0; i < count; i++ {
+			p := fmt.Sprintf("/%s-%03d.bin", prefix, i)
+			body := genPRBS(uint64(i)+uint64(len(files))*1_000_000, 1024)
+			if err := fs.WriteFile(p, body, 0o644); err != nil {
+				t.Fatalf("WriteFile %s: %v", p, err)
+			}
+			files = append(files, fileSpec{path: p, body: body})
+		}
+	}
+
+	verifyAll := func(stage string) {
+		t.Helper()
+		for _, f := range files {
+			got, err := fs.ReadFile(f.path)
+			if err != nil {
+				t.Fatalf("%s: ReadFile %s: %v", stage, f.path, err)
+			}
+			if !bytes.Equal(got, f.body) {
+				t.Fatalf("%s: %s body drift (got %d / want %d bytes; sha256 mismatch)",
+					stage, f.path, len(got), len(f.body))
+			}
+		}
+	}
+
+	// Phase 1 — populate the original 2 AGs.
+	writeAndRecord("pre", 20)
+	verifyAll("pre-grow")
+
+	// Phase 2 — grow to 4 AGs and write some more.
+	if err := fs.Grow(agSize * 4); err != nil {
+		t.Fatalf("Grow(4 AGs): %v", err)
+	}
+	writeAndRecord("mid", 20)
+	verifyAll("after-first-grow")
+
+	// Phase 3 — grow again, this time to 6 AGs.
+	if err := fs.Grow(agSize * 6); err != nil {
+		t.Fatalf("Grow(6 AGs): %v", err)
+	}
+	writeAndRecord("post", 20)
+	verifyAll("after-second-grow")
+
+	// Sanity: the on-disk file is exactly 6 AGs and a re-Open sees the
+	// same agcount (round-trips through readSuperblock).
+	st, err := os.Stat(img)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if st.Size() != agSize*6 {
+		t.Fatalf("image size = %d, want %d", st.Size(), agSize*6)
+	}
+	_ = fs.Close()
+	fs2 := openFS(t, img)
+	if entries, err := fs2.ListDir("/"); err != nil {
+		t.Fatalf("post-reopen ListDir: %v", err)
+	} else if len(entries) != len(files) {
+		t.Fatalf("post-reopen ListDir: %d entries, want %d", len(entries), len(files))
+	}
+
+	t.Logf("grow-cycle: 2 AG -> 4 AG -> 6 AG with %d files written total", len(files))
+}
+
+// TestStress_ResizeShrinkSentinel asserts the sentinel returned by
+// Resize on a shrink request matches filesystem.ErrShrinkUnsupported
+// — the contract the generic diskimage CLI dispatches on.
+func TestStress_ResizeShrinkSentinel(t *testing.T) {
+	img := formatImage(t, 2)
+	fs := openFS(t, img)
+
+	err := fs.Resize(agSize) // 2 -> 1 AG = shrink
+	if !errors.Is(err, filesystem.ErrShrinkUnsupported) {
+		t.Fatalf("Resize(shrink) = %v, want ErrShrinkUnsupported", err)
+	}
+}
+
 func TestStress_BTreeDepth(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping btree-depth in -short mode")
