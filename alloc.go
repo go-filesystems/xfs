@@ -2,9 +2,17 @@ package filesystem_xfs
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 )
+
+// errInobtFull is returned by inobtFindFree when every record in the inobt
+// has freecount==0. allocInode uses this sentinel to decide whether to
+// trigger growInobt — other errors (I/O, corruption) propagate as-is so
+// the caller can distinguish "out of inodes, grow the chunk pool" from
+// "the on-disk inobt is unreadable".
+var errInobtFull = errors.New("xfs: inobt has no free inodes")
 
 // AGF v5 field offsets (big-endian unless noted).
 const (
@@ -67,6 +75,16 @@ var allocBnoInsertRecord = bnoInsertRecord
 var allocCntInsertRecord = cntInsertRecord
 var allocInobtFindFree = inobtFindFree
 var allocInobtFindRecord = inobtFindRecord
+var allocGrowInobt = growInobt
+var allocAllocBlocks = allocBlocks
+var allocWriteRawBlock = writeRawBlock
+
+// inobtChunkInodes is the number of inodes per inobt record. The XFS spec
+// always uses 64-inode chunks (the irFree bitmap is 64 bits wide). With
+// blockSize=4096 and inopBlock=8 (inodeSize=512), a chunk occupies 8
+// filesystem blocks. growInobt() always allocates an 8-block run and
+// initialises all 64 inode slots so xfs_repair sees a well-formed chunk.
+const inobtChunkInodes = 64
 
 // agfBlock reads the AGF block for allocation group ag.
 func agfBlock(r io.ReaderAt, partOff int64, sb *superblock, ag uint32) ([]byte, error) {
@@ -497,6 +515,14 @@ func allocBTreeInsert(rw readerWriterAt, partOff int64, sb *superblock, ag uint3
 
 // allocInode allocates a free inode from allocation group ag using the inobt
 // B-tree. Returns the absolute inode number.
+//
+// When every inobt record in AG ag is full, allocInode grows the inobt by
+// allocating a fresh 64-inode chunk (8 filesystem blocks) via the bno/cnt
+// B-trees, pre-initialising every inode slot with a valid v3 header, and
+// inserting a new record in the inobt leaf. The newly-added chunk's first
+// inode is then returned to the caller. This lifts the writer's previous
+// 7-live-files cap (which came from the single 8-inode chunk Format()
+// seeds) to ~127 chunks per AG = ~8128 live inodes per AG.
 func allocInode(rw readerWriterAt, partOff int64, sb *superblock, ag uint32) (uint64, error) {
 	agiBuf, err := allocAGIBlock(rw, partOff, sb, ag)
 	if err != nil {
@@ -509,7 +535,29 @@ func allocInode(rw readerWriterAt, partOff int64, sb *superblock, ag uint32) (ui
 
 	leafRel, leaf, recIdx, err := allocInobtFindFree(rw, partOff, sb, ag, inobtRoot, inobtLevel)
 	if err != nil {
-		return 0, fmt.Errorf("xfs: allocInode ag=%d: %w", ag, err)
+		// Only grow when find-free reports the inobt is full. Other errors
+		// (I/O, corruption) propagate directly so the caller doesn't mask a
+		// real failure as a grow attempt.
+		if !errors.Is(err, errInobtFull) {
+			return 0, fmt.Errorf("xfs: allocInode ag=%d: %w", ag, err)
+		}
+		// Every chunk is full: grow the inobt with a new 64-inode chunk and
+		// retry. growInobt persists the updated AGI/inobt to disk, so we
+		// re-read both before retrying.
+		if gerr := allocGrowInobt(rw, partOff, sb, ag); gerr != nil {
+			return 0, fmt.Errorf("xfs: allocInode ag=%d: grow inobt: %w", ag, gerr)
+		}
+		// Re-read AGI: growInobt rewrote agiBuf on disk.
+		agiBuf, err = allocAGIBlock(rw, partOff, sb, ag)
+		if err != nil {
+			return 0, err
+		}
+		inobtRoot = be.Uint32(agiBuf[agiOffRoot:])
+		inobtLevel = int(be.Uint32(agiBuf[agiOffLevel:]))
+		leafRel, leaf, recIdx, err = allocInobtFindFree(rw, partOff, sb, ag, inobtRoot, inobtLevel)
+		if err != nil {
+			return 0, fmt.Errorf("xfs: allocInode ag=%d after grow: %w", ag, err)
+		}
 	}
 
 	hdrSize := sb.agBTreeHdrSize()
@@ -589,7 +637,7 @@ func inobtFindFree(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, 
 			}
 			rsib := binary.BigEndian.Uint32(blk[12:])
 			if rsib == 0xFFFFFFFF {
-				return 0, nil, 0, fmt.Errorf("no free inodes in AG %d inobt", ag)
+				return 0, nil, 0, fmt.Errorf("AG %d: %w", ag, errInobtFull)
 			}
 			agRel = rsib
 			continue
@@ -678,4 +726,131 @@ func inobtFindRecord(rw readerWriterAt, partOff int64, sb *superblock, ag uint32
 		agRel = binary.BigEndian.Uint32(blk[ptrOff:])
 		level--
 	}
+}
+
+// growInobt extends the inobt of AG ag by one fresh 64-inode chunk. It:
+//  1. allocates 8 contiguous blocks (= inobtChunkInodes/inopBlock) via the
+//     bno/cnt B-trees;
+//  2. initialises all 64 inode slots in those blocks with valid v3 headers
+//     (mode=0 means "free") so xfs_repair can walk the chunk;
+//  3. inserts a new inobt record (startIno, freeCount=64, irFree=all-ones)
+//     into the inobt leaf in sorted order;
+//  4. updates the AGI count + freeCount fields to reflect the +64 inodes.
+//
+// growInobt does NOT take an inode for the caller — allocInode will do a
+// fresh find-free pass on the now-non-empty inobt and return the first
+// inode of the new chunk.
+//
+// Limitations of this initial implementation: only single-leaf inobts are
+// supported (inobtLevel must be 1, i.e. the root is the leaf). A future
+// extension will split the leaf when it fills (~252 chunks/AG, plenty of
+// headroom before that ceiling).
+func growInobt(rw readerWriterAt, partOff int64, sb *superblock, ag uint32) error {
+	be := binary.BigEndian
+
+	// blocksPerChunk = 64 / inopBlock (typically 64/8 = 8). Guard inopBlock
+	// up front: division by zero would panic, and any inopBlock > 64 would
+	// produce blocksPerChunk == 0 (so we can't back the chunk at all).
+	if sb.inopBlock == 0 || sb.inopBlock > inobtChunkInodes {
+		return fmt.Errorf("xfs: growInobt: invalid inopBlock %d", sb.inopBlock)
+	}
+	blocksPerChunk := uint32(inobtChunkInodes) / uint32(sb.inopBlock)
+
+	// Allocate the backing blocks. Best-effort same-AG; the caller (allocInode)
+	// retries other AGs if this fails.
+	absStart, err := allocAllocBlocks(rw, partOff, sb, ag, blocksPerChunk)
+	if err != nil {
+		return fmt.Errorf("growInobt: alloc %d blocks: %w", blocksPerChunk, err)
+	}
+
+	// Compute the chunk's AG-relative starting inode number. startIno must
+	// not overlap the existing root chunk's 64-wide window; in practice
+	// the bno/cnt allocator hands out blocks well past the root inode block
+	// so startIno >= 56 ≥ 48+8 always, but the absolute spec window is 64.
+	agBlockBase := uint32(absStart % uint64(sb.agBlocks))
+	startIno := agBlockBase * uint32(sb.inopBlock)
+
+	// Pre-initialise every inode in the chunk. xfs_repair walks the chunk's
+	// inodes by physical block + slot, so each slot must hold a v3 inode
+	// header with the correct on-disk inode number and a valid CRC. mode=0
+	// marks the inode as free (kernel: "inode is not in use").
+	for slot := uint32(0); slot < inobtChunkInodes; slot++ {
+		buf := make([]byte, sb.inodeSize)
+		ino := inoFromAGRel(sb, ag, startIno+slot)
+		initInodeV3(buf, ino, 0 /* mode = free */, sb.inodeSize, 0 /* nlink */)
+		// Set di_format to a sane default so any reader sees something
+		// well-formed. The kernel uses XFS_DINODE_FMT_EXTENTS on freshly
+		// inited free inodes.
+		buf[inoOffFormat] = inodeFmtExtents
+		if sb.hasCRC {
+			updateCRC(buf, inoOffCRC, int(sb.inodeSize))
+		}
+		// Write the inode slot directly to its physical location.
+		blockIdx := slot / uint32(sb.inopBlock)
+		slotInBlock := slot % uint32(sb.inopBlock)
+		off := partOff +
+			int64(absStart+uint64(blockIdx))*int64(sb.blockSize) +
+			int64(slotInBlock)*int64(sb.inodeSize)
+		if _, err := rw.WriteAt(buf, off); err != nil {
+			return fmt.Errorf("growInobt: write inode slot %d: %w", slot, err)
+		}
+	}
+
+	// Insert the new record into the inobt leaf.
+	agiBuf, err := allocAGIBlock(rw, partOff, sb, ag)
+	if err != nil {
+		return err
+	}
+	inobtRoot := be.Uint32(agiBuf[agiOffRoot:])
+	inobtLevel := int(be.Uint32(agiBuf[agiOffLevel:]))
+	if inobtLevel != 1 {
+		return fmt.Errorf("growInobt: inobt level %d (>1) not supported yet", inobtLevel)
+	}
+
+	leafRel := inobtRoot
+	leaf, err := allocReadAGBlock(rw, partOff, sb, ag, leafRel)
+	if err != nil {
+		return err
+	}
+	hdrSize := sb.agBTreeHdrSize()
+	numrecs := int(be.Uint16(leaf[6:]))
+	maxRecs := (len(leaf) - hdrSize) / inobtRecSize
+	if numrecs >= maxRecs {
+		return fmt.Errorf("growInobt: inobt leaf full (%d records); leaf-split not implemented", numrecs)
+	}
+
+	// Find the insertion position (sorted by startIno).
+	insertAt := numrecs
+	for i := 0; i < numrecs; i++ {
+		off := hdrSize + i*inobtRecSize
+		existingStart := be.Uint32(leaf[off:])
+		if startIno < existingStart {
+			insertAt = i
+			break
+		}
+		if startIno == existingStart {
+			return fmt.Errorf("growInobt: inobt already has a record at startIno %d", startIno)
+		}
+	}
+
+	// Shift records right.
+	insertOff := hdrSize + insertAt*inobtRecSize
+	copy(leaf[insertOff+inobtRecSize:], leaf[insertOff:hdrSize+numrecs*inobtRecSize])
+
+	// Write the new record: startIno, freeCount=64, irFree=all-ones.
+	be.PutUint32(leaf[insertOff:], startIno)
+	be.PutUint32(leaf[insertOff+4:], inobtChunkInodes)
+	be.PutUint64(leaf[insertOff+8:], 0xFFFFFFFFFFFFFFFF)
+	be.PutUint16(leaf[6:], uint16(numrecs+1))
+
+	if err := allocWriteAGBTree(rw, partOff, sb, ag, leafRel, leaf); err != nil {
+		return err
+	}
+
+	// Update AGI: +64 to count + freeCount.
+	agiCount := be.Uint32(agiBuf[agiOffCount:])
+	agiFree := be.Uint32(agiBuf[agiOffFreeCount:])
+	be.PutUint32(agiBuf[agiOffCount:], agiCount+inobtChunkInodes)
+	be.PutUint32(agiBuf[agiOffFreeCount:], agiFree+inobtChunkInodes)
+	return allocWriteAGI(rw, partOff, sb, ag, agiBuf)
 }
