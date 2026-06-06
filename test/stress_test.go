@@ -92,26 +92,35 @@ type stressKnobs struct {
 func resolveStressKnobs(t testing.TB) stressKnobs {
 	t.Helper()
 
-	// NOTE: the current Format() bootstraps a single inode chunk in AG 0
-	// (8 inodes total, 1 of which is the root). allocInode does not yet
-	// grow the inobt, so a freshly-formatted image admits at most 7
-	// live files/dirs simultaneously. The stress tests churn the same
-	// small set of slots through overwrite + delete + recreate rather
-	// than growing an unbounded file population — that maps to the
-	// driver's real surface area.
+	// Format() bootstraps a single 8-inode chunk in AG 0 (1 root + 7 free).
+	// allocInode now grows the inobt by allocating fresh 64-inode chunks
+	// when the existing records are full, so the live inode population is
+	// bounded by free blocks (≈8000 inodes / AG) rather than the 7-slot
+	// seed chunk. The remaining cap on this stress test is the
+	// directory-block format: addEntryToBlockDir still operates on a
+	// single 4-KiB block (block-form), so a flat /-rooted listing tops
+	// out around 165 entries with the test's name lengths. Lifting that
+	// requires promoting the directory from block-form to data-form
+	// (multi-data-block + separate leaf), which is a follow-up to this
+	// fix.
+	//
+	// XFS_STRESS_LONG=1 cranks the many-files test from 32 to 150
+	// concurrent live files — comfortably past the 7-inode seed cap (so
+	// the inobt growth path runs) but still inside the single-block dir
+	// budget.
 
 	shortDuration := 2 * time.Second
 	longDuration := 30 * time.Second
 	shortFileMB := 16
 	longFileMB := 256
-	shortFiles := 6 // capped by inobt budget; XFS_STRESS_FILES is honoured if a
-	longFiles := 6  // future writer expansion lifts this limit.
+	shortFiles := 32  // > 7 → exercises the inobt growth path under default runs
+	longFiles := 150  // long-mode: stress the inobt growth path heavily
 
 	if testing.Short() {
 		// Pull each axis down further when running with -short.
 		shortDuration = 500 * time.Millisecond
 		shortFileMB = 4
-		shortFiles = 4
+		shortFiles = 8 // > 7 to exercise the inobt growth path even under -short
 	}
 
 	k := stressKnobs{
@@ -417,63 +426,94 @@ func genPRBS(seed uint64, n int) []byte {
 
 // ──────────────────── Many files: deep dir + inode pressure ────────────────
 
-// TestStress_ManyFiles exercises the high-churn create/delete path. The
-// current writer's Format() only seeds AG 0 with a single inode chunk
-// (7 free inodes) and allocInode does not grow the inobt, so the live
-// file population is hard-capped at 7. Instead of forcing thousands of
-// concurrent live files, this test rapidly cycles create → read →
-// delete on a small working set: `iterations` round-trips of `slots`
-// files each. That same code path is what xfs_repair stresses on a real
-// XFS, and it catches inobt / free-list bookkeeping bugs (an off-by-one
-// in freeInode would corrupt the bitmap after the first cycle).
+// TestStress_ManyFiles exercises the high-churn create/delete path with
+// many concurrently-live files. allocInode now grows the inobt by adding
+// fresh 64-inode chunks (8 disk blocks each) when the existing records
+// are full, so the inode side is bounded by free disk blocks per AG
+// rather than the 7-slot seed chunk Format() provides.
+//
+// The dir-block side is still single-block (block-form): a flat /-rooted
+// directory can hold roughly 165 23-byte entries before
+// addEntryToBlockDir returns "no free slot". longFiles = 150 picks a
+// number well beyond the inobt seed cap (so the inobt growth path runs)
+// while staying inside that dir-block budget.
+//
+// The test also catches inobt / free-list bookkeeping bugs (e.g. an
+// off-by-one in freeInode would corrupt the bitmap after the first
+// create+delete round).
 func TestStress_ManyFiles(t *testing.T) {
 	k := resolveStressKnobs(t)
 
-	const slots = 5 // ≤ Format()'s AG-0 free inode budget (7)
-	// k.files becomes "total number of create/delete cycles" rather than
-	// "live file count" because the writer can't admit > 7 live files.
-	iterations := k.files / slots
-	if iterations < 1 {
-		iterations = 1
+	// We pick AG count generously: each AG holds ~8000 inodes, but each
+	// file also needs 1 data block. Default to whichever is larger of the
+	// caller's `ags` knob and a sized-for-the-payload value.
+	//
+	// Each file costs:
+	//   - 1 inode (cheap; 8 blocks per 64-inode chunk → 1 block/file amortised)
+	//   - 1 data block
+	// Plus per-AG metadata overhead (~6 blocks).
+	// A 4-MiB AG = 1024 blocks. So ~500 files per AG is comfortable.
+	ags := k.ags
+	if needed := (k.files / 500) + 1; ags < needed {
+		ags = needed
 	}
 
-	img := formatImage(t, k.ags)
+	img := formatImage(t, ags)
 	fs := openFS(t, img)
 
 	start := time.Now()
-	for it := 0; it < iterations; it++ {
-		// Create the slot set.
-		for s := 0; s < slots; s++ {
-			p := fmt.Sprintf("/m%d.txt", s)
-			body := fmt.Appendf(nil, "iter=%d slot=%d", it, s)
-			if err := fs.WriteFile(p, body, 0o644); err != nil {
-				t.Fatalf("iter=%d slot=%d WriteFile: %v", it, s, err)
-			}
-		}
-		// Read each one back and verify content.
-		for s := 0; s < slots; s++ {
-			p := fmt.Sprintf("/m%d.txt", s)
-			want := fmt.Appendf(nil, "iter=%d slot=%d", it, s)
-			got, err := fs.ReadFile(p)
-			if err != nil {
-				t.Fatalf("iter=%d slot=%d ReadFile: %v", it, s, err)
-			}
-			if !bytes.Equal(got, want) {
-				t.Fatalf("iter=%d slot=%d: got %q want %q", it, s, got, want)
-			}
-		}
-		// Delete to free inodes for the next iteration.
-		for s := 0; s < slots; s++ {
-			p := fmt.Sprintf("/m%d.txt", s)
-			if err := fs.DeleteFile(p); err != nil {
-				t.Fatalf("iter=%d slot=%d DeleteFile: %v", it, s, err)
-			}
+
+	// Create the slot set.
+	for s := 0; s < k.files; s++ {
+		p := fmt.Sprintf("/m%05d.txt", s)
+		body := fmt.Appendf(nil, "slot=%d", s)
+		if err := fs.WriteFile(p, body, 0o644); err != nil {
+			t.Fatalf("slot=%d WriteFile: %v", s, err)
 		}
 	}
+
+	// Verify ListDir sees them all (catches inobt-growth bookkeeping bugs
+	// that leak entries or duplicate inode numbers).
+	entries, err := fs.ListDir("/")
+	if err != nil {
+		t.Fatalf("ListDir /: %v", err)
+	}
+	if len(entries) != k.files {
+		t.Fatalf("ListDir /: got %d entries, want %d", len(entries), k.files)
+	}
+
+	// Read each one back and verify content.
+	for s := 0; s < k.files; s++ {
+		p := fmt.Sprintf("/m%05d.txt", s)
+		want := fmt.Appendf(nil, "slot=%d", s)
+		got, err := fs.ReadFile(p)
+		if err != nil {
+			t.Fatalf("slot=%d ReadFile: %v", s, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("slot=%d: got %q want %q", s, got, want)
+		}
+	}
+
+	// Delete to free inodes.
+	for s := 0; s < k.files; s++ {
+		p := fmt.Sprintf("/m%05d.txt", s)
+		if err := fs.DeleteFile(p); err != nil {
+			t.Fatalf("slot=%d DeleteFile: %v", s, err)
+		}
+	}
+
+	// Final directory should be empty.
+	if entries, err := fs.ListDir("/"); err != nil {
+		t.Fatalf("post-delete ListDir /: %v", err)
+	} else if len(entries) != 0 {
+		t.Fatalf("post-delete ListDir /: %d entries left, want 0", len(entries))
+	}
+
 	elapsed := time.Since(start)
-	totalOps := iterations * slots * 3
-	t.Logf("many-files churn: %d iterations × %d slots × {create,read,delete} = %d ops in %s (%.0f ops/s)",
-		iterations, slots, totalOps, elapsed, float64(totalOps)/elapsed.Seconds())
+	totalOps := k.files * 3
+	t.Logf("many-files: %d live files × {create,read,delete} = %d ops in %s (%.0f ops/s, %d AGs)",
+		k.files, totalOps, elapsed, float64(totalOps)/elapsed.Seconds(), ags)
 }
 
 // ──────────────────── fsync / re-open semantics ────────────────────────────
