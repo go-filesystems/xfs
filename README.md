@@ -14,6 +14,7 @@ https://docs.kernel.org/filesystems/xfs/index.html
 |---|---:|---|
 | Open / Close | ✅ | Supports v5 XFS images (ftype, CRC32c) |
 | Format | ✅ | Creates XFS images |
+| Grow / Resize | ✅ | Grow supported; shrink returns `ErrShrinkUnsupported` |
 | ReadFile | ✅ | Full file reads supported |
 | WriteFile | ✅ | Full file writes supported |
 | MkDir / Delete / Rename | ✅ | Directory and rename operations supported |
