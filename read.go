@@ -38,6 +38,78 @@ func readFileData(r io.ReaderAt, partOff int64, sb *superblock, in *inode) ([]by
 	}
 }
 
+// xfsSymlinkHdrSize is the size of struct xfs_dsymlink_hdr that prefixes every
+// data block of a remote (extent-based) symlink on a v5 (CRC) filesystem.
+// xfsSymlinkMagic ("XSLM") is its leading sl_magic field.
+const (
+	xfsSymlinkHdrSize = 56
+	xfsSymlinkMagic   = "XSLM"
+)
+
+// readSymlinkTarget reads the target path of a symbolic link inode.
+//
+// Short targets are stored inline in the data fork (local format). Longer
+// targets are "remote": stored in data blocks. On a v5/CRC filesystem the
+// kernel prefixes each remote block with a 56-byte xfs_dsymlink_hdr (magic
+// "XSLM") that must be stripped before the target bytes; v4 filesystems (and
+// this driver's own writer) store the bytes with no header. We detect the
+// header per block by its magic so both layouts read correctly. readFileData
+// cannot be used for remote symlinks because it would return the header bytes
+// as part of the target.
+func readSymlinkTarget(r io.ReaderAt, partOff int64, sb *superblock, in *inode) ([]byte, error) {
+	if in.format == inodeFmtLocal {
+		fork := in.dataFork()
+		if uint64(len(fork)) < in.size {
+			return nil, fmt.Errorf("xfs: symlink inode %d size %d exceeds fork space %d",
+				in.num, in.size, len(fork))
+		}
+		out := make([]byte, in.size)
+		copy(out, in.dataFork())
+		return out, nil
+	}
+
+	var (
+		exts []extent
+		err  error
+	)
+	switch in.format {
+	case inodeFmtExtents:
+		exts, err = inlineExtents(in)
+	case inodeFmtBtree:
+		exts, err = btreeExtents(r, partOff, sb, in)
+	default:
+		return nil, fmt.Errorf("xfs: symlink inode %d unsupported fork format %d", in.num, in.format)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("xfs: symlink inode %d extents: %w", in.num, err)
+	}
+
+	out := make([]byte, 0, in.size)
+	remaining := int(in.size)
+	for _, e := range exts {
+		for b := uint32(0); b < e.count && remaining > 0; b++ {
+			blk, err := readRawBlock(r, partOff, sb, e.startBlock+uint64(b))
+			if err != nil {
+				return nil, err
+			}
+			hdr := 0
+			if len(blk) >= len(xfsSymlinkMagic) && string(blk[:len(xfsSymlinkMagic)]) == xfsSymlinkMagic {
+				hdr = xfsSymlinkHdrSize
+			}
+			if len(blk) <= hdr {
+				continue
+			}
+			payload := blk[hdr:]
+			if len(payload) > remaining {
+				payload = payload[:remaining]
+			}
+			out = append(out, payload...)
+			remaining -= len(payload)
+		}
+	}
+	return out, nil
+}
+
 // inlineExtents returns the flat extent list stored in an inode data fork
 // (format == inodeFmtExtents).
 func inlineExtents(in *inode) ([]extent, error) {

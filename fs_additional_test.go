@@ -397,7 +397,7 @@ func TestReadLinkAdditional(t *testing.T) {
 		oldLookup := fsPathLookup
 		oldDir := fsLookupInDir
 		oldRead := fsReadInode
-		oldData := fsReadFileData
+		oldData := fsReadSymlinkTarget
 		fsPathLookup = func(io.ReaderAt, int64, *superblock, string) (*inode, error) {
 			return newTestInode(17, 0x4000, inodeFmtLocal, 0), nil
 		}
@@ -405,12 +405,12 @@ func TestReadLinkAdditional(t *testing.T) {
 		fsReadInode = func(io.ReaderAt, int64, *superblock, uint64) (*inode, error) {
 			return newTestInode(101, 0xA000, inodeFmtLocal, 0), nil
 		}
-		fsReadFileData = func(io.ReaderAt, int64, *superblock, *inode) ([]byte, error) { return nil, errBoom }
+		fsReadSymlinkTarget = func(io.ReaderAt, int64, *superblock, *inode) ([]byte, error) { return nil, errBoom }
 		t.Cleanup(func() {
 			fsPathLookup = oldLookup
 			fsLookupInDir = oldDir
 			fsReadInode = oldRead
-			fsReadFileData = oldData
+			fsReadSymlinkTarget = oldData
 		})
 
 		if _, err := fs.ReadLink("/ln"); !errors.Is(err, errBoom) {
@@ -422,7 +422,7 @@ func TestReadLinkAdditional(t *testing.T) {
 		oldLookup := fsPathLookup
 		oldDir := fsLookupInDir
 		oldRead := fsReadInode
-		oldData := fsReadFileData
+		oldData := fsReadSymlinkTarget
 		fsPathLookup = func(io.ReaderAt, int64, *superblock, string) (*inode, error) {
 			return newTestInode(18, 0x4000, inodeFmtLocal, 0), nil
 		}
@@ -430,12 +430,12 @@ func TestReadLinkAdditional(t *testing.T) {
 		fsReadInode = func(io.ReaderAt, int64, *superblock, uint64) (*inode, error) {
 			return newTestInode(102, 0xA000, inodeFmtLocal, 0), nil
 		}
-		fsReadFileData = func(io.ReaderAt, int64, *superblock, *inode) ([]byte, error) { return []byte("/target"), nil }
+		fsReadSymlinkTarget = func(io.ReaderAt, int64, *superblock, *inode) ([]byte, error) { return []byte("/target"), nil }
 		t.Cleanup(func() {
 			fsPathLookup = oldLookup
 			fsLookupInDir = oldDir
 			fsReadInode = oldRead
-			fsReadFileData = oldData
+			fsReadSymlinkTarget = oldData
 		})
 
 		target, err := fs.ReadLink("/ln")
