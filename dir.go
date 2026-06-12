@@ -11,7 +11,7 @@ import (
 
 var dirReadInode = readInode
 var dirLookupInDirHook = lookupInDir
-var dirReadFileData = readFileData
+var dirReadSymlinkTarget = readSymlinkTarget
 var dirBlockDirLookup = blockDirLookup
 var dirInlineExtents = inlineExtents
 var dirBtreeExtents = btreeExtents
@@ -57,7 +57,7 @@ func pathLookup(r io.ReaderAt, partOff int64, sb *superblock, p string) (*inode,
 		}
 		// Follow symlinks.
 		if child.isSymlink() {
-			target, err := dirReadFileData(r, partOff, sb, child)
+			target, err := dirReadSymlinkTarget(r, partOff, sb, child)
 			if err != nil {
 				return nil, err
 			}

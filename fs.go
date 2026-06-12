@@ -20,6 +20,7 @@ var fsDeleteFile = deleteFile
 var fsLookupInDir = lookupInDir
 var fsReadInode = readInode
 var fsReadFileData = readFileData
+var fsReadSymlinkTarget = readSymlinkTarget
 var fsMakeDir = makeDir
 var fsDeleteDir = deleteDir
 var fsRenameEntry = renameEntry
@@ -379,7 +380,7 @@ func (fs *xfsFS) ReadLink(path string) (string, error) {
 	if !in.isSymlink() {
 		return "", fmt.Errorf("xfs: %q is not a symbolic link", path)
 	}
-	target, err := fsReadFileData(fs.f, fs.partOffset, fs.sb, in)
+	target, err := fsReadSymlinkTarget(fs.f, fs.partOffset, fs.sb, in)
 	if err != nil {
 		return "", err
 	}
