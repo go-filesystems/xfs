@@ -563,12 +563,14 @@ func TestDeleteDirectoryHelpersRemainingBranches(t *testing.T) {
 		}
 
 		copy(rw.data, blk)
-		off, sz := findEntryInBlock(rw.data, "file", sb.hasFType, sb.hasCRC)
 		if err := removeBlockDirEntry(rw, 0, sb, dirIn, "file"); err != nil {
-			t.Fatalf("removeBlockDirEntry merge: %v", err)
+			t.Fatalf("removeBlockDirEntry: %v", err)
 		}
-		if got := int(binary.BigEndian.Uint16(rw.data[off+2:])); got <= sz {
-			t.Fatalf("expected merged free slot length > %d, got %d", sz, got)
+		// The block is rebuilt without "file"; it must no longer be present.
+		for _, e := range parseDirBlock(rw.data, sb.hasFType, sb.hasCRC) {
+			if e.Name == "file" {
+				t.Fatal(`removeBlockDirEntry left "file" in the directory`)
+			}
 		}
 
 		badWrite := newMemRW(int(sb.blockSize))

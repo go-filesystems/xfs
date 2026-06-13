@@ -25,9 +25,9 @@ import (
 // that wants to validate our writer's output against xfsprogs tools.
 func xfsprogsImage(t *testing.T) string {
 	t.Helper()
-	const fourMiB = int64(4 * 1024 * 1024)
+	const imgSize = int64(128 * 1024 * 1024) // two 64 MiB AGs (xfs_repair needs >1 AG)
 	path := filepath.Join(t.TempDir(), "img.xfs")
-	fs, err := filesystem_xfs.Format(path, fourMiB, filesystem_xfs.FormatConfig{
+	fs, err := filesystem_xfs.Format(path, imgSize, filesystem_xfs.FormatConfig{
 		Label: "xfsprogs",
 	})
 	if err != nil {
@@ -61,8 +61,11 @@ func TestWriteThenXfsRepair(t *testing.T) {
 	if runErr != nil {
 		t.Fatalf("xfs_repair -n exited non-zero: %v", runErr)
 	}
-	if strings.Contains(strings.ToUpper(string(out)), "ERROR") {
-		t.Fatalf("xfs_repair -n reported ERROR in output:\n%s", out)
+	upper := strings.ToUpper(string(out))
+	for _, marker := range []string{"ERROR", "CORRUPT", "WOULD ", "BAD "} {
+		if strings.Contains(upper, marker) {
+			t.Fatalf("xfs_repair -n reported %q in output:\n%s", marker, out)
+		}
 	}
 }
 
@@ -82,9 +85,9 @@ func TestGrowThenXfsRepair(t *testing.T) {
 		t.Skip("xfs_repair not found on PATH; install xfsprogs to run this test")
 	}
 
-	const fourMiB = int64(4 * 1024 * 1024)
+	const oneAG = int64(16384 * 4096) // 64 MiB
 	path := filepath.Join(t.TempDir(), "grow.xfs")
-	fs, err := filesystem_xfs.Format(path, fourMiB, filesystem_xfs.FormatConfig{
+	fs, err := filesystem_xfs.Format(path, oneAG, filesystem_xfs.FormatConfig{
 		Label: "growcompat",
 	})
 	if err != nil {
@@ -95,8 +98,8 @@ func TestGrowThenXfsRepair(t *testing.T) {
 		t.Fatalf("WriteFile pre-grow: %v", err)
 	}
 
-	// Grow from 1 AG (4 MiB) to 3 AGs (12 MiB).
-	if err := fs.Grow(3 * fourMiB); err != nil {
+	// Grow from 1 AG (64 MiB) to 3 AGs (192 MiB).
+	if err := fs.Grow(3 * oneAG); err != nil {
 		fs.Close()
 		t.Fatalf("Grow: %v", err)
 	}
@@ -126,20 +129,72 @@ func TestGrowThenXfsRepair(t *testing.T) {
 	}
 }
 
+// TestBlockFormDirXfsRepair exercises the directory write paths that go
+// beyond short form: a directory large enough to be promoted to block form, a
+// subdirectory created inside it, short-form entries in the root, and
+// deletions from both a block-form and a short-form directory. The result must
+// be xfs_repair -n clean. Skip-gated on xfs_repair like the other interop tests.
+func TestBlockFormDirXfsRepair(t *testing.T) {
+	xfsRepair, err := exec.LookPath("xfs_repair")
+	if err != nil {
+		t.Skip("xfs_repair not found on PATH; install xfsprogs to run this test")
+	}
+
+	const oneAG = int64(16384 * 4096)
+	path := filepath.Join(t.TempDir(), "blockdir.xfs")
+	fs, err := filesystem_xfs.Format(path, 4*oneAG, filesystem_xfs.FormatConfig{Label: "blkdir"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	mustf := func(e error) {
+		if e != nil {
+			fs.Close()
+			t.Fatal(e)
+		}
+	}
+	mustf(fs.MkDir("/big", 0o755))
+	for i := 0; i < 40; i++ { // promotes /big to block form
+		mustf(fs.WriteFile(fmt.Sprintf("/big/f%03d.dat", i), []byte("data\n"), 0o644))
+	}
+	mustf(fs.MkDir("/big/sub", 0o755)) // subdir inside a block-form dir
+	mustf(fs.WriteFile("/big/sub/x.txt", []byte("x\n"), 0o644))
+	for i := 0; i < 5; i++ { // short-form root entries
+		mustf(fs.WriteFile(fmt.Sprintf("/top%d", i), []byte("t\n"), 0o644))
+	}
+	mustf(fs.DeleteFile("/big/f000.dat")) // delete from block form
+	mustf(fs.DeleteFile("/top0"))         // delete from short form
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	cmd := exec.Command(xfsRepair, "-n", path)
+	out, runErr := cmd.CombinedOutput()
+	t.Logf("xfs_repair -n output:\n%s", out)
+	if runErr != nil {
+		t.Fatalf("xfs_repair -n reported problems: %v", runErr)
+	}
+	upper := strings.ToUpper(string(out))
+	for _, marker := range []string{"ERROR", "CORRUPT", "WOULD ", "BAD "} {
+		if strings.Contains(upper, marker) {
+			t.Fatalf("xfs_repair -n reported %q in output:\n%s", marker, out)
+		}
+	}
+}
+
 // TestResizeShrinkErrSentinel is a tiny smoke test that the package's
 // Resize() entry point returns filesystem.ErrShrinkUnsupported on an
 // undersized request — same probe the diskimage CLI uses to decide
 // whether to fall through to "recreate" semantics. Not gated on
 // xfsprogs since it doesn't shell out.
 func TestResizeShrinkErrSentinel(t *testing.T) {
-	const fourMiB = int64(4 * 1024 * 1024)
+	const oneAG = int64(16384 * 4096) // 64 MiB, the minimum image size
 	path := filepath.Join(t.TempDir(), "shrink.xfs")
-	fs, err := filesystem_xfs.Format(path, 2*fourMiB, filesystem_xfs.FormatConfig{})
+	fs, err := filesystem_xfs.Format(path, 2*oneAG, filesystem_xfs.FormatConfig{})
 	if err != nil {
 		t.Fatalf("Format: %v", err)
 	}
 	defer fs.Close()
-	if err := fs.Resize(fourMiB); !errors.Is(err, filesystem.ErrShrinkUnsupported) {
+	if err := fs.Resize(oneAG); !errors.Is(err, filesystem.ErrShrinkUnsupported) {
 		t.Fatalf("Resize(shrink) = %v, want ErrShrinkUnsupported", err)
 	}
 }

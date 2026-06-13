@@ -70,7 +70,7 @@ func makeDir(rw readerWriterAt, partOff int64, sb *superblock, p string, perm os
 	// A fresh empty directory has nlink=2: the parent's entry pointing at
 	// it + the "." self-reference inside its own short-form data fork.
 	inodeBuf := make([]byte, sb.inodeSize)
-	initInodeV3(inodeBuf, ino, mode, sb.inodeSize, 2)
+	initInodeV3(inodeBuf, ino, mode, sb.inodeSize, 2, sb.uuid)
 
 	newIn := &inode{
 		num:    ino,
@@ -99,5 +99,13 @@ func makeDir(rw readerWriterAt, partOff int64, sb *superblock, p string, perm os
 	}
 
 	// Add entry to the parent directory (ftype 2 = directory).
-	return makeDirAddDirEntry(rw, partOff, sb, dirIn, ino, name, 2 /* DT_DIR */)
+	if err := makeDirAddDirEntry(rw, partOff, sb, dirIn, ino, name, 2 /* DT_DIR */); err != nil {
+		return err
+	}
+
+	// A new subdirectory's ".." entry references the parent, so the parent's
+	// link count gains one. xfs_repair flags a parent whose nlink doesn't
+	// account for its child directories ("would reset inode N nlinks").
+	be.PutUint32(dirIn.raw[inoOffNLink:], be.Uint32(dirIn.raw[inoOffNLink:])+1)
+	return makeDirWriteInode(rw, partOff, sb, dirIn)
 }

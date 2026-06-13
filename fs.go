@@ -296,12 +296,23 @@ func (fs *xfsFS) Stat(path string) (filesystem.Stat, error) {
 	return filesystem.NewStat(in.mode, in.size, in.num), nil
 }
 
+// afterMutation persists the filesystem-wide free counters to the primary
+// superblock after a successful allocating/freeing operation, so the global
+// counts stay consistent with the per-AG headers (xfs_repair cross-checks
+// them). A nil-returning op whose count sync fails surfaces that error.
+func (fs *xfsFS) afterMutation(err error) error {
+	if err != nil {
+		return err
+	}
+	return syncSuperblockCounts(fs.f, fs.partOffset, fs.sb)
+}
+
 // WriteFile creates or overwrites the regular file at path with the given data
 // and Unix permission bits. The parent directory must already exist.
 func (fs *xfsFS) WriteFile(path string, data []byte, perm os.FileMode) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	return fsWriteFile(fs.f, fs.partOffset, fs.sb, path, data, perm)
+	return fs.afterMutation(fsWriteFile(fs.f, fs.partOffset, fs.sb, path, data, perm))
 }
 
 // DeleteFile removes the regular file at path and frees its inode and data
@@ -309,7 +320,7 @@ func (fs *xfsFS) WriteFile(path string, data []byte, perm os.FileMode) error {
 func (fs *xfsFS) DeleteFile(path string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	return fsDeleteFile(fs.f, fs.partOffset, fs.sb, path)
+	return fs.afterMutation(fsDeleteFile(fs.f, fs.partOffset, fs.sb, path))
 }
 
 // Link creates a hardlink at newPath pointing at the inode at oldPath. The
@@ -318,7 +329,7 @@ func (fs *xfsFS) DeleteFile(path string) error {
 func (fs *xfsFS) Link(oldPath, newPath string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	return fsLinkInode(fs.f, fs.partOffset, fs.sb, oldPath, newPath)
+	return fs.afterMutation(fsLinkInode(fs.f, fs.partOffset, fs.sb, oldPath, newPath))
 }
 
 // Truncate resizes the regular file at path to newSize bytes. Growing a
@@ -331,7 +342,7 @@ func (fs *xfsFS) Truncate(path string, newSize int64) error {
 	}
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	return fsTruncateInode(fs.f, fs.partOffset, fs.sb, path, uint64(newSize))
+	return fs.afterMutation(fsTruncateInode(fs.f, fs.partOffset, fs.sb, path, uint64(newSize)))
 }
 
 // Symlink creates a symbolic link at linkPath whose target is the literal
@@ -340,7 +351,7 @@ func (fs *xfsFS) Truncate(path string, newSize int64) error {
 func (fs *xfsFS) Symlink(target, linkPath string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	return fsSymlinkInode(fs.f, fs.partOffset, fs.sb, target, linkPath)
+	return fs.afterMutation(fsSymlinkInode(fs.f, fs.partOffset, fs.sb, target, linkPath))
 }
 
 // ReadLink returns the target of the symbolic link at path.
@@ -393,7 +404,7 @@ func (fs *xfsFS) ReadLink(path string) (string, error) {
 func (fs *xfsFS) MkDir(path string, perm os.FileMode) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	return fsMakeDir(fs.f, fs.partOffset, fs.sb, path, perm)
+	return fs.afterMutation(fsMakeDir(fs.f, fs.partOffset, fs.sb, path, perm))
 }
 
 // DeleteDir removes the directory at path and all of its contents
@@ -401,7 +412,7 @@ func (fs *xfsFS) MkDir(path string, perm os.FileMode) error {
 func (fs *xfsFS) DeleteDir(path string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	return fsDeleteDir(fs.f, fs.partOffset, fs.sb, path)
+	return fs.afterMutation(fsDeleteDir(fs.f, fs.partOffset, fs.sb, path))
 }
 
 // Rename moves (and optionally renames) the file or directory at oldPath to
@@ -410,7 +421,7 @@ func (fs *xfsFS) DeleteDir(path string) error {
 func (fs *xfsFS) Rename(oldPath, newPath string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	return fsRenameEntry(fs.f, fs.partOffset, fs.sb, oldPath, newPath)
+	return fs.afterMutation(fsRenameEntry(fs.f, fs.partOffset, fs.sb, oldPath, newPath))
 }
 
 // Chown changes the owner uid/gid of the inode at path. ctime is bumped

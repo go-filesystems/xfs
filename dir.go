@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"path"
 	"strings"
 )
@@ -483,7 +484,16 @@ func addEntryToSFDir(in *inode, childIno uint64, name string, ftype uint8, sb *s
 		extra++
 	}
 
-	// Calculate current sf block size.
+	// Calculate current sf block size, and the dir2 "data block" offset the
+	// new entry will occupy. Each sf entry's offset field is the byte offset
+	// the entry *would* have in the equivalent dir2 data block — not its
+	// position in the short-form fork. It starts past the data-block header
+	// and the synthetic "." / ".." entries, then advances by each real
+	// entry's 8-byte-aligned data-entry size. xfs_repair validates these
+	// offsets, so they must match the canonical dir2 layout.
+	dataOff := dirDataHdrSize(sb.hasCRC) +
+		dir2DataEntSize(1, sb.hasFType) + // "."
+		dir2DataEntSize(2, sb.hasFType) // ".."
 	sfSize := 2 + parentSize // header
 	pos := sfSize
 	for i := 0; i < count; i++ {
@@ -500,6 +510,7 @@ func addEntryToSFDir(in *inode, childIno uint64, name string, ftype uint8, sb *s
 			entInoSize = 8
 		}
 		pos += entInoSize
+		dataOff += dir2DataEntSize(nl, sb.hasFType)
 	}
 	sfSize = pos
 
@@ -526,7 +537,7 @@ func addEntryToSFDir(in *inode, childIno uint64, name string, ftype uint8, sb *s
 	// Build new entry at sfSize.
 	e := rawFork[sfSize:]
 	e[0] = byte(len(name))
-	binary.BigEndian.PutUint16(e[1:], uint16(sfSize)) // "offset" field — just the position
+	binary.BigEndian.PutUint16(e[1:], uint16(dataOff)) // dir2 data-block offset
 	copy(e[3:], name)
 	p := 3 + len(name)
 	if sb.hasFType {
@@ -535,8 +546,45 @@ func addEntryToSFDir(in *inode, childIno uint64, name string, ftype uint8, sb *s
 	}
 	binary.BigEndian.PutUint32(e[p:], uint32(childIno))
 
-	// Update header.
+	// Update header entry count and the inode's di_size to the new
+	// short-form length, or xfs_repair sees a header claiming more entries
+	// than di_size accounts for and flags the data fork corrupt.
 	rawFork[0] = byte(count + 1)
+	setInodeSize(in, uint64(sfSize+extra))
 
 	return true
+}
+
+// xfsDirHash computes the XFS directory name hash (xfs_da_hashname) used as
+// the key in directory leaf entries. Verified against mkfs: "." → 0x2e,
+// ".." → 0x172e.
+func xfsDirHash(name []byte) uint32 {
+	var hash uint32
+	i, n := 0, len(name)
+	for ; n >= 4; n -= 4 {
+		hash = uint32(name[i])<<21 ^ uint32(name[i+1])<<14 ^ uint32(name[i+2])<<7 ^
+			uint32(name[i+3]) ^ bits.RotateLeft32(hash, 7*4)
+		i += 4
+	}
+	switch n {
+	case 3:
+		return uint32(name[i])<<14 ^ uint32(name[i+1])<<7 ^ uint32(name[i+2]) ^ bits.RotateLeft32(hash, 7*3)
+	case 2:
+		return uint32(name[i])<<7 ^ uint32(name[i+1]) ^ bits.RotateLeft32(hash, 7*2)
+	case 1:
+		return uint32(name[i]) ^ bits.RotateLeft32(hash, 7)
+	default:
+		return hash
+	}
+}
+
+// dir2DataEntSize returns the 8-byte-aligned size of an xfs_dir2_data_entry
+// for a name of the given length: inumber(8) + namelen(1) + name + tag(2),
+// plus a file-type byte when ftype is enabled.
+func dir2DataEntSize(namelen int, hasFType bool) int {
+	sz := 8 + 1 + namelen + 2
+	if hasFType {
+		sz++
+	}
+	return (sz + 7) &^ 7
 }
