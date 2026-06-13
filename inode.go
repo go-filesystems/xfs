@@ -62,7 +62,38 @@ const (
 	// xfsDiflag2Nrext64 (XFS_DIFLAG2_NREXT64) marks an inode that stores its
 	// data-fork extent count in di_big_nextents. Set by modern mkfs.xfs.
 	xfsDiflag2Nrext64 = 0x10
+
+	// xfsDiflag2Bigtime (XFS_DIFLAG2_BIGTIME) marks an inode whose timestamps
+	// are stored as a 64-bit nanosecond count since the bigtime epoch rather
+	// than a legacy seconds+nanoseconds pair. Default in modern mkfs.xfs.
+	xfsDiflag2Bigtime = 0x08
+
+	// xfsBigtimeEpochOffset is the seconds offset of the bigtime epoch
+	// (1901-12-13 20:45:52 UTC) before the Unix epoch: 2^31 seconds.
+	xfsBigtimeEpochOffset = 2147483648
 )
+
+// decodeInodeTime reads the 8-byte timestamp at off in a raw inode buffer. A
+// legacy timestamp is a signed seconds + nanoseconds pair; a bigtime timestamp
+// (xfsDiflag2Bigtime set) is a single big-endian uint64 nanosecond count since
+// the bigtime epoch.
+func decodeInodeTime(raw []byte, off int, bigtime bool) time.Time {
+	be := binary.BigEndian
+	if bigtime {
+		total := be.Uint64(raw[off:])
+		sec := int64(total/1_000_000_000) - xfsBigtimeEpochOffset
+		nsec := int64(total % 1_000_000_000)
+		return time.Unix(sec, nsec).UTC()
+	}
+	sec := int64(int32(be.Uint32(raw[off:])))
+	nsec := int64(int32(be.Uint32(raw[off+4:])))
+	return time.Unix(sec, nsec).UTC()
+}
+
+// inodeHasBigtime reports whether an inode's timestamps use bigtime encoding.
+func inodeHasBigtime(raw []byte) bool {
+	return raw[inoOffVersion] >= 3 && binary.BigEndian.Uint64(raw[inoOffFlags2:])&xfsDiflag2Bigtime != 0
+}
 
 // inodeByteOff returns the absolute byte offset of inode ino within the image.
 func inodeByteOff(sb *superblock, partOff int64, ino uint64) int64 {

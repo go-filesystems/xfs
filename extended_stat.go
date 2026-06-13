@@ -44,10 +44,9 @@ func (fs *xfsFS) ExtendedStat(p string) (*InodeStat, error) {
 		return nil, fmt.Errorf("xfs ExtendedStat %q: %w", p, err)
 	}
 	be := binary.BigEndian
+	bigtime := inodeHasBigtime(in.raw)
 	readT := func(off int) time.Time {
-		sec := int64(int32(be.Uint32(in.raw[off:])))
-		nsec := int64(int32(be.Uint32(in.raw[off+4:])))
-		return time.Unix(sec, nsec).UTC()
+		return decodeInodeTime(in.raw, off, bigtime)
 	}
 	out := &InodeStat{
 		Inode:      in.num,
