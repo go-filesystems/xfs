@@ -129,6 +129,58 @@ func TestGrowThenXfsRepair(t *testing.T) {
 	}
 }
 
+// TestBlockFormDirXfsRepair exercises the directory write paths that go
+// beyond short form: a directory large enough to be promoted to block form, a
+// subdirectory created inside it, short-form entries in the root, and
+// deletions from both a block-form and a short-form directory. The result must
+// be xfs_repair -n clean. Skip-gated on xfs_repair like the other interop tests.
+func TestBlockFormDirXfsRepair(t *testing.T) {
+	xfsRepair, err := exec.LookPath("xfs_repair")
+	if err != nil {
+		t.Skip("xfs_repair not found on PATH; install xfsprogs to run this test")
+	}
+
+	const oneAG = int64(16384 * 4096)
+	path := filepath.Join(t.TempDir(), "blockdir.xfs")
+	fs, err := filesystem_xfs.Format(path, 4*oneAG, filesystem_xfs.FormatConfig{Label: "blkdir"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	mustf := func(e error) {
+		if e != nil {
+			fs.Close()
+			t.Fatal(e)
+		}
+	}
+	mustf(fs.MkDir("/big", 0o755))
+	for i := 0; i < 40; i++ { // promotes /big to block form
+		mustf(fs.WriteFile(fmt.Sprintf("/big/f%03d.dat", i), []byte("data\n"), 0o644))
+	}
+	mustf(fs.MkDir("/big/sub", 0o755)) // subdir inside a block-form dir
+	mustf(fs.WriteFile("/big/sub/x.txt", []byte("x\n"), 0o644))
+	for i := 0; i < 5; i++ { // short-form root entries
+		mustf(fs.WriteFile(fmt.Sprintf("/top%d", i), []byte("t\n"), 0o644))
+	}
+	mustf(fs.DeleteFile("/big/f000.dat")) // delete from block form
+	mustf(fs.DeleteFile("/top0"))         // delete from short form
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	cmd := exec.Command(xfsRepair, "-n", path)
+	out, runErr := cmd.CombinedOutput()
+	t.Logf("xfs_repair -n output:\n%s", out)
+	if runErr != nil {
+		t.Fatalf("xfs_repair -n reported problems: %v", runErr)
+	}
+	upper := strings.ToUpper(string(out))
+	for _, marker := range []string{"ERROR", "CORRUPT", "WOULD ", "BAD "} {
+		if strings.Contains(upper, marker) {
+			t.Fatalf("xfs_repair -n reported %q in output:\n%s", marker, out)
+		}
+	}
+}
+
 // TestResizeShrinkErrSentinel is a tiny smoke test that the package's
 // Resize() entry point returns filesystem.ErrShrinkUnsupported on an
 // undersized request — same probe the diskimage CLI uses to decide
