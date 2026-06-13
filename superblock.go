@@ -33,7 +33,11 @@ type superblock struct {
 const (
 	sbOffMagic        = 0
 	sbOffBlockSize    = 4
+	sbOffDBlocks      = 8
 	sbOffRootIno      = 56
+	sbOffIcount       = 128
+	sbOffIfree        = 136
+	sbOffFdblocks     = 144
 	sbOffAgBlocks     = 84
 	sbOffAgCount      = 88
 	sbOffVersionNum   = 100
