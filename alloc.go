@@ -103,7 +103,7 @@ func agfBlock(r io.ReaderAt, partOff int64, sb *superblock, ag uint32) ([]byte, 
 // writeAGF writes back a modified AGF block, updating its CRC if v5.
 func writeAGF(rw io.WriterAt, partOff int64, sb *superblock, ag uint32, buf []byte) error {
 	if sb.hasCRC {
-		updateCRC(buf, agfOffCRC, agfStructSize)
+		updateCRC(buf, agfOffCRC, 512)
 	}
 	off := sb.agFByteOffset(partOff, ag)
 	if _, err := rw.WriteAt(buf, off); err != nil {
@@ -129,7 +129,7 @@ func agiBlock(r io.ReaderAt, partOff int64, sb *superblock, ag uint32) ([]byte, 
 // writeAGI writes back a modified AGI block.
 func writeAGI(rw io.WriterAt, partOff int64, sb *superblock, ag uint32, buf []byte) error {
 	if sb.hasCRC {
-		updateCRC(buf, agiOffCRC, agiStructSize)
+		updateCRC(buf, agiOffCRC, 512)
 	}
 	off := sb.agIByteOffset(partOff, ag)
 	if _, err := rw.WriteAt(buf, off); err != nil {
