@@ -327,6 +327,18 @@ func buildSuperblockBuffer(sb *superblock, agCount uint32, uuid [16]byte, label 
 	be.PutUint32(buf[sbOffInoAlignmt:], 8)                // ALIGNBIT in versionnum requires this
 	buf[sbOffImaxPct] = 25
 
+	// Filesystem-wide totals that xfs_repair cross-checks against AG metadata.
+	// sb_dblocks = total data blocks; fdblocks = sum of per-AG AGF free counts
+	// (AG0 reserves fmtMetaBlocksAG0 blocks, AG1+ reserve fmtMetaBlocksAGN);
+	// icount/ifree match the single 8-inode chunk pre-allocated in AG0.
+	dblocks := uint64(agCount) * uint64(sb.agBlocks)
+	fdblocks := uint64(sb.agBlocks-fmtMetaBlocksAG0) +
+		uint64(agCount-1)*uint64(sb.agBlocks-fmtMetaBlocksAGN)
+	be.PutUint64(buf[sbOffDBlocks:], dblocks)
+	be.PutUint64(buf[sbOffIcount:], 8)
+	be.PutUint64(buf[sbOffIfree:], 7)
+	be.PutUint64(buf[sbOffFdblocks:], fdblocks)
+
 	// UUID at offset 32 (sb_uuid, 16 bytes).
 	copy(buf[32:], uuid[:])
 
