@@ -190,7 +190,14 @@ func TestMakeDirBuildsLocalDirectoryInode(t *testing.T) {
 	makeDirPathLookup = func(io.ReaderAt, int64, *superblock, string) (*inode, error) { return parent, nil }
 	makeDirLookupInDir = func(io.ReaderAt, int64, *superblock, *inode, string) (uint64, error) { return 0, ErrNotFound }
 	makeDirAllocInode = func(readerWriterAt, int64, *superblock, uint32) (uint64, error) { return 123, nil }
-	makeDirWriteInode = func(_ io.WriterAt, _ int64, _ *superblock, in *inode) error { wrote = in; return nil }
+	// makeDir writes both the new directory inode and (to bump its nlink) the
+	// parent; capture the new directory inode (num 123) specifically.
+	makeDirWriteInode = func(_ io.WriterAt, _ int64, _ *superblock, in *inode) error {
+		if in.num == 123 {
+			wrote = in
+		}
+		return nil
+	}
 	makeDirAddDirEntry = func(readerWriterAt, int64, *superblock, *inode, uint64, string, uint8) error { return nil }
 	t.Cleanup(func() {
 		makeDirPathLookup = oldLookup

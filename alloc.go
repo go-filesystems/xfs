@@ -164,6 +164,48 @@ func (sb *superblock) agAbsBlock(ag, agRel uint32) uint64 {
 	return uint64(ag)*uint64(sb.agBlocks) + uint64(agRel)
 }
 
+// syncSuperblockCounts recomputes the filesystem-wide free counters
+// (sb_icount, sb_ifree, sb_fdblocks) from the per-AG AGI/AGF headers and
+// rewrites the primary superblock. Allocation only updates the per-AG headers;
+// without this the global SB counts drift and xfs_repair reports
+// "sb_ifree X, counted Y" / "sb_fdblocks ..." and exits non-zero. Call after
+// any operation that allocates or frees inodes or blocks.
+//
+// sb_fdblocks counts free-space-btree blocks plus the AGFL free-list blocks
+// (agf_flcount), matching how XFS and xfs_repair account for free space.
+func syncSuperblockCounts(rw readerWriterAt, partOff int64, sb *superblock) error {
+	be := binary.BigEndian
+	var icount, ifree, fdblocks uint64
+	for ag := uint32(0); ag < sb.agCount; ag++ {
+		agf, err := agfBlock(rw, partOff, sb, ag)
+		if err != nil {
+			return err
+		}
+		agi, err := agiBlock(rw, partOff, sb, ag)
+		if err != nil {
+			return err
+		}
+		fdblocks += uint64(be.Uint32(agf[agfOffFreeBlks:])) + uint64(be.Uint32(agf[agfOffFLCount:]))
+		icount += uint64(be.Uint32(agi[agiOffCount:]))
+		ifree += uint64(be.Uint32(agi[agiOffFreeCount:]))
+	}
+
+	buf := make([]byte, 512)
+	if err := readBytes(rw, partOff, buf); err != nil {
+		return fmt.Errorf("xfs: sync SB counts: read SB: %w", err)
+	}
+	be.PutUint64(buf[sbOffIcount:], icount)
+	be.PutUint64(buf[sbOffIfree:], ifree)
+	be.PutUint64(buf[sbOffFdblocks:], fdblocks)
+	if sb.hasCRC {
+		updateCRC(buf, sbOffCRC, sbCRCLen)
+	}
+	if _, err := rw.WriteAt(buf, partOff); err != nil {
+		return fmt.Errorf("xfs: sync SB counts: write SB: %w", err)
+	}
+	return nil
+}
+
 // readAGBlock reads an AG-relative block by converting to absolute first.
 func readAGBlock(r io.ReaderAt, partOff int64, sb *superblock, ag, agRel uint32) ([]byte, error) {
 	return readRawBlock(r, partOff, sb, sb.agAbsBlock(ag, agRel))
