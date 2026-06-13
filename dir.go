@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"path"
 	"strings"
 )
@@ -492,7 +493,7 @@ func addEntryToSFDir(in *inode, childIno uint64, name string, ftype uint8, sb *s
 	// offsets, so they must match the canonical dir2 layout.
 	dataOff := dirDataHdrSize(sb.hasCRC) +
 		dir2DataEntSize(1, sb.hasFType) + // "."
-		dir2DataEntSize(2, sb.hasFType)   // ".."
+		dir2DataEntSize(2, sb.hasFType) // ".."
 	sfSize := 2 + parentSize // header
 	pos := sfSize
 	for i := 0; i < count; i++ {
@@ -552,6 +553,29 @@ func addEntryToSFDir(in *inode, childIno uint64, name string, ftype uint8, sb *s
 	setInodeSize(in, uint64(sfSize+extra))
 
 	return true
+}
+
+// xfsDirHash computes the XFS directory name hash (xfs_da_hashname) used as
+// the key in directory leaf entries. Verified against mkfs: "." → 0x2e,
+// ".." → 0x172e.
+func xfsDirHash(name []byte) uint32 {
+	var hash uint32
+	i, n := 0, len(name)
+	for ; n >= 4; n -= 4 {
+		hash = uint32(name[i])<<21 ^ uint32(name[i+1])<<14 ^ uint32(name[i+2])<<7 ^
+			uint32(name[i+3]) ^ bits.RotateLeft32(hash, 7*4)
+		i += 4
+	}
+	switch n {
+	case 3:
+		return uint32(name[i])<<14 ^ uint32(name[i+1])<<7 ^ uint32(name[i+2]) ^ bits.RotateLeft32(hash, 7*3)
+	case 2:
+		return uint32(name[i])<<7 ^ uint32(name[i+1]) ^ bits.RotateLeft32(hash, 7*2)
+	case 1:
+		return uint32(name[i]) ^ bits.RotateLeft32(hash, 7)
+	default:
+		return hash
+	}
 }
 
 // dir2DataEntSize returns the 8-byte-aligned size of an xfs_dir2_data_entry
