@@ -25,9 +25,9 @@ import (
 // that wants to validate our writer's output against xfsprogs tools.
 func xfsprogsImage(t *testing.T) string {
 	t.Helper()
-	const fourMiB = int64(4 * 1024 * 1024)
+	const imgSize = int64(128 * 1024 * 1024) // two 64 MiB AGs (xfs_repair needs >1 AG)
 	path := filepath.Join(t.TempDir(), "img.xfs")
-	fs, err := filesystem_xfs.Format(path, fourMiB, filesystem_xfs.FormatConfig{
+	fs, err := filesystem_xfs.Format(path, imgSize, filesystem_xfs.FormatConfig{
 		Label: "xfsprogs",
 	})
 	if err != nil {
