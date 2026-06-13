@@ -48,11 +48,14 @@ const (
 	inoOffNBlocks  = 64
 	inoOffNExtents = 76
 	inoOffForkOff  = 82
-	inoOffGen      = 92  // __be32 inode generation
-	inoOffCRC      = 100 // __le32, v3 only
+	inoOffAFormat  = 83 // di_aformat (attribute-fork format)
+	inoOffGen          = 92  // __be32 inode generation
+	inoOffNextUnlinked = 96  // __be32 di_next_unlinked; NULLAGINO when not on the unlinked list
+	inoOffCRC          = 100 // __le32, v3 only
 	inoOffFlags2   = 120 // __be64 di_flags2, v3 only
 	inoOffCRTime   = 144 // v3 only: legacy timespec (sec+nsec)
 	inoOffIno      = 152 // uint64 absolute inode number, v3 only
+	inoOffUUID     = 160 // di_uuid (16 bytes), v3 only — must match sb_uuid
 
 	// di_big_nextents: 64-bit data-fork extent count present when the inode
 	// carries the NREXT64 feature. It overlays the legacy v3 padding right
@@ -207,7 +210,7 @@ func setInodeFormat(in *inode, fmt uint8) {
 // entry + "." self-reference). All four timestamp fields — atime, mtime,
 // ctime, crtime (v3 birth time) — are stamped with the current time so
 // `ls -l` and `stat(1)` don't show 1970.
-func initInodeV3(buf []byte, ino uint64, mode uint16, inodeSize uint16, nlink uint32) {
+func initInodeV3(buf []byte, ino uint64, mode uint16, inodeSize uint16, nlink uint32, uuid [16]byte) {
 	clear(buf)
 	be := binary.BigEndian
 	be.PutUint16(buf[inoOffMagic:], magicInode)
@@ -227,4 +230,13 @@ func initInodeV3(buf []byte, ino uint64, mode uint16, inodeSize uint16, nlink ui
 	stampLegacy(inoOffCTime)
 	stampLegacy(inoOffCRTime)
 	be.PutUint64(buf[inoOffIno:], ino)
+	// Not on the AG unlinked list: di_next_unlinked = NULLAGINO. xfs_repair
+	// flags a zeroed next_unlinked on every inode otherwise.
+	be.PutUint32(buf[inoOffNextUnlinked:], 0xFFFFFFFF)
+	// Empty attribute fork: di_aformat must be a valid format enum (extents),
+	// not 0, or xfs_repair reports "bad attribute format".
+	buf[inoOffAFormat] = inodeFmtExtents
+	// di_uuid must match sb_uuid or the v5 inode verifier (and xfs_repair)
+	// rejects the inode and clears it.
+	copy(buf[inoOffUUID:inoOffUUID+16], uuid[:])
 }

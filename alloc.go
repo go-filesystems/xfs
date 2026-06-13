@@ -14,24 +14,32 @@ import (
 // "the on-disk inobt is unreadable".
 var errInobtFull = errors.New("xfs: inobt has no free inodes")
 
-// AGF v5 field offsets (big-endian unless noted).
+// AGF v5 field offsets (big-endian unless noted). Layout mirrors
+// struct xfs_agf from fs/xfs/libxfs/xfs_format.h.
 const (
-	agfOffMagic    = 0
-	agfOffSeqNo    = 8
-	agfOffLength   = 12  // AG size in blocks
-	agfOffBnoRoot  = 16  // bno B-tree root (AG-relative block)
-	agfOffCntRoot  = 20  // cnt B-tree root
-	agfOffBnoLevel = 28  // bno B-tree depth
-	agfOffCntLevel = 32  // cnt B-tree depth
-	agfOffFreeBlks = 52  // free block count
-	agfOffLongest  = 56  // longest free run
-	agfOffCRC      = 104 // __le32 v5 CRC
-	agfStructSize  = 112
+	agfOffMagic     = 0
+	agfOffVersion   = 4 // agf_versionnum (= 1)
+	agfOffSeqNo     = 8
+	agfOffLength    = 12 // AG size in blocks
+	agfOffBnoRoot   = 16 // agf_roots[0]: bno B-tree root (AG-relative block)
+	agfOffCntRoot   = 20 // agf_roots[1]: cnt B-tree root
+	agfOffBnoLevel  = 28 // agf_levels[0]: bno B-tree depth
+	agfOffCntLevel  = 32 // agf_levels[1]: cnt B-tree depth
+	agfOffFLFirst   = 40 // first valid AGFL index
+	agfOffFLLast    = 44 // last valid AGFL index
+	agfOffFLCount   = 48 // number of blocks in the free list
+	agfOffFreeBlks  = 52 // free block count
+	agfOffLongest   = 56 // longest free run
+	agfOffBtreeBlks = 60 // blocks held by the free-space btrees
+	agfOffUUID      = 64 // sb_uuid (16 bytes)
+	agfOffCRC       = 216 // __le32 v5 CRC (covers the sector); agf_crc field after agf_lsn@208
+	agfStructSize   = 224
 )
 
-// AGI v5 field offsets.
+// AGI v5 field offsets. Layout mirrors struct xfs_agi.
 const (
 	agiOffMagic     = 0
+	agiOffVersion   = 4 // agi_versionnum (= 1)
 	agiOffSeqNo     = 8
 	agiOffLength    = 12
 	agiOffCount     = 16  // allocated inode count
@@ -39,8 +47,21 @@ const (
 	agiOffLevel     = 24  // inobt depth
 	agiOffFreeCount = 28  // free inode count
 	agiOffNewIno    = 32  // last allocated inode (AG-relative)
-	agiOffCRC       = 320 // __le32 v5 CRC
-	agiStructSize   = 348
+	agiOffDirIno    = 36  // agi_dirino (unused; null = 0xFFFFFFFF)
+	agiOffUUID      = 296 // sb_uuid (16 bytes); after agi_unlinked[64]
+	agiOffCRC       = 312 // __le32 v5 CRC; agi_crc field
+	agiStructSize   = 344
+)
+
+// AGFL v5 field offsets (the free-list block at sector 3 of each AG).
+// Layout mirrors struct xfs_agfl.
+const (
+	aglOffMagic = 0
+	aglOffSeqNo = 4
+	aglOffUUID  = 8  // sb_uuid (16 bytes)
+	aglOffLSN   = 24 // __be64
+	aglOffCRC   = 32 // __le32
+	aglOffBno   = 36 // __be32 bno[]; (sectorSize-36)/4 entries
 )
 
 // B-tree block header sizes.
@@ -88,7 +109,7 @@ const inobtChunkInodes = 64
 
 // agfBlock reads the AGF block for allocation group ag.
 func agfBlock(r io.ReaderAt, partOff int64, sb *superblock, ag uint32) ([]byte, error) {
-	buf := make([]byte, sb.blockSize)
+	buf := make([]byte, sb.sectSize())
 	off := sb.agFByteOffset(partOff, ag)
 	if err := readBytes(r, off, buf); err != nil {
 		return nil, fmt.Errorf("xfs: read AGF ag=%d: %w", ag, err)
@@ -103,7 +124,7 @@ func agfBlock(r io.ReaderAt, partOff int64, sb *superblock, ag uint32) ([]byte, 
 // writeAGF writes back a modified AGF block, updating its CRC if v5.
 func writeAGF(rw io.WriterAt, partOff int64, sb *superblock, ag uint32, buf []byte) error {
 	if sb.hasCRC {
-		updateCRC(buf, agfOffCRC, agfStructSize)
+		updateCRC(buf, agfOffCRC, 512)
 	}
 	off := sb.agFByteOffset(partOff, ag)
 	if _, err := rw.WriteAt(buf, off); err != nil {
@@ -114,7 +135,7 @@ func writeAGF(rw io.WriterAt, partOff int64, sb *superblock, ag uint32, buf []by
 
 // agiBlock reads the AGI block for allocation group ag.
 func agiBlock(r io.ReaderAt, partOff int64, sb *superblock, ag uint32) ([]byte, error) {
-	buf := make([]byte, sb.blockSize)
+	buf := make([]byte, sb.sectSize())
 	off := sb.agIByteOffset(partOff, ag)
 	if err := readBytes(r, off, buf); err != nil {
 		return nil, fmt.Errorf("xfs: read AGI ag=%d: %w", ag, err)
@@ -129,7 +150,7 @@ func agiBlock(r io.ReaderAt, partOff int64, sb *superblock, ag uint32) ([]byte, 
 // writeAGI writes back a modified AGI block.
 func writeAGI(rw io.WriterAt, partOff int64, sb *superblock, ag uint32, buf []byte) error {
 	if sb.hasCRC {
-		updateCRC(buf, agiOffCRC, agiStructSize)
+		updateCRC(buf, agiOffCRC, 512)
 	}
 	off := sb.agIByteOffset(partOff, ag)
 	if _, err := rw.WriteAt(buf, off); err != nil {
@@ -141,6 +162,48 @@ func writeAGI(rw io.WriterAt, partOff int64, sb *superblock, ag uint32, buf []by
 // agAbsBlock converts an AG-relative block number to an absolute FS block.
 func (sb *superblock) agAbsBlock(ag, agRel uint32) uint64 {
 	return uint64(ag)*uint64(sb.agBlocks) + uint64(agRel)
+}
+
+// syncSuperblockCounts recomputes the filesystem-wide free counters
+// (sb_icount, sb_ifree, sb_fdblocks) from the per-AG AGI/AGF headers and
+// rewrites the primary superblock. Allocation only updates the per-AG headers;
+// without this the global SB counts drift and xfs_repair reports
+// "sb_ifree X, counted Y" / "sb_fdblocks ..." and exits non-zero. Call after
+// any operation that allocates or frees inodes or blocks.
+//
+// sb_fdblocks counts free-space-btree blocks plus the AGFL free-list blocks
+// (agf_flcount), matching how XFS and xfs_repair account for free space.
+func syncSuperblockCounts(rw readerWriterAt, partOff int64, sb *superblock) error {
+	be := binary.BigEndian
+	var icount, ifree, fdblocks uint64
+	for ag := uint32(0); ag < sb.agCount; ag++ {
+		agf, err := agfBlock(rw, partOff, sb, ag)
+		if err != nil {
+			return err
+		}
+		agi, err := agiBlock(rw, partOff, sb, ag)
+		if err != nil {
+			return err
+		}
+		fdblocks += uint64(be.Uint32(agf[agfOffFreeBlks:])) + uint64(be.Uint32(agf[agfOffFLCount:]))
+		icount += uint64(be.Uint32(agi[agiOffCount:]))
+		ifree += uint64(be.Uint32(agi[agiOffFreeCount:]))
+	}
+
+	buf := make([]byte, 512)
+	if err := readBytes(rw, partOff, buf); err != nil {
+		return fmt.Errorf("xfs: sync SB counts: read SB: %w", err)
+	}
+	be.PutUint64(buf[sbOffIcount:], icount)
+	be.PutUint64(buf[sbOffIfree:], ifree)
+	be.PutUint64(buf[sbOffFdblocks:], fdblocks)
+	if sb.hasCRC {
+		updateCRC(buf, sbOffCRC, sbCRCLen)
+	}
+	if _, err := rw.WriteAt(buf, partOff); err != nil {
+		return fmt.Errorf("xfs: sync SB counts: write SB: %w", err)
+	}
+	return nil
 }
 
 // readAGBlock reads an AG-relative block by converting to absolute first.
@@ -777,7 +840,7 @@ func growInobt(rw readerWriterAt, partOff int64, sb *superblock, ag uint32) erro
 	for slot := uint32(0); slot < inobtChunkInodes; slot++ {
 		buf := make([]byte, sb.inodeSize)
 		ino := inoFromAGRel(sb, ag, startIno+slot)
-		initInodeV3(buf, ino, 0 /* mode = free */, sb.inodeSize, 0 /* nlink */)
+		initInodeV3(buf, ino, 0 /* mode = free */, sb.inodeSize, 0 /* nlink */, sb.uuid)
 		// Set di_format to a sane default so any reader sees something
 		// well-formed. The kernel uses XFS_DINODE_FMT_EXTENTS on freshly
 		// inited free inodes.
