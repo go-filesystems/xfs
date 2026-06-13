@@ -309,15 +309,23 @@ func buildSuperblockBuffer(sb *superblock, agCount uint32, uuid [16]byte, label 
 	be.PutUint64(buf[sbOffRootIno:], sb.rootIno)
 	be.PutUint32(buf[sbOffAgBlocks:], sb.agBlocks)
 	be.PutUint32(buf[sbOffAgCount:], agCount)
-	be.PutUint16(buf[sbOffVersionNum:], uint16(xfsSBVersion5)) // low nibble must equal 5 for hasCRC
+	be.PutUint16(buf[sbOffVersionNum:], uint16(xfsSBVersionV5)) // v5 + feature bits (low nibble 5 → hasCRC)
+	be.PutUint16(buf[102:], 512) // sb_sectsize
 	be.PutUint16(buf[sbOffInodeSize:], sb.inodeSize)
 	be.PutUint16(buf[sbOffInopBlock:], sb.inopBlock)
+	buf[121] = 9 // sb_sectlog (log2 512)
 	buf[sbOffBlockLog] = fmtBlockLog
 	buf[sbOffInodeLog] = fmtInodeLog
 	buf[sbOffInopBLog] = sb.inopBLog
 	buf[sbOffAgBlkLog] = sb.agBlkLog
 	buf[sbOffDirBlkLog] = 0
 	be.PutUint32(buf[sbOffFeatIncompat:], xfsSBFeatFType)
+	// v5 feature words + alignment/geometry fields that xfs_repair cross-checks
+	// against the version bits set above.
+	be.PutUint32(buf[sbOffFeatures2:], xfsSBFeatures2)
+	be.PutUint32(buf[sbOffBadFeatures2:], xfsSBFeatures2) // historical duplicate
+	be.PutUint32(buf[sbOffInoAlignmt:], 8)                // ALIGNBIT in versionnum requires this
+	buf[sbOffImaxPct] = 25
 
 	// UUID at offset 32 (sb_uuid, 16 bytes).
 	copy(buf[32:], uuid[:])
