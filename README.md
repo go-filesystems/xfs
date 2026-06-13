@@ -18,6 +18,7 @@ https://docs.kernel.org/filesystems/xfs/index.html
 | ReadFile | ✅ | Full file reads supported, incl. `NREXT64` (64-bit extent counts) images from modern `mkfs.xfs` |
 | WriteFile | ✅ | Full file writes supported |
 | MkDir / Delete / Rename | ✅ | Directory and rename operations supported |
+| Stat / timestamps | ✅ | Legacy and `BIGTIME` (64-bit) timestamps, as written by modern `mkfs.xfs` |
 | ReadLink / Symlinks | ✅ | Inline and remote (extent-based) targets, incl. the v5 `xfs_dsymlink_hdr` written by the kernel |
 | Partitioned images | ✅ | MBR/GPT auto-detected |
 
