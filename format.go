@@ -175,7 +175,7 @@ func fmtWriteAG(f fmtFile, sb *superblock, ag uint32, uuid [16]byte) error {
 	be.PutUint32(agfBuf[agfOffCntLevel:], 1)
 	be.PutUint32(agfBuf[agfOffFreeBlks:], freeBlks)
 	be.PutUint32(agfBuf[agfOffLongest:], freeBlks)
-	updateCRC(agfBuf, agfOffCRC, agfStructSize)
+	updateCRC(agfBuf, agfOffCRC, 512) // AGF CRC covers the 512-byte sector
 	if _, err := f.WriteAt(agfBuf, agBase+int64(sb.blockSize)); err != nil {
 		return fmt.Errorf("write AGF: %w", err)
 	}
@@ -193,7 +193,7 @@ func fmtWriteAG(f fmtFile, sb *superblock, ag uint32, uuid [16]byte) error {
 		be.PutUint32(agiBuf[agiOffFreeCount:], 7)
 	}
 	// else: count=0, freeCount=0 (zero-value already)
-	updateCRC(agiBuf, agiOffCRC, agiStructSize)
+	updateCRC(agiBuf, agiOffCRC, 512) // AGI CRC covers the 512-byte sector
 	if _, err := f.WriteAt(agiBuf, agBase+2*int64(sb.blockSize)); err != nil {
 		return fmt.Errorf("write AGI: %w", err)
 	}
