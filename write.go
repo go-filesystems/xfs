@@ -315,7 +315,7 @@ func createInodeWithData(rw readerWriterAt, partOff int64, sb *superblock, dirIn
 	// A freshly created regular file or symlink has nlink=1 (the dir entry
 	// about to point at it).
 	inodeBuf := make([]byte, sb.inodeSize)
-	initInodeV3(inodeBuf, ino, mode, sb.inodeSize, 1)
+	initInodeV3(inodeBuf, ino, mode, sb.inodeSize, 1, sb.uuid)
 
 	newIn := &inode{
 		num:  ino,
