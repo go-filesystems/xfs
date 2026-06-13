@@ -34,7 +34,10 @@ const (
 	sbOffMagic        = 0
 	sbOffBlockSize    = 4
 	sbOffDBlocks      = 8
+	sbOffLogStart     = 48
 	sbOffRootIno      = 56
+	sbOffRExtSize     = 80
+	sbOffLogBlocks    = 96
 	sbOffIcount       = 128
 	sbOffIfree        = 136
 	sbOffFdblocks     = 144

@@ -16,8 +16,15 @@ const (
 	fmtInodeLog  = 9    // log2(fmtInodeSize)
 	fmtInopBlock = 8    // fmtBlockSize / fmtInodeSize
 	fmtInopBLog  = 3    // log2(fmtInopBlock)
-	fmtAgBlocks  = 1024 // blocks per AG (4 MiB)
-	fmtAgBlkLog  = 10   // log2(fmtAgBlocks)
+	fmtAgBlocks  = 16384 // blocks per AG (64 MiB) — large enough to host the log in AG 0
+	fmtAgBlkLog  = 14    // log2(fmtAgBlocks)
+
+	// Internal log: a contiguous run in AG 0 immediately after the metadata
+	// blocks. XFS requires a minimum internal-log size of XFS_MIN_LOG_BYTES
+	// (10 MiB). The region is left zeroed — mkfs.xfs does the same, and
+	// xfs_repair treats a zeroed log on a freshly-formatted fs as clean.
+	fmtLogBlocks = 2560 // 10 MiB / 4 KiB
+	fmtLogStart  = fmtMetaBlocksAG0
 
 	// Per-AG block assignment:
 	//   0  – primary/secondary superblock
@@ -153,7 +160,9 @@ func fmtWriteAG(f fmtFile, sb *superblock, ag uint32, uuid [16]byte) error {
 	// ── AGF (block 1 of AG) ────────────────────────────────────────────────
 	firstFree := uint32(fmtMetaBlocksAGN)
 	if ag == 0 {
-		firstFree = uint32(fmtMetaBlocksAG0)
+		// AG 0 also reserves the internal log immediately after the metadata,
+		// so its free space starts past the log (keeps a single free extent).
+		firstFree = uint32(fmtMetaBlocksAG0) + fmtLogBlocks
 	}
 	freeBlks := sb.agBlocks - firstFree
 	agfBuf := make([]byte, fmtBlockSize)
@@ -291,8 +300,13 @@ func fmtWriteRootInode(f fmtFile, sb *superblock) error {
 
 func fmtWriteSuperblock(f fmtFile, sb *superblock, agCount uint32, uuid [16]byte, label string) error {
 	buf := buildSuperblockBuffer(sb, agCount, uuid, label)
-	if _, err := f.WriteAt(buf, 0); err != nil {
-		return fmt.Errorf("write superblock: %w", err)
+	// Write the primary SB at byte 0 and an identical secondary SB at block 0
+	// of every other AG; xfs_repair cross-checks secondaries against the primary.
+	for ag := uint32(0); ag < agCount; ag++ {
+		off := int64(ag) * int64(sb.agBlocks) * int64(sb.blockSize)
+		if _, err := f.WriteAt(buf, off); err != nil {
+			return fmt.Errorf("write superblock AG %d: %w", ag, err)
+		}
 	}
 	return nil
 }
@@ -324,7 +338,7 @@ func buildSuperblockBuffer(sb *superblock, agCount uint32, uuid [16]byte, label 
 	// against the version bits set above.
 	be.PutUint32(buf[sbOffFeatures2:], xfsSBFeatures2)
 	be.PutUint32(buf[sbOffBadFeatures2:], xfsSBFeatures2) // historical duplicate
-	be.PutUint32(buf[sbOffInoAlignmt:], 8)                // ALIGNBIT in versionnum requires this
+	be.PutUint32(buf[sbOffInoAlignmt:], 2)                // ALIGNBIT in versionnum requires this
 	buf[sbOffImaxPct] = 25
 
 	// Filesystem-wide totals that xfs_repair cross-checks against AG metadata.
@@ -332,12 +346,23 @@ func buildSuperblockBuffer(sb *superblock, agCount uint32, uuid [16]byte, label 
 	// (AG0 reserves fmtMetaBlocksAG0 blocks, AG1+ reserve fmtMetaBlocksAGN);
 	// icount/ifree match the single 8-inode chunk pre-allocated in AG0.
 	dblocks := uint64(agCount) * uint64(sb.agBlocks)
-	fdblocks := uint64(sb.agBlocks-fmtMetaBlocksAG0) +
+	// AG 0's free space excludes both its metadata and the internal log.
+	fdblocks := uint64(sb.agBlocks-fmtMetaBlocksAG0-fmtLogBlocks) +
 		uint64(agCount-1)*uint64(sb.agBlocks-fmtMetaBlocksAGN)
 	be.PutUint64(buf[sbOffDBlocks:], dblocks)
 	be.PutUint64(buf[sbOffIcount:], 8)
 	be.PutUint64(buf[sbOffIfree:], 7)
 	be.PutUint64(buf[sbOffFdblocks:], fdblocks)
+
+	// Internal log: contiguous run in AG 0 after the metadata (zeroed region;
+	// the kernel formats it on first mount).
+	be.PutUint64(buf[sbOffLogStart:], fmtLogStart)
+	be.PutUint32(buf[sbOffLogBlocks:], fmtLogBlocks)
+
+	// No realtime device: rblocks/rextents stay 0, but rextsize must be a
+	// valid non-zero extent size (1 block) or xfs_repair flags "inconsistent
+	// realtime geometry".
+	be.PutUint32(buf[sbOffRExtSize:], 1)
 
 	// UUID at offset 32 (sb_uuid, 16 bytes).
 	copy(buf[32:], uuid[:])
