@@ -278,7 +278,7 @@ func TestZeroInode(t *testing.T) {
 
 func TestInitInodeV3(t *testing.T) {
 	buf := make([]byte, 512)
-	initInodeV3(buf, 256, 0x81A4, 512, 1)
+	initInodeV3(buf, 256, 0x81A4, 512, 1, [16]byte{})
 
 	be := binary.BigEndian
 	magic := be.Uint16(buf[inoOffMagic:])
