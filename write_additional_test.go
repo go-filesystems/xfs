@@ -879,37 +879,37 @@ func TestWriteAdditionalFinalBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("addEntryToBlockDir leaf skip and insert error", func(t *testing.T) {
+	t.Run("addEntryToBlockDir skips leaf extents and rebuilds the data block", func(t *testing.T) {
 		oldDirExtents := writeDirExtents
 		oldReadRaw := writeReadRawBlock
-		oldInsert := writeInsertIntoSlot
+		oldWriteRaw := writeWriteRawBlock
 		leafLogBlock := dirLeafByteOffset / uint64(sb.blockSize)
+		// First extent is the leaf block (must be skipped); the data block is 2.
 		writeDirExtents = func(io.ReaderAt, int64, *superblock, *inode) ([]extent, error) {
 			return []extent{{startOff: leafLogBlock, startBlock: 1, count: 1}, {startOff: 0, startBlock: 2, count: 1}}, nil
 		}
 		writeReadRawBlock = func(_ io.ReaderAt, _ int64, _ *superblock, block uint64) ([]byte, error) {
 			if block != 2 {
-				return make([]byte, sb.blockSize), nil
+				t.Fatalf("read block %d; leaf extent should have been skipped", block)
 			}
-			blk := make([]byte, sb.blockSize)
-			markSlotFree(blk, dirDataHdrSize(sb.hasCRC), len(blk)-dirDataHdrSize(sb.hasCRC))
-			return blk, nil
+			return make([]byte, sb.blockSize), nil
 		}
-		called := false
-		writeInsertIntoSlot = func([]byte, int, int, uint64, string, uint8, bool, bool, uint64) error {
-			called = true
-			return errBoom
+		var wroteBlock uint64
+		wrote := false
+		writeWriteRawBlock = func(_ io.WriterAt, _ int64, _ *superblock, block uint64, _ []byte) error {
+			wroteBlock, wrote = block, true
+			return nil
 		}
 		t.Cleanup(func() {
 			writeDirExtents = oldDirExtents
 			writeReadRawBlock = oldReadRaw
-			writeInsertIntoSlot = oldInsert
+			writeWriteRawBlock = oldWriteRaw
 		})
-		if err := addEntryToBlockDir(newMemRW(0), 0, sb, newTestInode(122, 0x4000, inodeFmtExtents, 0), 7, "file", 1); !errors.Is(err, errBoom) {
-			t.Fatalf("expected addEntryToBlockDir insert error %v, got %v", errBoom, err)
+		if err := addEntryToBlockDir(newMemRW(0), 0, sb, newTestInode(122, 0x4000, inodeFmtExtents, 0), 7, "file", 1); err != nil {
+			t.Fatalf("addEntryToBlockDir: %v", err)
 		}
-		if !called {
-			t.Fatal("expected addEntryToBlockDir to reach insertIntoSlot after skipping leaf extents")
+		if !wrote || wroteBlock != 2 {
+			t.Fatalf("expected rebuilt block written to data block 2, wrote=%v block=%d", wrote, wroteBlock)
 		}
 	})
 }
