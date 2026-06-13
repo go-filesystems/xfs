@@ -26,10 +26,10 @@ const (
 	magicInode uint16 = 0x494E     // "IN"   — inode
 
 	// Directory data-block magic numbers.
-	magicDir3Block uint32 = 0x58443342 // "XD3B" — v5 single-block directory
-	magicDir3Data  uint32 = 0x58443344 // "XD3D" — v5 multi-block directory data
-	magicDir2Block uint32 = 0x58443221 // v4 single-block directory
-	magicDir2Data  uint32 = 0x58443231 // v4 multi-block directory data
+	magicDir3Block uint32 = 0x58444233 // "XDB3" — v5 single-block directory
+	magicDir3Data  uint32 = 0x58444433 // "XDD3" — v5 multi-block directory data
+	magicDir2Block uint32 = 0x58443242 // "XD2B" — v4 single-block directory
+	magicDir2Data  uint32 = 0x58443244 // "XD2D" — v4 multi-block directory data
 
 	// AG free-space B-tree magic numbers.
 	magicABTB   uint32 = 0x41423342 // "AB3B" — v5 bno B-tree

@@ -142,9 +142,13 @@ func removeSFEntry(rw readerWriterAt, partOff int64, sb *superblock, in *inode, 
 		if n == name {
 			// Remove: shift everything after this entry left.
 			entEnd := off
+			entLen := entEnd - entStart
 			copy(fork[entStart:], fork[entEnd:])
-			clear(fork[len(fork)-(entEnd-entStart):])
+			clear(fork[len(fork)-entLen:])
 			fork[0] = byte(count - 1)
+			// Shrink di_size by the removed entry, or xfs_repair reads stale
+			// bytes past the live entries and flags the data fork corrupt.
+			setInodeSize(in, in.size-uint64(entLen))
 			return deleteWriteInode(rw, partOff, sb, in)
 		}
 	}
@@ -153,46 +157,55 @@ func removeSFEntry(rw readerWriterAt, partOff int64, sb *superblock, in *inode, 
 
 // removeBlockDirEntry scans block/leaf/node-form directory data blocks and
 // marks the entry for name as a free slot.
+// removeBlockDirEntry removes name from a single-block directory by reading
+// its entries, dropping the named one, and rebuilding the block through
+// buildBlockDirBlock — keeping the data entries, free region, leaf array and
+// block tail mutually consistent (marking a slot free in place left the
+// bestfree table and leaf array stale, which xfs_repair flags).
 func removeBlockDirEntry(rw readerWriterAt, partOff int64, sb *superblock, in *inode, name string) error {
 	exts, err := dirExtents(rw, partOff, sb, in)
 	if err != nil {
 		return err
 	}
 	leafLogBlock := dirLeafByteOffset / uint64(sb.blockSize)
-
+	var absBlock uint64
+	found := false
 	for _, e := range exts {
 		if e.startOff >= leafLogBlock {
 			continue
 		}
-		for b := uint32(0); b < e.count; b++ {
-			absBlock := e.startBlock + uint64(b)
-			blk, err := readRawBlock(rw, partOff, sb, absBlock)
-			if err != nil {
-				return err
-			}
-			off, sz := findEntryInBlock(blk, name, sb.hasFType, sb.hasCRC)
-			if off < 0 {
-				continue
-			}
-			// Mark the entry as a free slot.
-			// Attempt to merge with an immediately following free slot.
-			totalFree := sz
-			nextOff := off + sz
-			if nextOff+4 <= len(blk) {
-				nextFreeTag := binary.BigEndian.Uint16(blk[nextOff:])
-				if nextFreeTag == dirFreeTag {
-					nextLen := int(binary.BigEndian.Uint16(blk[nextOff+2:]))
-					totalFree += nextLen
-				}
-			}
-			markSlotFree(blk, off, totalFree)
-			if sb.hasCRC {
-				updateCRC(blk, 4, len(blk))
-			}
-			return writeRawBlock(rw, partOff, sb, absBlock, blk)
-		}
+		absBlock = e.startBlock
+		found = true
+		break
 	}
-	return ErrNotFound
+	if !found {
+		return ErrNotFound
+	}
+
+	blk, err := readRawBlock(rw, partOff, sb, absBlock)
+	if err != nil {
+		return err
+	}
+	parentIno := blockDirParent(blk, sb.hasFType, sb.hasCRC)
+	current := parseDirBlock(blk, sb.hasFType, sb.hasCRC) // excludes "." / ".."
+	entries := make([]dirEnt, 0, len(current))
+	removed := false
+	for _, e := range current {
+		if e.Name == name {
+			removed = true
+			continue
+		}
+		entries = append(entries, dirEnt{e.Name, e.Inode, e.FileType})
+	}
+	if !removed {
+		return ErrNotFound
+	}
+
+	nblk := make([]byte, len(blk))
+	if err := buildBlockDirBlock(sb, nblk, absBlock, in.num, parentIno, entries); err != nil {
+		return err
+	}
+	return writeRawBlock(rw, partOff, sb, absBlock, nblk)
 }
 
 // findEntryInBlock returns the byte offset and size of the directory entry

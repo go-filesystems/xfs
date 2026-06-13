@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"sort"
 	"strings"
 )
 
@@ -412,16 +413,149 @@ func addDirEntry(rw readerWriterAt, partOff int64, sb *superblock, dirIn *inode,
 	}
 }
 
-// convertSFToBlock allocates a directory data block, copies all sf entries
-// into it, plus the new entry, and updates the directory inode.
+// dirEnt is a directory entry to be laid down in a block-form directory.
+type dirEnt struct {
+	name  string
+	ino   uint64
+	ftype uint8
+}
+
+// buildBlockDirBlock fills blk (a directory block of len blkSize) with a
+// single-block ("block form") directory: the dir3/dir2 header, "." and ".."
+// (always directories), the supplied entries, one free region recorded in
+// bestfree, and the trailing leaf-entry array + xfs_dir2_block_tail. It is the
+// single source of truth for the on-disk block layout, shared by short-form
+// conversion and by subsequent adds. Returns an error if the entries don't fit
+// one block (leaf form, not yet implemented).
+func buildBlockDirBlock(sb *superblock, blk []byte, absBlock, ownerIno, parentIno uint64, entries []dirEnt) error {
+	be := binary.BigEndian
+	for i := range blk {
+		blk[i] = 0
+	}
+	blkSize := len(blk)
+	hdrSize := dirDataHdrSize(sb.hasCRC)
+
+	if sb.hasCRC {
+		// xfs_dir3_blk_hdr: magic@0, crc@4, blkno@8, lsn@16, uuid@24, owner@40.
+		be.PutUint32(blk[0:], magicDir3Block)
+		be.PutUint64(blk[8:], absBlock*fmtDaddrPerBlock)
+		copy(blk[24:40], sb.uuid[:])
+		be.PutUint64(blk[40:], ownerIno)
+	} else {
+		be.PutUint32(blk[0:], magicDir2Block)
+	}
+
+	all := make([]dirEnt, 0, len(entries)+2)
+	all = append(all, dirEnt{".", ownerIno, 2}, dirEnt{"..", parentIno, 2})
+	all = append(all, entries...)
+
+	// Tail (count+stale) is the last 8 bytes; the leaf array (8 bytes/entry)
+	// precedes it.
+	count := len(all)
+	tailOff := blkSize - 8
+	leafStart := tailOff - count*8
+
+	type leafEnt struct{ hash, addr uint32 }
+	leaves := make([]leafEnt, 0, count)
+	off := hdrSize
+	for _, e := range all {
+		sz := dirEntrySize(len(e.name), sb.hasFType)
+		if off+sz > leafStart {
+			return fmt.Errorf("xfs: directory %d too large for single-block form (%d entries); leaf form not implemented", ownerIno, count)
+		}
+		writeDirEntry(blk, off, e.ino, e.name, e.ftype, sb.hasFType)
+		leaves = append(leaves, leafEnt{xfsDirHash([]byte(e.name)), uint32(off) >> 3})
+		off += sz
+	}
+	endData := off
+
+	// The gap between the data entries and the leaf array is one free region,
+	// recorded as an xfs_dir2_data_unused entry and in bestfree[0].
+	if leafStart > endData {
+		freeLen := leafStart - endData
+		be.PutUint16(blk[endData:], 0xFFFF)                    // freetag
+		be.PutUint16(blk[endData+2:], uint16(freeLen))         // length
+		be.PutUint16(blk[endData+freeLen-2:], uint16(endData)) // tag = own offset
+		bfOff := 48                                            // dir3 hdr: bestfree[3] at 48
+		if !sb.hasCRC {
+			bfOff = 4 // dir2 hdr: bestfree[3] right after magic
+		}
+		be.PutUint16(blk[bfOff:], uint16(endData))
+		be.PutUint16(blk[bfOff+2:], uint16(freeLen))
+	}
+
+	// Leaf entries, sorted by hash (ties broken by address).
+	sort.Slice(leaves, func(i, j int) bool {
+		if leaves[i].hash != leaves[j].hash {
+			return leaves[i].hash < leaves[j].hash
+		}
+		return leaves[i].addr < leaves[j].addr
+	})
+	for i, le := range leaves {
+		p := leafStart + i*8
+		be.PutUint32(blk[p:], le.hash)
+		be.PutUint32(blk[p+4:], le.addr)
+	}
+
+	// xfs_dir2_block_tail.
+	be.PutUint32(blk[tailOff:], uint32(count))
+	be.PutUint32(blk[tailOff+4:], 0) // stale
+
+	if sb.hasCRC {
+		updateCRC(blk, 4, blkSize) // CRC at offset 4 in dir3_blk_hdr
+	}
+	return nil
+}
+
+// blockDirParent returns the inode number stored in a block-form directory's
+// ".." entry (its parent), or 0 if not found.
+func blockDirParent(blk []byte, hasFType, hasCRC bool) uint64 {
+	off := dirDataHdrSize(hasCRC)
+	for off+10 <= len(blk) {
+		if binary.BigEndian.Uint16(blk[off:]) == dirFreeTag {
+			length := int(binary.BigEndian.Uint16(blk[off+2:]))
+			if length < 8 {
+				break
+			}
+			off += length
+			continue
+		}
+		ino := binary.BigEndian.Uint64(blk[off:])
+		if ino == 0 {
+			off += 8
+			continue
+		}
+		namelen := int(blk[off+8])
+		if namelen == 0 {
+			break
+		}
+		if off+9+namelen <= len(blk) && string(blk[off+9:off+9+namelen]) == ".." {
+			return ino
+		}
+		off += dirEntrySize(namelen, hasFType)
+	}
+	return 0
+}
+
+// convertSFToBlock promotes a short-form directory to block form: it allocates
+// a directory block and lays down all existing entries plus the new one.
 func convertSFToBlock(rw readerWriterAt, partOff int64, sb *superblock, dirIn *inode, newIno uint64, newName string, newFtype uint8) error {
-	// Collect existing sf entries.
-	existing, err := writeSFReadDir(dirIn.dataFork(), sb.hasFType)
+	be := binary.BigEndian
+
+	// The parent inode lives in the short-form header (after count + i8count).
+	fork := dirIn.dataFork()
+	var parentIno uint64
+	if fork[1] > 0 {
+		parentIno = be.Uint64(fork[2:])
+	} else {
+		parentIno = uint64(be.Uint32(fork[2:]))
+	}
+
+	existing, err := writeSFReadDir(fork, sb.hasFType)
 	if err != nil {
 		return err
 	}
 
-	// Allocate one directory data block (dirFSBlocks() filesystem blocks).
 	dirBlocks := sb.dirFSBlocks()
 	ag := inoAG(sb, dirIn.num)
 	absBlock, err := writeAllocBlocks(rw, partOff, sb, ag, dirBlocks)
@@ -429,56 +563,25 @@ func convertSFToBlock(rw readerWriterAt, partOff int64, sb *superblock, dirIn *i
 		return fmt.Errorf("xfs: convertSFToBlock: %w", err)
 	}
 
-	// Build the directory data block.
-	blkSize := int(sb.blockSize) * int(dirBlocks)
-	blk := make([]byte, blkSize)
-
-	// Write header.
-	hdrSize := dirDataHdrSize(sb.hasCRC)
-	if sb.hasCRC {
-		binary.BigEndian.PutUint32(blk[0:], magicDir3Block)
-		// blk_lsn, uuid, owner, blkno — left as zero / will be set if needed
-	} else {
-		binary.BigEndian.PutUint32(blk[0:], magicDir2Block)
-	}
-
-	// Write dot and dotdot entries.
-	off := hdrSize
-	off += writeDirEntry(blk, off, dirIn.num, ".", newFtype, sb.hasFType)
-	// For dotdot we'd need the parent inode. Use dirIn.num as placeholder.
-	off += writeDirEntry(blk, off, dirIn.num, "..", newFtype, sb.hasFType)
-
-	// Write existing entries.
+	entries := make([]dirEnt, 0, len(existing)+1)
 	for _, e := range existing {
 		if e.Name == "." || e.Name == ".." {
 			continue
 		}
-		off += writeDirEntry(blk, off, e.Inode, e.Name, e.FileType, sb.hasFType)
+		entries = append(entries, dirEnt{e.Name, e.Inode, e.FileType})
 	}
+	entries = append(entries, dirEnt{newName, newIno, newFtype})
 
-	// Write the new entry.
-	off += writeDirEntry(blk, off, newIno, newName, newFtype, sb.hasFType)
-
-	// Mark remaining space as free.
-	// For block-form, we need a tail at the end before the leaf entries.
-	// Simple block-form tail: 8-byte xfs_dir2_block_tail at blkSize-8.
-	tailOff := blkSize - 8
-	if off < tailOff {
-		markSlotFree(blk, off, tailOff-off)
+	blkSize := int(sb.blockSize) * int(dirBlocks)
+	blk := make([]byte, blkSize)
+	if err := buildBlockDirBlock(sb, blk, absBlock, dirIn.num, parentIno, entries); err != nil {
+		return err
 	}
-	// Block tail: count=0 (no leaf entries), stale=0.
-	binary.BigEndian.PutUint32(blk[tailOff:], 0)
-	binary.BigEndian.PutUint32(blk[tailOff+4:], 0)
-
-	if sb.hasCRC {
-		updateCRC(blk, 4, blkSize) // CRC at offset 4 in dir3_blk_hdr
-	}
-
 	if err := writeWriteBlocksData(rw, partOff, sb, absBlock, dirBlocks, blk); err != nil {
 		return err
 	}
 
-	// Update inode to point at the new block via an extent.
+	// Point the inode at the new block via a single extent.
 	exts := []extent{{startOff: 0, startBlock: absBlock, count: dirBlocks}}
 	setInodeFormat(dirIn, inodeFmtExtents)
 	setInodeNBlocks(dirIn, uint64(dirBlocks))
@@ -490,32 +593,48 @@ func convertSFToBlock(rw readerWriterAt, partOff int64, sb *superblock, dirIn *i
 	return writeWriteInode(rw, partOff, sb, dirIn)
 }
 
-// addEntryToBlockDir wraps the dir.go helper, adapting the interface.
+// addEntryToBlockDir adds an entry to an existing single-block directory by
+// reading its current entries, appending the new one, and rebuilding the block
+// through buildBlockDirBlock — keeping the data entries, free region, leaf
+// array and tail mutually consistent (which incremental insertion did not).
 func addEntryToBlockDir(rw readerWriterAt, partOff int64, sb *superblock, dirIn *inode, childIno uint64, name string, ftype uint8) error {
 	exts, err := writeDirExtents(rw, partOff, sb, dirIn)
 	if err != nil {
 		return err
 	}
-	need := dirEntrySize(len(name), sb.hasFType)
 	leafLogBlock := dirLeafByteOffset / uint64(sb.blockSize)
-
+	var absBlock uint64
+	found := false
 	for _, e := range exts {
 		if e.startOff >= leafLogBlock {
 			continue
 		}
-		for b := uint32(0); b < e.count; b++ {
-			absBlock := e.startBlock + uint64(b)
-			blk, err := writeReadRawBlock(rw, partOff, sb, absBlock)
-			if err != nil {
-				return err
-			}
-			if offs := findFreeSlot(blk, need, sb.hasFType, sb.hasCRC); offs >= 0 {
-				if err := writeInsertIntoSlot(blk, offs, need, childIno, name, ftype, sb.hasFType, sb.hasCRC, absBlock); err != nil {
-					return err
-				}
-				return writeWriteRawBlock(rw, partOff, sb, absBlock, blk)
-			}
-		}
+		absBlock = e.startBlock
+		found = true
+		break
 	}
-	return fmt.Errorf("xfs: no free slot found in directory inode %d for %q; consider expanding the directory", dirIn.num, name)
+	if !found {
+		return fmt.Errorf("xfs: directory inode %d has no data block", dirIn.num)
+	}
+
+	blk, err := writeReadRawBlock(rw, partOff, sb, absBlock)
+	if err != nil {
+		return err
+	}
+	parentIno := blockDirParent(blk, sb.hasFType, sb.hasCRC)
+	existing := parseDirBlock(blk, sb.hasFType, sb.hasCRC) // excludes "." / ".."
+	entries := make([]dirEnt, 0, len(existing)+1)
+	for _, e := range existing {
+		if e.Name == name {
+			return fmt.Errorf("xfs: %q already exists", name)
+		}
+		entries = append(entries, dirEnt{e.Name, e.Inode, e.FileType})
+	}
+	entries = append(entries, dirEnt{name, childIno, ftype})
+
+	nblk := make([]byte, len(blk))
+	if err := buildBlockDirBlock(sb, nblk, absBlock, dirIn.num, parentIno, entries); err != nil {
+		return err
+	}
+	return writeWriteRawBlock(rw, partOff, sb, absBlock, nblk)
 }
