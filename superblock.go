@@ -44,17 +44,24 @@ const (
 	sbOffInopBLog     = 123
 	sbOffAgBlkLog     = 124
 	sbOffDirBlkLog    = 192
+	sbOffImaxPct      = 127
+	sbOffInoAlignmt   = 180
 	sbOffFeatures2    = 200
+	sbOffBadFeatures2 = 204
 	sbOffFeatIncompat = 216
 	sbOffCRC          = 224 // v5 only, __le32
-	sbCRCLen          = 224 // bytes covered by CRC
+	sbCRCLen          = 512 // CRC covers the whole superblock sector (sectsize)
 )
 
 // XFS version and feature bits.
 const (
 	xfsSBVersionBits = 0x000F
 	xfsSBVersion5    = 5
-	xfsSBFeatFType   = 0x00000008 // v5 sb_features_incompat ftype
+	// xfsSBVersionV5 is the canonical v5 sb_versionnum: version 5 plus
+	// MOREBITS|DIRV2|EXTFLG|LOGV2|ALIGN|NLINK — what mkfs.xfs writes (0xb4a5).
+	xfsSBVersionV5  = 0xb4a5
+	xfsSBFeatures2  = 0x0000018a // sb_features2 (LAZYSBCOUNT|ATTR2|PROJID32|FTYPE)
+	xfsSBFeatFType  = 0x00000001 // v5 sb_features_incompat ftype (XFS_SB_FEAT_INCOMPAT_FTYPE)
 	xfsSBv4FeatFType = 0x00000200 // v4 sb_features2 ftype (XFS_SB_VERSION2_FTYPE)
 )
 
