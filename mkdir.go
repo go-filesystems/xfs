@@ -70,7 +70,7 @@ func makeDir(rw readerWriterAt, partOff int64, sb *superblock, p string, perm os
 	// A fresh empty directory has nlink=2: the parent's entry pointing at
 	// it + the "." self-reference inside its own short-form data fork.
 	inodeBuf := make([]byte, sb.inodeSize)
-	initInodeV3(inodeBuf, ino, mode, sb.inodeSize, 2)
+	initInodeV3(inodeBuf, ino, mode, sb.inodeSize, 2, sb.uuid)
 
 	newIn := &inode{
 		num:    ino,

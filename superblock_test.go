@@ -202,15 +202,17 @@ func TestReadSuperblock_PartitionOffset(t *testing.T) {
 // ──────────────────── superblock byte-offset helpers ───────────────────────
 
 func TestAgFByteOffset(t *testing.T) {
-	sb := defaultSB() // blockSize=4096, agBlocks=16384
-	// AG 0 AGF: partOff + 0*16384*4096 + 4096 = 4096
+	sb := defaultSB() // blockSize=4096, agBlocks=16384, sectorSize defaults to 512
+	// The AG headers (SB/AGF/AGI/AGFL) are sector-aligned inside block 0, so
+	// the AGF lives at sector 1 of the AG, not block 1.
+	// AG 0 AGF: partOff + 0*16384*4096 + 512 = 512
 	got := sb.agFByteOffset(0, 0)
-	if got != 4096 {
-		t.Errorf("agFByteOffset(0,0) = %d, want 4096", got)
+	if got != 512 {
+		t.Errorf("agFByteOffset(0,0) = %d, want 512", got)
 	}
-	// AG 1 AGF: partOff + 1*16384*4096 + 4096 = 67112960
+	// AG 1 AGF: partOff + 1*16384*4096 + 512
 	got = sb.agFByteOffset(0, 1)
-	want := int64(16384*4096) + 4096
+	want := int64(16384*4096) + 512
 	if got != want {
 		t.Errorf("agFByteOffset(0,1) = %d, want %d", got, want)
 	}
@@ -219,8 +221,8 @@ func TestAgFByteOffset(t *testing.T) {
 func TestAgIByteOffset(t *testing.T) {
 	sb := defaultSB()
 	got := sb.agIByteOffset(0, 0)
-	if got != 8192 { // 2 * 4096
-		t.Errorf("agIByteOffset(0,0) = %d, want 8192", got)
+	if got != 1024 { // sector 2 = 2 * 512
+		t.Errorf("agIByteOffset(0,0) = %d, want 1024", got)
 	}
 }
 

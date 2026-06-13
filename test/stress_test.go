@@ -163,8 +163,9 @@ func resolveStressKnobs(t testing.TB) stressKnobs {
 // ──────────────────── Image factory ────────────────────────────────────────
 
 // agSize is the per-AG byte budget used by filesystem_xfs.Format
-// (matches the package constant fmtMinSize = 1024 * 4096 = 4 MiB).
-const agSize = int64(1024 * 4096)
+// (matches the package constant fmtMinSize = fmtAgBlocks * fmtBlockSize =
+// 16384 * 4096 = 64 MiB, which is also the minimum image size of one AG).
+const agSize = int64(16384 * 4096)
 
 // formatImage creates a fresh XFS image of `ags` allocation groups (each
 // 4 MiB) and returns the path. The image is owned by t.TempDir so it is

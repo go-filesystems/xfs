@@ -22,6 +22,7 @@ const (
 	magicSB    uint32 = 0x58465342 // "XFSB" — superblock
 	magicAGF   uint32 = 0x58414746 // "XAGF" — AG free-space header
 	magicAGI   uint32 = 0x58414749 // "XAGI" — AG inode header
+	magicAGFL  uint32 = 0x5841464C // "XAFL" — AG free-list block (v5)
 	magicInode uint16 = 0x494E     // "IN"   — inode
 
 	// Directory data-block magic numbers.
@@ -37,7 +38,7 @@ const (
 	magicABTCv4 uint32 = 0x41425443 // "ABTC" — v4 cnt B-tree
 
 	// Inode B-tree magic numbers.
-	magicIAB3   uint32 = 0x41423349 // "AB3I" — v5 inobt
+	magicIAB3   uint32 = 0x49414233 // "IAB3" — v5 inobt
 	magicIABTv4 uint32 = 0x54494142 // "TIAB" — v4 inobt
 
 	// Inode data-fork formats (di_format).

@@ -9,8 +9,9 @@ import (
 
 // Internal superblock representation — only the fields we use at runtime.
 type superblock struct {
-	blockSize uint32
-	agBlocks  uint32 // blocks per allocation group
+	blockSize  uint32
+	sectorSize uint32 // sb_sectsize; AG headers (SB/AGF/AGI/AGFL) are sector-aligned
+	agBlocks   uint32 // blocks per allocation group
 	agCount   uint32
 	rootIno   uint64 // root directory inode number
 	inodeSize uint16
@@ -34,6 +35,10 @@ const (
 	sbOffMagic        = 0
 	sbOffBlockSize    = 4
 	sbOffDBlocks      = 8
+	sbOffRbmino       = 64  // realtime bitmap inode (rootino+1)
+	sbOffRsumino      = 72  // realtime summary inode (rootino+2)
+	sbOffSectSize     = 102 // sb_sectsize (__be16)
+	sbOffSectLog      = 121 // sb_sectlog (__u8)
 	sbOffLogStart     = 48
 	sbOffRootIno      = 56
 	sbOffRExtSize     = 80
@@ -98,9 +103,14 @@ func readSuperblock(r io.ReaderAt, partOff int64) (*superblock, error) {
 		hasFType = (feat2 & xfsSBv4FeatFType) != 0
 	}
 
+	sectorSize := uint32(be.Uint16(buf[sbOffSectSize:]))
+	if sectorSize == 0 {
+		sectorSize = 512
+	}
 	sb := &superblock{
-		blockSize: be.Uint32(buf[sbOffBlockSize:]),
-		agBlocks:  be.Uint32(buf[sbOffAgBlocks:]),
+		blockSize:  be.Uint32(buf[sbOffBlockSize:]),
+		sectorSize: sectorSize,
+		agBlocks:   be.Uint32(buf[sbOffAgBlocks:]),
 		agCount:   be.Uint32(buf[sbOffAgCount:]),
 		rootIno:   be.Uint64(buf[sbOffRootIno:]),
 		inodeSize: be.Uint16(buf[sbOffInodeSize:]),
@@ -128,14 +138,29 @@ func (sb *superblock) agByteOffset(ag uint32) int64 {
 	return int64(ag) * int64(sb.agBlocks) * int64(sb.blockSize)
 }
 
-// agFByteOffset returns the absolute byte offset of the AGF (block 1 of AG ag).
-func (sb *superblock) agFByteOffset(partOff int64, ag uint32) int64 {
-	return partOff + sb.agByteOffset(ag) + int64(sb.blockSize)
+// sectSize returns the on-disk sector size, defaulting to 512 for an
+// in-memory superblock built before the field was populated.
+func (sb *superblock) sectSize() int64 {
+	if sb.sectorSize == 0 {
+		return 512
+	}
+	return int64(sb.sectorSize)
 }
 
-// agIByteOffset returns the absolute byte offset of the AGI (block 2 of AG ag).
+// agFByteOffset returns the absolute byte offset of the AGF, which lives at
+// sector 1 of the AG (immediately after the superblock sector, inside block 0).
+func (sb *superblock) agFByteOffset(partOff int64, ag uint32) int64 {
+	return partOff + sb.agByteOffset(ag) + sb.sectSize()
+}
+
+// agIByteOffset returns the absolute byte offset of the AGI (sector 2 of the AG).
 func (sb *superblock) agIByteOffset(partOff int64, ag uint32) int64 {
-	return partOff + sb.agByteOffset(ag) + 2*int64(sb.blockSize)
+	return partOff + sb.agByteOffset(ag) + 2*sb.sectSize()
+}
+
+// agFLByteOffset returns the absolute byte offset of the AGFL (sector 3 of the AG).
+func (sb *superblock) agFLByteOffset(partOff int64, ag uint32) int64 {
+	return partOff + sb.agByteOffset(ag) + 3*sb.sectSize()
 }
 
 // dirBlocksPerBlock returns the number of filesystem blocks per directory
