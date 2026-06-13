@@ -295,6 +295,15 @@ func deleteDir(rw readerWriterAt, partOff int64, sb *superblock, p string) error
 		return fmt.Errorf("xfs: deleteDir remove parent entry: %w", err)
 	}
 
+	// Removing a subdirectory drops the parent's link count by one (the
+	// subdirectory's ".." no longer references it) — the mirror of makeDir.
+	if nl := binary.BigEndian.Uint32(dirIn.raw[inoOffNLink:]); nl > 0 {
+		binary.BigEndian.PutUint32(dirIn.raw[inoOffNLink:], nl-1)
+		if err := deleteWriteInode(rw, partOff, sb, dirIn); err != nil {
+			return fmt.Errorf("xfs: deleteDir update parent nlink: %w", err)
+		}
+	}
+
 	// Re-read to free the right inode.
 	targetIn, err = deleteReadInode(rw, partOff, sb, childInoNum)
 	if err != nil {
