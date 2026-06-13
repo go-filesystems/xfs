@@ -50,8 +50,18 @@ const (
 	inoOffForkOff  = 82
 	inoOffGen      = 92  // __be32 inode generation
 	inoOffCRC      = 100 // __le32, v3 only
+	inoOffFlags2   = 120 // __be64 di_flags2, v3 only
 	inoOffCRTime   = 144 // v3 only: legacy timespec (sec+nsec)
 	inoOffIno      = 152 // uint64 absolute inode number, v3 only
+
+	// di_big_nextents: 64-bit data-fork extent count present when the inode
+	// carries the NREXT64 feature. It overlays the legacy v3 padding right
+	// after di_projid_hi, NOT the di_nextents slot at offset 76.
+	inoOffBigNExtents = 24
+
+	// xfsDiflag2Nrext64 (XFS_DIFLAG2_NREXT64) marks an inode that stores its
+	// data-fork extent count in di_big_nextents. Set by modern mkfs.xfs.
+	xfsDiflag2Nrext64 = 0x10
 )
 
 // inodeByteOff returns the absolute byte offset of inode ino within the image.
@@ -104,6 +114,13 @@ func readInode(r io.ReaderAt, partOff int64, sb *superblock, ino uint64) (*inode
 		nExts:   be.Uint32(buf[inoOffNExtents:]),
 		forkOff: buf[inoOffForkOff],
 		raw:     buf,
+	}
+	// Modern mkfs.xfs sets the NREXT64 feature, which moves the data-fork
+	// extent count into the 64-bit di_big_nextents field; the legacy
+	// di_nextents slot reads as 0. Without this, every extent-based file,
+	// directory, or symlink on a kernel-created image looks empty.
+	if buf[inoOffVersion] >= 3 && be.Uint64(buf[inoOffFlags2:])&xfsDiflag2Nrext64 != 0 {
+		in.nExts = uint32(be.Uint64(buf[inoOffBigNExtents:]))
 	}
 	return in, nil
 }
