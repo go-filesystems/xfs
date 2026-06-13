@@ -10,7 +10,7 @@ import (
 func restoreDirHooks(t *testing.T) {
 	oldReadInode := dirReadInode
 	oldLookupInDir := dirLookupInDirHook
-	oldReadFileData := dirReadFileData
+	oldReadFileData := dirReadSymlinkTarget
 	oldBlockDirLookup := dirBlockDirLookup
 	oldInlineExtents := dirInlineExtents
 	oldBtreeExtents := dirBtreeExtents
@@ -20,7 +20,7 @@ func restoreDirHooks(t *testing.T) {
 	t.Cleanup(func() {
 		dirReadInode = oldReadInode
 		dirLookupInDirHook = oldLookupInDir
-		dirReadFileData = oldReadFileData
+		dirReadSymlinkTarget = oldReadFileData
 		dirBlockDirLookup = oldBlockDirLookup
 		dirInlineExtents = oldInlineExtents
 		dirBtreeExtents = oldBtreeExtents
@@ -113,14 +113,14 @@ func TestPathLookupAdditional(t *testing.T) {
 		dirLookupInDirHook = func(_ io.ReaderAt, _ int64, _ *superblock, _ *inode, _ string) (uint64, error) {
 			return 12, nil
 		}
-		dirReadFileData = func(_ io.ReaderAt, _ int64, _ *superblock, _ *inode) ([]byte, error) {
+		dirReadSymlinkTarget = func(_ io.ReaderAt, _ int64, _ *superblock, _ *inode) ([]byte, error) {
 			return nil, errBoom
 		}
 		if _, err := pathLookup(rw, 0, sb, "/link"); !errors.Is(err, errBoom) {
 			t.Fatalf("expected symlink read error %v, got %v", errBoom, err)
 		}
 
-		dirReadFileData = func(_ io.ReaderAt, _ int64, _ *superblock, _ *inode) ([]byte, error) {
+		dirReadSymlinkTarget = func(_ io.ReaderAt, _ int64, _ *superblock, _ *inode) ([]byte, error) {
 			return []byte("/target"), nil
 		}
 		dirPathLookup = func(_ io.ReaderAt, _ int64, _ *superblock, _ string) (*inode, error) {
