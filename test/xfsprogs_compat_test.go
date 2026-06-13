@@ -61,8 +61,11 @@ func TestWriteThenXfsRepair(t *testing.T) {
 	if runErr != nil {
 		t.Fatalf("xfs_repair -n exited non-zero: %v", runErr)
 	}
-	if strings.Contains(strings.ToUpper(string(out)), "ERROR") {
-		t.Fatalf("xfs_repair -n reported ERROR in output:\n%s", out)
+	upper := strings.ToUpper(string(out))
+	for _, marker := range []string{"ERROR", "CORRUPT", "WOULD ", "BAD "} {
+		if strings.Contains(upper, marker) {
+			t.Fatalf("xfs_repair -n reported %q in output:\n%s", marker, out)
+		}
 	}
 }
 
@@ -82,9 +85,9 @@ func TestGrowThenXfsRepair(t *testing.T) {
 		t.Skip("xfs_repair not found on PATH; install xfsprogs to run this test")
 	}
 
-	const fourMiB = int64(4 * 1024 * 1024)
+	const oneAG = int64(16384 * 4096) // 64 MiB
 	path := filepath.Join(t.TempDir(), "grow.xfs")
-	fs, err := filesystem_xfs.Format(path, fourMiB, filesystem_xfs.FormatConfig{
+	fs, err := filesystem_xfs.Format(path, oneAG, filesystem_xfs.FormatConfig{
 		Label: "growcompat",
 	})
 	if err != nil {
@@ -95,8 +98,8 @@ func TestGrowThenXfsRepair(t *testing.T) {
 		t.Fatalf("WriteFile pre-grow: %v", err)
 	}
 
-	// Grow from 1 AG (4 MiB) to 3 AGs (12 MiB).
-	if err := fs.Grow(3 * fourMiB); err != nil {
+	// Grow from 1 AG (64 MiB) to 3 AGs (192 MiB).
+	if err := fs.Grow(3 * oneAG); err != nil {
 		fs.Close()
 		t.Fatalf("Grow: %v", err)
 	}
@@ -132,14 +135,14 @@ func TestGrowThenXfsRepair(t *testing.T) {
 // whether to fall through to "recreate" semantics. Not gated on
 // xfsprogs since it doesn't shell out.
 func TestResizeShrinkErrSentinel(t *testing.T) {
-	const fourMiB = int64(4 * 1024 * 1024)
+	const oneAG = int64(16384 * 4096) // 64 MiB, the minimum image size
 	path := filepath.Join(t.TempDir(), "shrink.xfs")
-	fs, err := filesystem_xfs.Format(path, 2*fourMiB, filesystem_xfs.FormatConfig{})
+	fs, err := filesystem_xfs.Format(path, 2*oneAG, filesystem_xfs.FormatConfig{})
 	if err != nil {
 		t.Fatalf("Format: %v", err)
 	}
 	defer fs.Close()
-	if err := fs.Resize(fourMiB); !errors.Is(err, filesystem.ErrShrinkUnsupported) {
+	if err := fs.Resize(oneAG); !errors.Is(err, filesystem.ErrShrinkUnsupported) {
 		t.Fatalf("Resize(shrink) = %v, want ErrShrinkUnsupported", err)
 	}
 }
