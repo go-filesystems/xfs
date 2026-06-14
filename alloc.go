@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 )
 
 // errInobtFull is returned by inobtFindFree when every record in the inobt
@@ -579,9 +580,17 @@ func bnoFindRecord(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, 
 	}
 }
 
-// freeBlocks returns a run of nBlocks blocks starting at absStartBlock back
-// to the free space B-trees. Only handles the simple case where the freed
-// range does not merge with adjacent extents.
+// freeBlocks returns a run of nBlocks blocks starting at absStartBlock back to
+// the free-space B-trees, coalescing with any immediately-adjacent free
+// extents. Coalescing is essential: without it, churny workloads (a directory
+// rebuilt block-by-block on every entry change) fragment free space into ever
+// more records until the bno/cnt leaf fills and no insert can succeed. Merging
+// keeps the record count bounded — and progressively shrinks an
+// already-fragmented tree — so the trees stay single-leaf in practice.
+//
+// The single-leaf case (the only one coalescing produces) rebuilds the bno and
+// cnt leaves from the merged record set. A multi-level tree falls back to a
+// plain non-coalescing insert.
 func freeBlocks(rw readerWriterAt, partOff int64, sb *superblock, absStartBlock uint64, nBlocks uint32) error {
 	ag := uint32(absStartBlock / uint64(sb.agBlocks))
 	agStartRel := uint32(absStartBlock % uint64(sb.agBlocks))
@@ -597,26 +606,102 @@ func freeBlocks(rw readerWriterAt, partOff int64, sb *superblock, absStartBlock 
 	bnoLevel := int(be.Uint32(agfBuf[agfOffBnoLevel:]))
 	cntLevel := int(be.Uint32(agfBuf[agfOffCntLevel:]))
 
-	// Insert into bno B-tree.
-	if err := allocBnoInsertRecord(rw, partOff, sb, ag, bnoRoot, bnoLevel, agStartRel, nBlocks); err != nil {
-		return fmt.Errorf("xfs: freeBlocks bno insert: %w", err)
-	}
-	// Insert into cnt B-tree.
-	if err := allocCntInsertRecord(rw, partOff, sb, ag, cntRoot, cntLevel, agStartRel, nBlocks); err != nil {
-		return fmt.Errorf("xfs: freeBlocks cnt insert: %w", err)
+	if bnoLevel != 1 || cntLevel != 1 {
+		// Multi-level: fall back to a plain insert (coalescing keeps trees
+		// single-leaf, so this is only reached on trees grown by other means).
+		if err := allocBnoInsertRecord(rw, partOff, sb, ag, bnoRoot, bnoLevel, agStartRel, nBlocks); err != nil {
+			return fmt.Errorf("xfs: freeBlocks bno insert: %w", err)
+		}
+		if err := allocCntInsertRecord(rw, partOff, sb, ag, cntRoot, cntLevel, agStartRel, nBlocks); err != nil {
+			return fmt.Errorf("xfs: freeBlocks cnt insert: %w", err)
+		}
+		freeBlks := be.Uint32(agfBuf[agfOffFreeBlks:])
+		be.PutUint32(agfBuf[agfOffFreeBlks:], freeBlks+nBlocks)
+		longest, err := allocRecomputeLongest(rw, partOff, sb, ag, bnoRoot, bnoLevel)
+		if err != nil {
+			return err
+		}
+		be.PutUint32(agfBuf[agfOffLongest:], longest)
+		return allocWriteAGF(rw, partOff, sb, ag, agfBuf)
 	}
 
-	// Update AGF free count and recompute the longest free extent. (This code
-	// path does not merge with adjacent free extents, so a recompute keeps
-	// agf_longest exact rather than a lower bound.)
-	freeBlks := be.Uint32(agfBuf[agfOffFreeBlks:])
-	be.PutUint32(agfBuf[agfOffFreeBlks:], freeBlks+nBlocks)
-	longest, err := allocRecomputeLongest(rw, partOff, sb, ag, bnoRoot, bnoLevel)
+	// Single-leaf: gather the bno records (root is the leaf), merge the freed
+	// run with any adjacent extents, and rewrite both leaves.
+	bnoLeaf, err := allocReadAGBlock(rw, partOff, sb, ag, bnoRoot)
 	if err != nil {
 		return err
 	}
+	cntLeaf, err := allocReadAGBlock(rw, partOff, sb, ag, cntRoot)
+	if err != nil {
+		return err
+	}
+	hdrSize := sb.agBTreeHdrSize()
+	numrecs := int(be.Uint16(bnoLeaf[6:]))
+
+	mStart, mCount := agStartRel, nBlocks
+	kept := make([]freeExtent, 0, numrecs+1)
+	for i := 0; i < numrecs; i++ {
+		o := hdrSize + i*allocRecSize
+		r := freeExtent{be.Uint32(bnoLeaf[o:]), be.Uint32(bnoLeaf[o+4:])}
+		switch {
+		case r.start+r.count == mStart: // r immediately precedes the merged run
+			mStart = r.start
+			mCount += r.count
+		case mStart+mCount == r.start: // r immediately follows the merged run
+			mCount += r.count
+		default:
+			kept = append(kept, r)
+		}
+	}
+	kept = append(kept, freeExtent{mStart, mCount})
+
+	maxRecs := (len(bnoLeaf) - hdrSize) / allocRecSize
+	if len(kept) > maxRecs {
+		return fmt.Errorf("xfs: freeBlocks: %d free extents exceed leaf capacity %d", len(kept), maxRecs)
+	}
+
+	// bno leaf: sorted by start. cnt leaf: sorted by (count, start).
+	sort.Slice(kept, func(i, j int) bool { return kept[i].start < kept[j].start })
+	rewriteAllocLeaf(be, bnoLeaf, hdrSize, kept)
+	if err := allocWriteAGBTree(rw, partOff, sb, ag, bnoRoot, bnoLeaf); err != nil {
+		return err
+	}
+	var longest uint32
+	for _, r := range kept {
+		if r.count > longest {
+			longest = r.count
+		}
+	}
+	sort.Slice(kept, func(i, j int) bool {
+		if kept[i].count != kept[j].count {
+			return kept[i].count < kept[j].count
+		}
+		return kept[i].start < kept[j].start
+	})
+	rewriteAllocLeaf(be, cntLeaf, hdrSize, kept)
+	if err := allocWriteAGBTree(rw, partOff, sb, ag, cntRoot, cntLeaf); err != nil {
+		return err
+	}
+
+	freeBlks := be.Uint32(agfBuf[agfOffFreeBlks:])
+	be.PutUint32(agfBuf[agfOffFreeBlks:], freeBlks+nBlocks)
 	be.PutUint32(agfBuf[agfOffLongest:], longest)
 	return allocWriteAGF(rw, partOff, sb, ag, agfBuf)
+}
+
+// freeExtent is an AG-relative free-space extent (start block, block count).
+type freeExtent struct{ start, count uint32 }
+
+// rewriteAllocLeaf overwrites a bno/cnt B-tree leaf's records with recs and
+// sets numrecs, clearing any stale trailing record bytes.
+func rewriteAllocLeaf(be binary.ByteOrder, leaf []byte, hdrSize int, recs []freeExtent) {
+	clear(leaf[hdrSize:])
+	be.PutUint16(leaf[6:], uint16(len(recs)))
+	for i, r := range recs {
+		o := hdrSize + i*allocRecSize
+		be.PutUint32(leaf[o:], r.start)
+		be.PutUint32(leaf[o+4:], r.count)
+	}
 }
 
 // bnoInsertRecord inserts (agStartRel, nBlocks) into the bno B-tree leaf.
