@@ -256,6 +256,72 @@ func TestLeafFormDirXfsRepair(t *testing.T) {
 	}
 }
 
+// TestNodeFormDirXfsRepair builds a directory large enough to outgrow leaf
+// form into node form: the single leaf1 index block is replaced by a da3-node
+// btree (0x3ebe) over multiple leafN blocks (0x3dff) plus a free-index block
+// (XDF3) at the 64 GiB offset. It must be xfs_repair -n clean and read back.
+func TestNodeFormDirXfsRepair(t *testing.T) {
+	xfsRepair, err := exec.LookPath("xfs_repair")
+	if err != nil {
+		t.Skip("xfs_repair not found on PATH; install xfsprogs to run this test")
+	}
+
+	const oneAG = int64(16384 * 4096)
+	path := filepath.Join(t.TempDir(), "nodedir.xfs")
+	fs, err := filesystem_xfs.Format(path, 8*oneAG, filesystem_xfs.FormatConfig{Label: "nodedir"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	mustf := func(e error) {
+		if e != nil {
+			fs.Close()
+			t.Fatal(e)
+		}
+	}
+	mustf(fs.MkDir("/nd", 0o755))
+	const nEntries = 2000 // forces node form (multiple leafN under a da3 node)
+	for i := 0; i < nEntries; i++ {
+		mustf(fs.WriteFile(fmt.Sprintf("/nd/file_%05d.txt", i), []byte(fmt.Sprintf("c%d\n", i)), 0o644))
+	}
+	mustf(fs.DeleteFile("/nd/file_00000.txt"))
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	cmd := exec.Command(xfsRepair, "-n", path)
+	out, runErr := cmd.CombinedOutput()
+	t.Logf("xfs_repair -n output:\n%s", out)
+	if runErr != nil {
+		t.Fatalf("xfs_repair -n reported problems: %v", runErr)
+	}
+	upper := strings.ToUpper(string(out))
+	for _, marker := range []string{"ERROR", "CORRUPT", "WOULD ", "BAD ", "AGF_LONGEST"} {
+		if strings.Contains(upper, marker) {
+			t.Fatalf("xfs_repair -n reported %q in output:\n%s", marker, out)
+		}
+	}
+
+	ro, err := filesystem_xfs.Open(path, -1)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer ro.Close()
+	ents, err := ro.ListDir("/nd")
+	if err != nil {
+		t.Fatalf("ListDir /nd: %v", err)
+	}
+	if len(ents) != nEntries-1 {
+		t.Fatalf("/nd has %d entries, want %d", len(ents), nEntries-1)
+	}
+	got, err := ro.ReadFile("/nd/file_01000.txt")
+	if err != nil {
+		t.Fatalf("ReadFile /nd/file_01000.txt: %v", err)
+	}
+	if string(got) != "c1000\n" {
+		t.Fatalf("file_01000.txt = %q, want %q", got, "c1000\n")
+	}
+}
+
 // TestResizeShrinkErrSentinel is a tiny smoke test that the package's
 // Resize() entry point returns filesystem.ErrShrinkUnsupported on an
 // undersized request — same probe the diskimage CLI uses to decide
