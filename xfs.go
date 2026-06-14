@@ -28,6 +28,7 @@ const (
 	// Directory data-block magic numbers.
 	magicDir3Block uint32 = 0x58444233 // "XDB3" — v5 single-block directory
 	magicDir3Data  uint32 = 0x58444433 // "XDD3" — v5 multi-block directory data
+	magicDir3Leaf1 uint16 = 0x3df1     // v5 leaf-form directory leaf/index block (in da3_blkinfo.magic)
 	magicDir2Block uint32 = 0x58443242 // "XD2B" — v4 single-block directory
 	magicDir2Data  uint32 = 0x58443244 // "XD2D" — v4 multi-block directory data
 

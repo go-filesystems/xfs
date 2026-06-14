@@ -99,6 +99,7 @@ var allocInobtFindRecord = inobtFindRecord
 var allocGrowInobt = growInobt
 var allocAllocBlocks = allocBlocks
 var allocWriteRawBlock = writeRawBlock
+var allocRecomputeLongest = agfRecomputeLongest
 
 // inobtChunkInodes is the number of inodes per inobt record. The XFS spec
 // always uses 64-inode chunks (the irFree bitmap is 64 bits wide). With
@@ -288,18 +289,149 @@ func allocBlocks(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, nB
 		}
 	}
 
-	// Update AGF free block count.
+	// Update AGF free block count and recompute the true longest free extent.
+	// Lowering agf_longest to this extent's remainder is wrong when a smaller
+	// extent (e.g. an aligned-allocation head gap) is consumed while larger
+	// extents remain — it would understate agf_longest, eventually reaching 0.
 	freeBlks := be.Uint32(agfBuf[agfOffFreeBlks:])
 	be.PutUint32(agfBuf[agfOffFreeBlks:], freeBlks-nBlocks)
-	if remaining < be.Uint32(agfBuf[agfOffLongest:]) {
-		be.PutUint32(agfBuf[agfOffLongest:], remaining)
+	longest, err := allocRecomputeLongest(rw, partOff, sb, ag, bnoRoot, int(bnoLevel))
+	if err != nil {
+		return 0, err
 	}
+	be.PutUint32(agfBuf[agfOffLongest:], longest)
 	if err := allocWriteAGF(rw, partOff, sb, ag, agfBuf); err != nil {
 		return 0, err
 	}
 
-	absBlock := sb.agAbsBlock(ag, allocStartRel)
-	return absBlock, nil
+	return sb.agAbsBlock(ag, allocStartRel), nil
+}
+
+// allocAlignedBlocks allocates need contiguous blocks in AG ag whose
+// AG-relative start block is a multiple of align. Inode chunks need this:
+// the chunk's start inode is startBlock*inopBlock, and xfs_repair / the kernel
+// require it to be a multiple of XFS_INODES_PER_CHUNK (64). allocBlocks alone
+// returns the first blocks of a free extent, which are only inopBlock-aligned,
+// so a chunk could start at e.g. block 2637 → startino 21096 (21096 % 64 = 8),
+// which xfs_repair rejects (it then maps inodes onto file-data blocks).
+//
+// It finds a free extent large enough to contain an aligned run, removes it
+// from the bno/cnt B-trees, and reinserts the unaligned head and the trailing
+// remainder as smaller free extents.
+func allocAlignedBlocks(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, need, align uint32) (uint64, error) {
+	if align <= 1 {
+		return allocBlocks(rw, partOff, sb, ag, need)
+	}
+	be := binary.BigEndian
+	agfBuf, err := allocAGFBlock(rw, partOff, sb, ag)
+	if err != nil {
+		return 0, err
+	}
+	cntRoot := be.Uint32(agfBuf[agfOffCntRoot:])
+	cntLevel := be.Uint32(agfBuf[agfOffCntLevel:])
+	bnoRoot := be.Uint32(agfBuf[agfOffBnoRoot:])
+	bnoLevel := be.Uint32(agfBuf[agfOffBnoLevel:])
+
+	// Slack of align-1 guarantees an aligned start exists inside the extent.
+	want := need + align - 1
+	cntLeafRel, cntLeaf, recIdx, err := allocCntFindBlock(rw, partOff, sb, ag, cntRoot, int(cntLevel), want)
+	if err != nil {
+		return 0, fmt.Errorf("xfs: allocAlignedBlocks ag=%d: %w", ag, err)
+	}
+	hdrSize := sb.agBTreeHdrSize()
+	recOff := hdrSize + recIdx*allocRecSize
+	startRel := be.Uint32(cntLeaf[recOff:])
+	count := be.Uint32(cntLeaf[recOff+4:])
+
+	alignedStart := ((startRel + align - 1) / align) * align
+	headGap := alignedStart - startRel
+	tailStart := alignedStart + need
+	tailLen := (startRel + count) - tailStart // count >= need+align-1 >= headGap+need
+
+	// Remove the whole extent from both B-trees.
+	if err := allocBtreeDeleteRecord(rw, partOff, sb, ag, cntRoot, int(cntLevel), recIdx, cntLeafRel, cntLeaf, allocRecSize, false); err != nil {
+		return 0, fmt.Errorf("xfs: aligned cnt delete: %w", err)
+	}
+	if err := allocBnoDeleteRecord(rw, partOff, sb, ag, bnoRoot, int(bnoLevel), startRel); err != nil {
+		return 0, fmt.Errorf("xfs: aligned bno delete: %w", err)
+	}
+	// Reinsert the unaligned head and the trailing remainder as free extents.
+	if headGap > 0 {
+		if err := allocBnoInsertRecord(rw, partOff, sb, ag, bnoRoot, int(bnoLevel), startRel, headGap); err != nil {
+			return 0, err
+		}
+		if err := allocCntInsertRecord(rw, partOff, sb, ag, cntRoot, int(cntLevel), startRel, headGap); err != nil {
+			return 0, err
+		}
+	}
+	if tailLen > 0 {
+		if err := allocBnoInsertRecord(rw, partOff, sb, ag, bnoRoot, int(bnoLevel), tailStart, tailLen); err != nil {
+			return 0, err
+		}
+		if err := allocCntInsertRecord(rw, partOff, sb, ag, cntRoot, int(cntLevel), tailStart, tailLen); err != nil {
+			return 0, err
+		}
+	}
+
+	// AGF: drop need blocks and recompute the true longest free extent.
+	// Splitting an extent into head+tail can leave a remainder smaller than
+	// some other free extent, so the conservative "lower-only" update is wrong
+	// here (it once drove agf_longest to 0); scan the cnt B-tree for the real
+	// maximum instead.
+	freeBlks := be.Uint32(agfBuf[agfOffFreeBlks:])
+	be.PutUint32(agfBuf[agfOffFreeBlks:], freeBlks-need)
+	longest, err := allocRecomputeLongest(rw, partOff, sb, ag, cntRoot, int(cntLevel))
+	if err != nil {
+		return 0, err
+	}
+	be.PutUint32(agfBuf[agfOffLongest:], longest)
+	if err := allocWriteAGF(rw, partOff, sb, ag, agfBuf); err != nil {
+		return 0, err
+	}
+
+	return sb.agAbsBlock(ag, alignedStart), nil
+}
+
+var allocAlignedAllocBlocks = allocAlignedBlocks
+
+// agfRecomputeLongest returns the size of the largest free extent in AG ag by
+// scanning every leaf of the cnt B-tree. Used to keep agf_longest accurate
+// after operations (like aligned allocation) that can split a free extent into
+// remainders smaller than other free extents.
+func agfRecomputeLongest(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, cntRoot uint32, cntLevel int) (uint32, error) {
+	hdrSize := sb.agBTreeHdrSize()
+	agRel := cntRoot
+	// Descend leftmost pointers to the first leaf.
+	for {
+		blk, err := allocReadAGBlock(rw, partOff, sb, ag, agRel)
+		if err != nil {
+			return 0, err
+		}
+		if int(binary.BigEndian.Uint16(blk[4:])) == 0 {
+			// Leaf: scan this block and all right siblings for the max count.
+			var longest uint32
+			for {
+				numrecs := int(binary.BigEndian.Uint16(blk[6:]))
+				for i := 0; i < numrecs; i++ {
+					c := binary.BigEndian.Uint32(blk[hdrSize+i*allocRecSize+4:])
+					if c > longest {
+						longest = c
+					}
+				}
+				rsib := binary.BigEndian.Uint32(blk[12:])
+				if rsib == 0xFFFFFFFF {
+					return longest, nil
+				}
+				blk, err = allocReadAGBlock(rw, partOff, sb, ag, rsib)
+				if err != nil {
+					return 0, err
+				}
+			}
+		}
+		// Internal node: follow the leftmost child pointer.
+		numrecs := int(binary.BigEndian.Uint16(blk[6:]))
+		agRel = binary.BigEndian.Uint32(blk[hdrSize+numrecs*allocKeySize:])
+	}
 }
 
 // cntFindBlock navigates the cnt B-tree to a leaf containing a record with
@@ -474,13 +606,16 @@ func freeBlocks(rw readerWriterAt, partOff int64, sb *superblock, absStartBlock 
 		return fmt.Errorf("xfs: freeBlocks cnt insert: %w", err)
 	}
 
-	// Update AGF free count.
+	// Update AGF free count and recompute the longest free extent. (This code
+	// path does not merge with adjacent free extents, so a recompute keeps
+	// agf_longest exact rather than a lower bound.)
 	freeBlks := be.Uint32(agfBuf[agfOffFreeBlks:])
 	be.PutUint32(agfBuf[agfOffFreeBlks:], freeBlks+nBlocks)
-	longest := be.Uint32(agfBuf[agfOffLongest:])
-	if nBlocks > longest {
-		be.PutUint32(agfBuf[agfOffLongest:], nBlocks)
+	longest, err := allocRecomputeLongest(rw, partOff, sb, ag, bnoRoot, bnoLevel)
+	if err != nil {
+		return err
 	}
+	be.PutUint32(agfBuf[agfOffLongest:], longest)
 	return allocWriteAGF(rw, partOff, sb, ag, agfBuf)
 }
 
@@ -819,9 +954,12 @@ func growInobt(rw readerWriterAt, partOff int64, sb *superblock, ag uint32) erro
 	}
 	blocksPerChunk := uint32(inobtChunkInodes) / uint32(sb.inopBlock)
 
-	// Allocate the backing blocks. Best-effort same-AG; the caller (allocInode)
-	// retries other AGs if this fails.
-	absStart, err := allocAllocBlocks(rw, partOff, sb, ag, blocksPerChunk)
+	// Allocate the backing blocks, aligned so the chunk's start inode is a
+	// multiple of XFS_INODES_PER_CHUNK (64). startIno = startBlock*inopBlock,
+	// so the start block must be a multiple of blocksPerChunk (= 64/inopBlock);
+	// an unaligned chunk yields a non-64-aligned startino that xfs_repair
+	// rejects. Best-effort same-AG; the caller (allocInode) retries other AGs.
+	absStart, err := allocAlignedAllocBlocks(rw, partOff, sb, ag, blocksPerChunk, blocksPerChunk)
 	if err != nil {
 		return fmt.Errorf("growInobt: alloc %d blocks: %w", blocksPerChunk, err)
 	}
