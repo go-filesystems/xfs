@@ -74,6 +74,7 @@ func TestAllocBlocksAdditional(t *testing.T) {
 		}
 		allocBnoDeleteRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32) error { return nil }
 		allocWriteAGF = func(io.WriterAt, int64, *superblock, uint32, []byte) error { return errBoom }
+		allocRecomputeLongest = func(readerWriterAt, int64, *superblock, uint32, uint32, int) (uint32, error) { return 0, nil }
 		if _, err := allocBlocks(newMemRW(0), 0, sb, 0, 5); !errors.Is(err, errBoom) {
 			t.Fatalf("expected allocBlocks writeAGF error %v, got %v", errBoom, err)
 		}
@@ -147,6 +148,7 @@ func TestAllocBlocksAdditional(t *testing.T) {
 			return nil
 		}
 		allocWriteAGF = func(io.WriterAt, int64, *superblock, uint32, []byte) error { return errBoom }
+		allocRecomputeLongest = func(readerWriterAt, int64, *superblock, uint32, uint32, int) (uint32, error) { return 0, nil }
 		if _, err := allocBlocks(newMemRW(0), 0, sb, 0, 5); !errors.Is(err, errBoom) {
 			t.Fatalf("expected partial alloc writeAGF error %v, got %v", errBoom, err)
 		}
@@ -170,6 +172,7 @@ func TestAllocBlocksAdditional(t *testing.T) {
 		allocBnoUpdateRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32, uint32, uint32) error {
 			return nil
 		}
+		allocRecomputeLongest = func(readerWriterAt, int64, *superblock, uint32, uint32, int) (uint32, error) { return 4, nil }
 		allocWriteAGF = func(_ io.WriterAt, _ int64, _ *superblock, _ uint32, buf []byte) error {
 			if got := be.Uint32(buf[agfOffFreeBlks:]); got != 95 {
 				t.Fatalf("unexpected free block count %d", got)
@@ -226,6 +229,7 @@ func TestFreeBlocksAdditional(t *testing.T) {
 		allocBnoInsertRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32, uint32) error { return nil }
 		allocCntInsertRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32, uint32) error { return nil }
 		allocWriteAGF = func(io.WriterAt, int64, *superblock, uint32, []byte) error { return errBoom }
+		allocRecomputeLongest = func(readerWriterAt, int64, *superblock, uint32, uint32, int) (uint32, error) { return 0, nil }
 		if err := freeBlocks(newMemRW(0), 0, sb, absStart, 7); !errors.Is(err, errBoom) {
 			t.Fatalf("expected freeBlocks writeAGF error %v, got %v", errBoom, err)
 		}
@@ -235,6 +239,7 @@ func TestFreeBlocksAdditional(t *testing.T) {
 		allocAGFBlock = func(io.ReaderAt, int64, *superblock, uint32) ([]byte, error) { return agf, nil }
 		allocBnoInsertRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32, uint32) error { return nil }
 		allocCntInsertRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32, uint32) error { return nil }
+		allocRecomputeLongest = func(readerWriterAt, int64, *superblock, uint32, uint32, int) (uint32, error) { return 7, nil }
 		allocWriteAGF = func(_ io.WriterAt, _ int64, _ *superblock, _ uint32, buf []byte) error {
 			if got := be.Uint32(buf[agfOffFreeBlks:]); got != 17 {
 				t.Fatalf("unexpected free block count %d", got)
