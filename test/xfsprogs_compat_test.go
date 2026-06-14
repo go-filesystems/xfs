@@ -322,6 +322,68 @@ func TestNodeFormDirXfsRepair(t *testing.T) {
 	}
 }
 
+// TestDirChurnXfsRepair grows a directory into node form one entry at a time,
+// then deletes most of its entries — the workload that fragments the free
+// space the most, since each add/remove frees and reallocates the whole
+// directory. It must stay xfs_repair -n clean, which exercises free-extent
+// coalescing in freeBlocks (without it the bno/cnt B-tree leaf fills and
+// further frees fail with "cannot insert without a tree split").
+func TestDirChurnXfsRepair(t *testing.T) {
+	xfsRepair, err := exec.LookPath("xfs_repair")
+	if err != nil {
+		t.Skip("xfs_repair not found on PATH; install xfsprogs to run this test")
+	}
+
+	const oneAG = int64(16384 * 4096)
+	path := filepath.Join(t.TempDir(), "churn.xfs")
+	fs, err := filesystem_xfs.Format(path, 8*oneAG, filesystem_xfs.FormatConfig{Label: "churn"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	mustf := func(e error) {
+		if e != nil {
+			fs.Close()
+			t.Fatal(e)
+		}
+	}
+	mustf(fs.MkDir("/d", 0o755))
+	for i := 0; i < 700; i++ { // grow well into node form
+		mustf(fs.WriteFile(fmt.Sprintf("/d/f%04d", i), []byte("x\n"), 0o644))
+	}
+	for i := 0; i < 650; i++ { // shrink back toward block form
+		mustf(fs.DeleteFile(fmt.Sprintf("/d/f%04d", i)))
+	}
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	cmd := exec.Command(xfsRepair, "-n", path)
+	out, runErr := cmd.CombinedOutput()
+	t.Logf("xfs_repair -n output:\n%s", out)
+	if runErr != nil {
+		t.Fatalf("xfs_repair -n reported problems: %v", runErr)
+	}
+	upper := strings.ToUpper(string(out))
+	for _, marker := range []string{"ERROR", "CORRUPT", "WOULD ", "BAD ", "AGF_LONGEST"} {
+		if strings.Contains(upper, marker) {
+			t.Fatalf("xfs_repair -n reported %q in output:\n%s", marker, out)
+		}
+	}
+
+	ro, err := filesystem_xfs.Open(path, -1)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer ro.Close()
+	ents, err := ro.ListDir("/d")
+	if err != nil {
+		t.Fatalf("ListDir /d: %v", err)
+	}
+	if len(ents) != 50 {
+		t.Fatalf("/d has %d entries, want 50", len(ents))
+	}
+}
+
 // TestResizeShrinkErrSentinel is a tiny smoke test that the package's
 // Resize() entry point returns filesystem.ErrShrinkUnsupported on an
 // undersized request — same probe the diskimage CLI uses to decide
