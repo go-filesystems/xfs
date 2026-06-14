@@ -537,104 +537,37 @@ func blockDirParent(blk []byte, hasFType, hasCRC bool) uint64 {
 	return 0
 }
 
-// convertSFToBlock promotes a short-form directory to block form: it allocates
-// a directory block and lays down all existing entries plus the new one.
+// convertSFToBlock promotes a short-form directory: it gathers the existing
+// entries plus the new one and rebuilds the directory, choosing block or leaf
+// form via writeWholeDir.
 func convertSFToBlock(rw readerWriterAt, partOff int64, sb *superblock, dirIn *inode, newIno uint64, newName string, newFtype uint8) error {
-	be := binary.BigEndian
-
-	// The parent inode lives in the short-form header (after count + i8count).
-	fork := dirIn.dataFork()
-	var parentIno uint64
-	if fork[1] > 0 {
-		parentIno = be.Uint64(fork[2:])
-	} else {
-		parentIno = uint64(be.Uint32(fork[2:]))
-	}
-
-	existing, err := writeSFReadDir(fork, sb.hasFType)
+	existing, parentIno, err := gatherDirEntries(rw, partOff, sb, dirIn)
 	if err != nil {
 		return err
 	}
-
-	dirBlocks := sb.dirFSBlocks()
-	ag := inoAG(sb, dirIn.num)
-	absBlock, err := writeAllocBlocks(rw, partOff, sb, ag, dirBlocks)
-	if err != nil {
-		return fmt.Errorf("xfs: convertSFToBlock: %w", err)
-	}
-
-	entries := make([]dirEnt, 0, len(existing)+1)
 	for _, e := range existing {
-		if e.Name == "." || e.Name == ".." {
-			continue
+		if e.name == newName {
+			return fmt.Errorf("xfs: %q already exists", newName)
 		}
-		entries = append(entries, dirEnt{e.Name, e.Inode, e.FileType})
 	}
-	entries = append(entries, dirEnt{newName, newIno, newFtype})
-
-	blkSize := int(sb.blockSize) * int(dirBlocks)
-	blk := make([]byte, blkSize)
-	if err := buildBlockDirBlock(sb, blk, absBlock, dirIn.num, parentIno, entries); err != nil {
-		return err
-	}
-	if err := writeWriteBlocksData(rw, partOff, sb, absBlock, dirBlocks, blk); err != nil {
-		return err
-	}
-
-	// Point the inode at the new block via a single extent.
-	exts := []extent{{startOff: 0, startBlock: absBlock, count: dirBlocks}}
-	setInodeFormat(dirIn, inodeFmtExtents)
-	setInodeNBlocks(dirIn, uint64(dirBlocks))
-	setInodeNExtents(dirIn, 1)
-	setInodeSize(dirIn, uint64(blkSize))
-	if err := writeWriteExtentList(dirIn, exts); err != nil {
-		return err
-	}
-	return writeWriteInode(rw, partOff, sb, dirIn)
+	entries := append(existing, dirEnt{newName, newIno, newFtype})
+	return writeWholeDir(rw, partOff, sb, dirIn, parentIno, entries)
 }
 
-// addEntryToBlockDir adds an entry to an existing single-block directory by
-// reading its current entries, appending the new one, and rebuilding the block
-// through buildBlockDirBlock — keeping the data entries, free region, leaf
-// array and tail mutually consistent (which incremental insertion did not).
+// addEntryToBlockDir adds an entry to a block- or leaf-form directory by
+// gathering its full entry set, appending the new one, and rebuilding through
+// writeWholeDir (which keeps every data block, the free regions and the leaf
+// index mutually consistent and promotes block→leaf form when needed).
 func addEntryToBlockDir(rw readerWriterAt, partOff int64, sb *superblock, dirIn *inode, childIno uint64, name string, ftype uint8) error {
-	exts, err := writeDirExtents(rw, partOff, sb, dirIn)
+	existing, parentIno, err := gatherDirEntries(rw, partOff, sb, dirIn)
 	if err != nil {
 		return err
 	}
-	leafLogBlock := dirLeafByteOffset / uint64(sb.blockSize)
-	var absBlock uint64
-	found := false
-	for _, e := range exts {
-		if e.startOff >= leafLogBlock {
-			continue
-		}
-		absBlock = e.startBlock
-		found = true
-		break
-	}
-	if !found {
-		return fmt.Errorf("xfs: directory inode %d has no data block", dirIn.num)
-	}
-
-	blk, err := writeReadRawBlock(rw, partOff, sb, absBlock)
-	if err != nil {
-		return err
-	}
-	parentIno := blockDirParent(blk, sb.hasFType, sb.hasCRC)
-	existing := parseDirBlock(blk, sb.hasFType, sb.hasCRC) // excludes "." / ".."
-	entries := make([]dirEnt, 0, len(existing)+1)
 	for _, e := range existing {
-		if e.Name == name {
+		if e.name == name {
 			return fmt.Errorf("xfs: %q already exists", name)
 		}
-		entries = append(entries, dirEnt{e.Name, e.Inode, e.FileType})
 	}
-	entries = append(entries, dirEnt{name, childIno, ftype})
-
-	nblk := make([]byte, len(blk))
-	if err := buildBlockDirBlock(sb, nblk, absBlock, dirIn.num, parentIno, entries); err != nil {
-		return err
-	}
-	return writeWriteRawBlock(rw, partOff, sb, absBlock, nblk)
+	entries := append(existing, dirEnt{name, childIno, ftype})
+	return writeWholeDir(rw, partOff, sb, dirIn, parentIno, entries)
 }
