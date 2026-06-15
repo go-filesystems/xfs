@@ -229,3 +229,95 @@ func TestWriteThenXfsDb(t *testing.T) {
 	}
 }
 
+// assertXfsRepairClean runs `xfs_repair -n` (read-only) on img and fails the
+// test if it exits non-zero or reports any problem marker.
+func assertXfsRepairClean(t *testing.T, xfsRepair, img string) {
+	t.Helper()
+	cmd := exec.Command(xfsRepair, "-n", img)
+	out, runErr := cmd.CombinedOutput()
+	t.Logf("xfs_repair -n output:\n%s", out)
+	if runErr != nil {
+		t.Fatalf("xfs_repair -n reported problems: %v", runErr)
+	}
+	upper := strings.ToUpper(string(out))
+	for _, marker := range []string{"ERROR", "CORRUPT", "WOULD ", "BAD "} {
+		if strings.Contains(upper, marker) {
+			t.Fatalf("xfs_repair -n reported %q in output:\n%s", marker, out)
+		}
+	}
+}
+
+// TestLeafFormDirXfsRepair builds a directory large enough to be promoted from
+// block form to leaf form (entries spread across several data blocks with a
+// separate leaf-index block), deletes a few entries, and checks the on-disk
+// result is xfs_repair -n clean. Skip-gated on xfs_repair.
+func TestLeafFormDirXfsRepair(t *testing.T) {
+	xfsRepair, err := exec.LookPath("xfs_repair")
+	if err != nil {
+		t.Skip("xfs_repair not found on PATH; install xfsprogs to run this test")
+	}
+
+	const oneAG = int64(16384 * 4096)
+	path := filepath.Join(t.TempDir(), "leafdir.xfs")
+	fs, err := filesystem_xfs.Format(path, 4*oneAG, filesystem_xfs.FormatConfig{Label: "leafdir"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	mustf := func(e error) {
+		if e != nil {
+			fs.Close()
+			t.Fatal(e)
+		}
+	}
+	mustf(fs.MkDir("/leaf", 0o755))
+	// ~300 entries: comfortably past block-form capacity, within a single leaf.
+	for i := 0; i < 300; i++ {
+		mustf(fs.WriteFile(fmt.Sprintf("/leaf/file-%05d.dat", i), []byte("payload\n"), 0o644))
+	}
+	mustf(fs.MkDir("/leaf/sub", 0o755)) // subdir inside a leaf-form dir
+	mustf(fs.WriteFile("/leaf/sub/x.txt", []byte("x\n"), 0o644))
+	for _, i := range []int{0, 7, 42, 199, 299} { // delete a scattering of entries
+		mustf(fs.DeleteFile(fmt.Sprintf("/leaf/file-%05d.dat", i)))
+	}
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	assertXfsRepairClean(t, xfsRepair, path)
+}
+
+// TestNodeFormDirXfsRepair builds a directory whose hash index outgrows a
+// single leaf block, promoting it to node form (leafn blocks indexed by a
+// da-btree node, plus free blocks), then checks the on-disk result is
+// xfs_repair -n clean. The files are empty so the data-block allocator isn't
+// the bottleneck. Skip-gated on xfs_repair.
+func TestNodeFormDirXfsRepair(t *testing.T) {
+	xfsRepair, err := exec.LookPath("xfs_repair")
+	if err != nil {
+		t.Skip("xfs_repair not found on PATH; install xfsprogs to run this test")
+	}
+
+	const oneAG = int64(16384 * 4096)
+	path := filepath.Join(t.TempDir(), "nodedir.xfs")
+	fs, err := filesystem_xfs.Format(path, 8*oneAG, filesystem_xfs.FormatConfig{Label: "nodedir"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	mustf := func(e error) {
+		if e != nil {
+			fs.Close()
+			t.Fatal(e)
+		}
+	}
+	mustf(fs.MkDir("/node", 0o755))
+	// ~1500 entries: forces the index across multiple leafn blocks + a da node.
+	for i := 0; i < 1500; i++ {
+		mustf(fs.WriteFile(fmt.Sprintf("/node/file-%06d.dat", i), nil, 0o644))
+	}
+	for _, i := range []int{0, 123, 756, 1499} { // delete a scattering of entries
+		mustf(fs.DeleteFile(fmt.Sprintf("/node/file-%06d.dat", i)))
+	}
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	assertXfsRepairClean(t, xfsRepair, path)
+}

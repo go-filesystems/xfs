@@ -163,45 +163,32 @@ func removeSFEntry(rw readerWriterAt, partOff int64, sb *superblock, in *inode, 
 // block tail mutually consistent (marking a slot free in place left the
 // bestfree table and leaf array stale, which xfs_repair flags).
 func removeBlockDirEntry(rw readerWriterAt, partOff int64, sb *superblock, in *inode, name string) error {
-	exts, err := dirExtents(rw, partOff, sb, in)
+	parentIno, current, blockForm, err := gatherDirEntries(rw, partOff, sb, in)
 	if err != nil {
 		return err
 	}
-	leafLogBlock := dirLeafByteOffset / uint64(sb.blockSize)
-	var absBlock uint64
-	found := false
-	for _, e := range exts {
-		if e.startOff >= leafLogBlock {
-			continue
-		}
-		absBlock = e.startBlock
-		found = true
-		break
-	}
-	if !found {
-		return ErrNotFound
-	}
-
-	blk, err := readRawBlock(rw, partOff, sb, absBlock)
-	if err != nil {
-		return err
-	}
-	parentIno := blockDirParent(blk, sb.hasFType, sb.hasCRC)
-	current := parseDirBlock(blk, sb.hasFType, sb.hasCRC) // excludes "." / ".."
 	entries := make([]dirEnt, 0, len(current))
 	removed := false
 	for _, e := range current {
-		if e.Name == name {
+		if e.name == name {
 			removed = true
 			continue
 		}
-		entries = append(entries, dirEnt{e.Name, e.Inode, e.FileType})
+		entries = append(entries, e)
 	}
 	if !removed {
 		return ErrNotFound
 	}
 
-	nblk := make([]byte, len(blk))
+	// For a leaf/node-form directory rebuild the whole layout (which collapses
+	// back to a single block when the remaining entries fit). A block-form
+	// directory is rebuilt in place.
+	if !blockForm {
+		return rewriteDirEntries(rw, partOff, sb, in, parentIno, entries)
+	}
+
+	absBlock := dirFirstDataBlock(rw, partOff, sb, in)
+	nblk := make([]byte, sb.blockSize)
 	if err := buildBlockDirBlock(sb, nblk, absBlock, in.num, parentIno, entries); err != nil {
 		return err
 	}
