@@ -879,12 +879,13 @@ func TestWriteAdditionalFinalBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("addEntryToBlockDir skips leaf extents and rebuilds the data block", func(t *testing.T) {
+	t.Run("gatherDirEntries skips leaf extents and reports leaf form", func(t *testing.T) {
 		oldDirExtents := writeDirExtents
 		oldReadRaw := writeReadRawBlock
-		oldWriteRaw := writeWriteRawBlock
 		leafLogBlock := dirLeafByteOffset / uint64(sb.blockSize)
-		// First extent is the leaf block (must be skipped); the data block is 2.
+		// First extent is the leaf block (must be skipped for entry reading);
+		// the data block is 2. The presence of the leaf extent means the
+		// directory is in leaf form, not block form.
 		writeDirExtents = func(io.ReaderAt, int64, *superblock, *inode) ([]extent, error) {
 			return []extent{{startOff: leafLogBlock, startBlock: 1, count: 1}, {startOff: 0, startBlock: 2, count: 1}}, nil
 		}
@@ -892,24 +893,25 @@ func TestWriteAdditionalFinalBranches(t *testing.T) {
 			if block != 2 {
 				t.Fatalf("read block %d; leaf extent should have been skipped", block)
 			}
-			return make([]byte, sb.blockSize), nil
-		}
-		var wroteBlock uint64
-		wrote := false
-		writeWriteRawBlock = func(_ io.WriterAt, _ int64, _ *superblock, block uint64, _ []byte) error {
-			wroteBlock, wrote = block, true
-			return nil
+			return buildDirBlock([]struct {
+				ino  uint64
+				name string
+				ft   uint8
+			}{{ino: 9, name: "kept", ft: 1}}, sb.hasFType), nil
 		}
 		t.Cleanup(func() {
 			writeDirExtents = oldDirExtents
 			writeReadRawBlock = oldReadRaw
-			writeWriteRawBlock = oldWriteRaw
 		})
-		if err := addEntryToBlockDir(newMemRW(0), 0, sb, newTestInode(122, 0x4000, inodeFmtExtents, 0), 7, "file", 1); err != nil {
-			t.Fatalf("addEntryToBlockDir: %v", err)
+		_, entries, blockForm, err := gatherDirEntries(newMemRW(0), 0, sb, newTestInode(122, 0x4000, inodeFmtExtents, 0))
+		if err != nil {
+			t.Fatalf("gatherDirEntries: %v", err)
 		}
-		if !wrote || wroteBlock != 2 {
-			t.Fatalf("expected rebuilt block written to data block 2, wrote=%v block=%d", wrote, wroteBlock)
+		if blockForm {
+			t.Fatal("expected leaf form (blockForm=false) when a leaf extent is present")
+		}
+		if len(entries) != 1 || entries[0].name != "kept" {
+			t.Fatalf("expected just [kept], got %+v", entries)
 		}
 	})
 }

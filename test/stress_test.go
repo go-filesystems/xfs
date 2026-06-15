@@ -97,18 +97,15 @@ func resolveStressKnobs(t testing.TB) stressKnobs {
 	// allocInode now grows the inobt by allocating fresh 64-inode chunks
 	// when the existing records are full, so the live inode population is
 	// bounded by free blocks (≈8000 inodes / AG) rather than the 7-slot
-	// seed chunk. The remaining cap on this stress test is the
-	// directory-block format: addEntryToBlockDir still operates on a
-	// single 4-KiB block (block-form), so a flat /-rooted listing tops
-	// out around 165 entries with the test's name lengths. Lifting that
-	// requires promoting the directory from block-form to data-form
-	// (multi-data-block + separate leaf), which is a follow-up to this
-	// fix.
+	// seed chunk. The directory-block format is no longer a cap either:
+	// the writer promotes a directory from block form to leaf form (and on
+	// to node form) as it grows, so a flat /-rooted listing can hold far
+	// more than the old ~165-entry single-block limit. See the
+	// leaf/node-form directory tests for the dedicated coverage.
 	//
 	// XFS_STRESS_LONG=1 cranks the many-files test from 32 to 150
-	// concurrent live files — comfortably past the 7-inode seed cap (so
-	// the inobt growth path runs) but still inside the single-block dir
-	// budget.
+	// concurrent live files — well past the 7-inode seed cap (so the inobt
+	// growth path runs) and into leaf-form directory territory.
 
 	shortDuration := 2 * time.Second
 	longDuration := 30 * time.Second

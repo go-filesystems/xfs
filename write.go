@@ -461,7 +461,7 @@ func buildBlockDirBlock(sb *superblock, blk []byte, absBlock, ownerIno, parentIn
 	for _, e := range all {
 		sz := dirEntrySize(len(e.name), sb.hasFType)
 		if off+sz > leafStart {
-			return fmt.Errorf("xfs: directory %d too large for single-block form (%d entries); leaf form not implemented", ownerIno, count)
+			return fmt.Errorf("xfs: directory %d too large for single-block form (%d entries): %w", ownerIno, count, errDirBlockFull)
 		}
 		writeDirEntry(blk, off, e.ino, e.name, e.ftype, sb.hasFType)
 		leaves = append(leaves, leafEnt{xfsDirHash([]byte(e.name)), uint32(off) >> 3})
@@ -593,48 +593,95 @@ func convertSFToBlock(rw readerWriterAt, partOff int64, sb *superblock, dirIn *i
 	return writeWriteInode(rw, partOff, sb, dirIn)
 }
 
-// addEntryToBlockDir adds an entry to an existing single-block directory by
-// reading its current entries, appending the new one, and rebuilding the block
-// through buildBlockDirBlock — keeping the data entries, free region, leaf
-// array and tail mutually consistent (which incremental insertion did not).
-func addEntryToBlockDir(rw readerWriterAt, partOff int64, sb *superblock, dirIn *inode, childIno uint64, name string, ftype uint8) error {
+// errDirBlockFull signals that a directory's entries plus their hash index no
+// longer fit a single block, so the directory must be promoted to leaf form.
+var errDirBlockFull = errors.New("xfs: directory block full")
+
+// gatherDirEntries reads every data block of a block/leaf/node-form directory
+// and returns its parent inode (from "..") and all real entries (excluding
+// "." / ".."). `blockForm` reports whether the directory is still in
+// single-block "block form" — distinguished by the absence of any leaf/node/
+// free extent (logical offset ≥ the leaf address space). Returns ErrNotFound
+// when the directory has no data block at all.
+func gatherDirEntries(rw readerWriterAt, partOff int64, sb *superblock, dirIn *inode) (parentIno uint64, entries []dirEnt, blockForm bool, err error) {
 	exts, err := writeDirExtents(rw, partOff, sb, dirIn)
 	if err != nil {
-		return err
+		return 0, nil, false, err
 	}
 	leafLogBlock := dirLeafByteOffset / uint64(sb.blockSize)
-	var absBlock uint64
-	found := false
+	blockForm = true
+	first := true
 	for _, e := range exts {
 		if e.startOff >= leafLogBlock {
+			blockForm = false // a leaf/node/free extent exists
 			continue
 		}
-		absBlock = e.startBlock
-		found = true
-		break
+		for b := uint32(0); b < e.count; b++ {
+			blk, rerr := writeReadRawBlock(rw, partOff, sb, e.startBlock+uint64(b))
+			if rerr != nil {
+				return 0, nil, false, rerr
+			}
+			if first {
+				parentIno = blockDirParent(blk, sb.hasFType, sb.hasCRC)
+				first = false
+			}
+			for _, de := range parseDirBlock(blk, sb.hasFType, sb.hasCRC) {
+				entries = append(entries, dirEnt{de.Name, de.Inode, de.FileType})
+			}
+		}
 	}
-	if !found {
-		return fmt.Errorf("xfs: directory inode %d has no data block", dirIn.num)
+	if first {
+		return 0, nil, false, ErrNotFound
 	}
+	return parentIno, entries, blockForm, nil
+}
 
-	blk, err := writeReadRawBlock(rw, partOff, sb, absBlock)
+// addEntryToBlockDir adds an entry to a block-, leaf- or node-form directory.
+// Block form is rebuilt in place through buildBlockDirBlock; once the entries
+// plus their hash index overflow a single block the directory is promoted to
+// leaf (or node) form via rewriteDirEntries, which relays out every block so
+// the data entries, hash index, bests array and da-btree stay consistent.
+func addEntryToBlockDir(rw readerWriterAt, partOff int64, sb *superblock, dirIn *inode, childIno uint64, name string, ftype uint8) error {
+	parentIno, existing, blockForm, err := gatherDirEntries(rw, partOff, sb, dirIn)
 	if err != nil {
 		return err
 	}
-	parentIno := blockDirParent(blk, sb.hasFType, sb.hasCRC)
-	existing := parseDirBlock(blk, sb.hasFType, sb.hasCRC) // excludes "." / ".."
 	entries := make([]dirEnt, 0, len(existing)+1)
 	for _, e := range existing {
-		if e.Name == name {
+		if e.name == name {
 			return fmt.Errorf("xfs: %q already exists", name)
 		}
-		entries = append(entries, dirEnt{e.Name, e.Inode, e.FileType})
+		entries = append(entries, e)
 	}
 	entries = append(entries, dirEnt{name, childIno, ftype})
 
-	nblk := make([]byte, len(blk))
-	if err := buildBlockDirBlock(sb, nblk, absBlock, dirIn.num, parentIno, entries); err != nil {
-		return err
+	if blockForm {
+		// Try to keep it in a single block; promote on overflow.
+		absBlock := dirFirstDataBlock(rw, partOff, sb, dirIn)
+		nblk := make([]byte, sb.blockSize)
+		err := buildBlockDirBlock(sb, nblk, absBlock, dirIn.num, parentIno, entries)
+		if err == nil {
+			return writeWriteRawBlock(rw, partOff, sb, absBlock, nblk)
+		}
+		if !errors.Is(err, errDirBlockFull) {
+			return err
+		}
 	}
-	return writeWriteRawBlock(rw, partOff, sb, absBlock, nblk)
+	return rewriteDirEntries(rw, partOff, sb, dirIn, parentIno, entries)
+}
+
+// dirFirstDataBlock returns the absolute FS block number of a directory's first
+// data block (logical offset 0). Returns 0 if it cannot be determined.
+func dirFirstDataBlock(rw readerWriterAt, partOff int64, sb *superblock, dirIn *inode) uint64 {
+	exts, err := writeDirExtents(rw, partOff, sb, dirIn)
+	if err != nil {
+		return 0
+	}
+	leafLogBlock := dirLeafByteOffset / uint64(sb.blockSize)
+	for _, e := range exts {
+		if e.startOff < leafLogBlock {
+			return e.startBlock
+		}
+	}
+	return 0
 }
