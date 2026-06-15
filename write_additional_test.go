@@ -541,21 +541,27 @@ func TestDirectoryWriteHelpersAdditional(t *testing.T) {
 			writeWriteExtentList = oldList
 			writeWriteInode = oldWrite
 		})
-		dirIn := newTestInode(14, 0x4000, inodeFmtLocal, 6)
-		dirIn.dataFork()[0] = 0
-		dirIn.dataFork()[1] = 0
+		// A fresh empty short-form dir per call: a failed conversion can leave
+		// the in-memory inode half-mutated (format flipped to extents), so each
+		// error-injection starts from a clean local inode.
+		freshDir := func() *inode {
+			d := newTestInode(14, 0x4000, inodeFmtLocal, 6)
+			d.dataFork()[0] = 0
+			d.dataFork()[1] = 0
+			return d
+		}
 
-		if err := convertSFToBlock(newMemRW(0), 0, sb, dirIn, 55, "file", 1); !errors.Is(err, errBoom) {
+		if err := convertSFToBlock(newMemRW(0), 0, sb, freshDir(), 55, "file", 1); !errors.Is(err, errBoom) {
 			t.Fatalf("expected block write error %v, got %v", errBoom, err)
 		}
 		writeWriteBlocksData = func(io.WriterAt, int64, *superblock, uint64, uint32, []byte) error { return nil }
 		writeWriteExtentList = func(*inode, []extent) error { return errBoom }
-		if err := convertSFToBlock(newMemRW(0), 0, sb, dirIn, 55, "file", 1); !errors.Is(err, errBoom) {
+		if err := convertSFToBlock(newMemRW(0), 0, sb, freshDir(), 55, "file", 1); !errors.Is(err, errBoom) {
 			t.Fatalf("expected extent-list error %v, got %v", errBoom, err)
 		}
 		writeWriteExtentList = func(*inode, []extent) error { return nil }
 		writeWriteInode = func(io.WriterAt, int64, *superblock, *inode) error { return errBoom }
-		if err := convertSFToBlock(newMemRW(0), 0, sb, dirIn, 55, "file", 1); !errors.Is(err, errBoom) {
+		if err := convertSFToBlock(newMemRW(0), 0, sb, freshDir(), 55, "file", 1); !errors.Is(err, errBoom) {
 			t.Fatalf("expected inode write error %v, got %v", errBoom, err)
 		}
 	})
@@ -879,18 +885,18 @@ func TestWriteAdditionalFinalBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("addEntryToBlockDir skips leaf extents and rebuilds the data block", func(t *testing.T) {
+	t.Run("addEntryToBlockDir rebuilds a single-block directory in place", func(t *testing.T) {
 		oldDirExtents := writeDirExtents
 		oldReadRaw := writeReadRawBlock
 		oldWriteRaw := writeWriteRawBlock
-		leafLogBlock := dirLeafByteOffset / uint64(sb.blockSize)
-		// First extent is the leaf block (must be skipped); the data block is 2.
+		// A single block-form data block at logical 0 (block 2), no leaf: the
+		// add rebuilds it in place, no allocation.
 		writeDirExtents = func(io.ReaderAt, int64, *superblock, *inode) ([]extent, error) {
-			return []extent{{startOff: leafLogBlock, startBlock: 1, count: 1}, {startOff: 0, startBlock: 2, count: 1}}, nil
+			return []extent{{startOff: 0, startBlock: 2, count: 1}}, nil
 		}
 		writeReadRawBlock = func(_ io.ReaderAt, _ int64, _ *superblock, block uint64) ([]byte, error) {
 			if block != 2 {
-				t.Fatalf("read block %d; leaf extent should have been skipped", block)
+				t.Fatalf("read unexpected block %d", block)
 			}
 			return make([]byte, sb.blockSize), nil
 		}
