@@ -181,6 +181,209 @@ func TestBlockFormDirXfsRepair(t *testing.T) {
 	}
 }
 
+// TestLeafFormDirXfsRepair builds a directory large enough to (a) outgrow a
+// single directory block into leaf form (>~165 short-name entries, an XDD3
+// data block plus a 0x3df1 leaf/index block) and (b) consume enough inodes
+// that the inobt must grow several new 64-inode chunks. Both must be
+// xfs_repair -n clean.
+//
+// This is the regression for two bugs: the leaf-form writer itself, and an
+// inode-chunk allocation that returned only inopBlock-aligned blocks — a
+// non-64-aligned chunk start makes xfs_repair map inodes onto file-data
+// blocks. Earlier interop tests created too few files (≤ the root chunk's
+// free-inode budget) to ever grow the inobt, so neither bug surfaced.
+func TestLeafFormDirXfsRepair(t *testing.T) {
+	xfsRepair, err := exec.LookPath("xfs_repair")
+	if err != nil {
+		t.Skip("xfs_repair not found on PATH; install xfsprogs to run this test")
+	}
+
+	const oneAG = int64(16384 * 4096)
+	path := filepath.Join(t.TempDir(), "leafdir.xfs")
+	fs, err := filesystem_xfs.Format(path, 4*oneAG, filesystem_xfs.FormatConfig{Label: "leafdir"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	mustf := func(e error) {
+		if e != nil {
+			fs.Close()
+			t.Fatal(e)
+		}
+	}
+	mustf(fs.MkDir("/d", 0o755))
+	const nEntries = 300 // forces leaf form and several inode chunks
+	for i := 0; i < nEntries; i++ {
+		mustf(fs.WriteFile(fmt.Sprintf("/d/file%04d.txt", i), []byte(fmt.Sprintf("content %d\n", i)), 0o644))
+	}
+	mustf(fs.WriteFile("/top.txt", []byte("top\n"), 0o644))
+	mustf(fs.DeleteFile("/d/file0000.txt")) // delete from a leaf-form dir
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	cmd := exec.Command(xfsRepair, "-n", path)
+	out, runErr := cmd.CombinedOutput()
+	t.Logf("xfs_repair -n output:\n%s", out)
+	if runErr != nil {
+		t.Fatalf("xfs_repair -n reported problems: %v", runErr)
+	}
+	upper := strings.ToUpper(string(out))
+	for _, marker := range []string{"ERROR", "CORRUPT", "WOULD ", "BAD ", "AGF_LONGEST"} {
+		if strings.Contains(upper, marker) {
+			t.Fatalf("xfs_repair -n reported %q in output:\n%s", marker, out)
+		}
+	}
+
+	// Reopen and confirm every surviving entry reads back correctly.
+	ro, err := filesystem_xfs.Open(path, -1)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer ro.Close()
+	ents, err := ro.ListDir("/d")
+	if err != nil {
+		t.Fatalf("ListDir /d: %v", err)
+	}
+	if len(ents) != nEntries-1 {
+		t.Fatalf("/d has %d entries, want %d", len(ents), nEntries-1)
+	}
+	got, err := ro.ReadFile("/d/file0150.txt")
+	if err != nil {
+		t.Fatalf("ReadFile /d/file0150.txt: %v", err)
+	}
+	if string(got) != "content 150\n" {
+		t.Fatalf("file0150.txt = %q, want %q", got, "content 150\n")
+	}
+}
+
+// TestNodeFormDirXfsRepair builds a directory large enough to outgrow leaf
+// form into node form: the single leaf1 index block is replaced by a da3-node
+// btree (0x3ebe) over multiple leafN blocks (0x3dff) plus a free-index block
+// (XDF3) at the 64 GiB offset. It must be xfs_repair -n clean and read back.
+func TestNodeFormDirXfsRepair(t *testing.T) {
+	xfsRepair, err := exec.LookPath("xfs_repair")
+	if err != nil {
+		t.Skip("xfs_repair not found on PATH; install xfsprogs to run this test")
+	}
+
+	const oneAG = int64(16384 * 4096)
+	path := filepath.Join(t.TempDir(), "nodedir.xfs")
+	fs, err := filesystem_xfs.Format(path, 8*oneAG, filesystem_xfs.FormatConfig{Label: "nodedir"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	mustf := func(e error) {
+		if e != nil {
+			fs.Close()
+			t.Fatal(e)
+		}
+	}
+	mustf(fs.MkDir("/nd", 0o755))
+	const nEntries = 2000 // forces node form (multiple leafN under a da3 node)
+	for i := 0; i < nEntries; i++ {
+		mustf(fs.WriteFile(fmt.Sprintf("/nd/file_%05d.txt", i), []byte(fmt.Sprintf("c%d\n", i)), 0o644))
+	}
+	mustf(fs.DeleteFile("/nd/file_00000.txt"))
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	cmd := exec.Command(xfsRepair, "-n", path)
+	out, runErr := cmd.CombinedOutput()
+	t.Logf("xfs_repair -n output:\n%s", out)
+	if runErr != nil {
+		t.Fatalf("xfs_repair -n reported problems: %v", runErr)
+	}
+	upper := strings.ToUpper(string(out))
+	for _, marker := range []string{"ERROR", "CORRUPT", "WOULD ", "BAD ", "AGF_LONGEST"} {
+		if strings.Contains(upper, marker) {
+			t.Fatalf("xfs_repair -n reported %q in output:\n%s", marker, out)
+		}
+	}
+
+	ro, err := filesystem_xfs.Open(path, -1)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer ro.Close()
+	ents, err := ro.ListDir("/nd")
+	if err != nil {
+		t.Fatalf("ListDir /nd: %v", err)
+	}
+	if len(ents) != nEntries-1 {
+		t.Fatalf("/nd has %d entries, want %d", len(ents), nEntries-1)
+	}
+	got, err := ro.ReadFile("/nd/file_01000.txt")
+	if err != nil {
+		t.Fatalf("ReadFile /nd/file_01000.txt: %v", err)
+	}
+	if string(got) != "c1000\n" {
+		t.Fatalf("file_01000.txt = %q, want %q", got, "c1000\n")
+	}
+}
+
+// TestDirChurnXfsRepair grows a directory into node form one entry at a time,
+// then deletes most of its entries — the workload that fragments the free
+// space the most, since each add/remove frees and reallocates the whole
+// directory. It must stay xfs_repair -n clean, which exercises free-extent
+// coalescing in freeBlocks (without it the bno/cnt B-tree leaf fills and
+// further frees fail with "cannot insert without a tree split").
+func TestDirChurnXfsRepair(t *testing.T) {
+	xfsRepair, err := exec.LookPath("xfs_repair")
+	if err != nil {
+		t.Skip("xfs_repair not found on PATH; install xfsprogs to run this test")
+	}
+
+	const oneAG = int64(16384 * 4096)
+	path := filepath.Join(t.TempDir(), "churn.xfs")
+	fs, err := filesystem_xfs.Format(path, 8*oneAG, filesystem_xfs.FormatConfig{Label: "churn"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	mustf := func(e error) {
+		if e != nil {
+			fs.Close()
+			t.Fatal(e)
+		}
+	}
+	mustf(fs.MkDir("/d", 0o755))
+	for i := 0; i < 700; i++ { // grow well into node form
+		mustf(fs.WriteFile(fmt.Sprintf("/d/f%04d", i), []byte("x\n"), 0o644))
+	}
+	for i := 0; i < 650; i++ { // shrink back toward block form
+		mustf(fs.DeleteFile(fmt.Sprintf("/d/f%04d", i)))
+	}
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	cmd := exec.Command(xfsRepair, "-n", path)
+	out, runErr := cmd.CombinedOutput()
+	t.Logf("xfs_repair -n output:\n%s", out)
+	if runErr != nil {
+		t.Fatalf("xfs_repair -n reported problems: %v", runErr)
+	}
+	upper := strings.ToUpper(string(out))
+	for _, marker := range []string{"ERROR", "CORRUPT", "WOULD ", "BAD ", "AGF_LONGEST"} {
+		if strings.Contains(upper, marker) {
+			t.Fatalf("xfs_repair -n reported %q in output:\n%s", marker, out)
+		}
+	}
+
+	ro, err := filesystem_xfs.Open(path, -1)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer ro.Close()
+	ents, err := ro.ListDir("/d")
+	if err != nil {
+		t.Fatalf("ListDir /d: %v", err)
+	}
+	if len(ents) != 50 {
+		t.Fatalf("/d has %d entries, want 50", len(ents))
+	}
+}
+
 // TestResizeShrinkErrSentinel is a tiny smoke test that the package's
 // Resize() entry point returns filesystem.ErrShrinkUnsupported on an
 // undersized request — same probe the diskimage CLI uses to decide
