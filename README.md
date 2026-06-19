@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/go-filesystems/brand/main/social/go-filesystems-xfs.png" alt="go-filesystems/xfs" width="720"></p>
+
 # xfs
 
 Pure-Go read/write access to XFS filesystem images — no root privileges, no external tools, no CGO.
