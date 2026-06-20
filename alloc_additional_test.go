@@ -164,8 +164,6 @@ func restoreAllocHooks(t *testing.T) {
 	oldInobtFindRecord := allocInobtFindRecord
 	oldGrowInobt := allocGrowInobt
 	oldAllocBlocks := allocAllocBlocks
-	oldAlignedAllocBlocks := allocAlignedAllocBlocks
-	oldRecomputeLongest := allocRecomputeLongest
 	oldWriteRawBlock := allocWriteRawBlock
 	t.Cleanup(func() {
 		allocAGFBlock = oldAGFBlock
@@ -185,8 +183,6 @@ func restoreAllocHooks(t *testing.T) {
 		allocInobtFindRecord = oldInobtFindRecord
 		allocGrowInobt = oldGrowInobt
 		allocAllocBlocks = oldAllocBlocks
-		allocAlignedAllocBlocks = oldAlignedAllocBlocks
-		allocRecomputeLongest = oldRecomputeLongest
 		allocWriteRawBlock = oldWriteRawBlock
 	})
 }
