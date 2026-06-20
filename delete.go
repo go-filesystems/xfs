@@ -163,24 +163,49 @@ func removeSFEntry(rw readerWriterAt, partOff int64, sb *superblock, in *inode, 
 // block tail mutually consistent (marking a slot free in place left the
 // bestfree table and leaf array stale, which xfs_repair flags).
 func removeBlockDirEntry(rw readerWriterAt, partOff int64, sb *superblock, in *inode, name string) error {
-	current, parentIno, err := gatherDirEntries(rw, partOff, sb, in)
+	exts, err := dirExtents(rw, partOff, sb, in)
 	if err != nil {
 		return err
 	}
+	leafLogBlock := dirLeafByteOffset / uint64(sb.blockSize)
+	var absBlock uint64
+	found := false
+	for _, e := range exts {
+		if e.startOff >= leafLogBlock {
+			continue
+		}
+		absBlock = e.startBlock
+		found = true
+		break
+	}
+	if !found {
+		return ErrNotFound
+	}
+
+	blk, err := readRawBlock(rw, partOff, sb, absBlock)
+	if err != nil {
+		return err
+	}
+	parentIno := blockDirParent(blk, sb.hasFType, sb.hasCRC)
+	current := parseDirBlock(blk, sb.hasFType, sb.hasCRC) // excludes "." / ".."
 	entries := make([]dirEnt, 0, len(current))
 	removed := false
 	for _, e := range current {
-		if e.name == name {
+		if e.Name == name {
 			removed = true
 			continue
 		}
-		entries = append(entries, e)
+		entries = append(entries, dirEnt{e.Name, e.Inode, e.FileType})
 	}
 	if !removed {
 		return ErrNotFound
 	}
-	// Rebuild the directory (block or leaf form) from the remaining entries.
-	return writeWholeDir(rw, partOff, sb, in, parentIno, entries)
+
+	nblk := make([]byte, len(blk))
+	if err := buildBlockDirBlock(sb, nblk, absBlock, in.num, parentIno, entries); err != nil {
+		return err
+	}
+	return writeRawBlock(rw, partOff, sb, absBlock, nblk)
 }
 
 // findEntryInBlock returns the byte offset and size of the directory entry
