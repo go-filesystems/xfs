@@ -143,7 +143,7 @@ func TestGrowInobt_Mocked(t *testing.T) {
 
 	t.Run("alloc blocks fails", func(t *testing.T) {
 		restoreAllocHooks(t)
-		allocAlignedAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32, uint32) (uint64, error) {
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
 			return 0, errBoom
 		}
 		if err := growInobt(newMemRW(0), 0, sb, 0); !errors.Is(err, errBoom) {
@@ -154,7 +154,7 @@ func TestGrowInobt_Mocked(t *testing.T) {
 	t.Run("agi re-read fails", func(t *testing.T) {
 		restoreAllocHooks(t)
 		// allocAllocBlocks succeeds, but the AGI re-read fails.
-		allocAlignedAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32, uint32) (uint64, error) {
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
 			// Return an absolute block within AG 0 (block 7).
 			return 7, nil
 		}
@@ -170,7 +170,7 @@ func TestGrowInobt_Mocked(t *testing.T) {
 
 	t.Run("leaf read fails", func(t *testing.T) {
 		restoreAllocHooks(t)
-		allocAlignedAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32, uint32) (uint64, error) {
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
 			return 7, nil
 		}
 		agi := makeAGIBuffer(sb, 0, 5, 1, 0, 0)
@@ -187,7 +187,7 @@ func TestGrowInobt_Mocked(t *testing.T) {
 
 	t.Run("multi-level inobt rejected", func(t *testing.T) {
 		restoreAllocHooks(t)
-		allocAlignedAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32, uint32) (uint64, error) {
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
 			return 7, nil
 		}
 		agi := makeAGIBuffer(sb, 0, 5, 2 /* level=2 */, 0, 0)
@@ -202,7 +202,7 @@ func TestGrowInobt_Mocked(t *testing.T) {
 
 	t.Run("leaf full rejected", func(t *testing.T) {
 		restoreAllocHooks(t)
-		allocAlignedAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32, uint32) (uint64, error) {
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
 			return 7, nil
 		}
 		agi := makeAGIBuffer(sb, 0, 5, 1, 0, 0)
@@ -226,7 +226,7 @@ func TestGrowInobt_Mocked(t *testing.T) {
 	t.Run("duplicate startIno rejected", func(t *testing.T) {
 		restoreAllocHooks(t)
 		// Allocator returns block 0 (agAbsBlock(0, 0)), so startIno = 0.
-		allocAlignedAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32, uint32) (uint64, error) {
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
 			return 0, nil
 		}
 		agi := makeAGIBuffer(sb, 0, 5, 1, 0, 0)
@@ -252,7 +252,7 @@ func TestGrowInobt_Mocked(t *testing.T) {
 
 	t.Run("leaf write fails", func(t *testing.T) {
 		restoreAllocHooks(t)
-		allocAlignedAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32, uint32) (uint64, error) {
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
 			return 7, nil
 		}
 		agi := makeAGIBuffer(sb, 0, 5, 1, 0, 0)
@@ -276,7 +276,7 @@ func TestGrowInobt_Mocked(t *testing.T) {
 
 	t.Run("agi write fails", func(t *testing.T) {
 		restoreAllocHooks(t)
-		allocAlignedAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32, uint32) (uint64, error) {
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
 			return 7, nil
 		}
 		agi := makeAGIBuffer(sb, 0, 5, 1, 0, 0)
@@ -301,7 +301,7 @@ func TestGrowInobt_Mocked(t *testing.T) {
 
 	t.Run("inode slot write fails", func(t *testing.T) {
 		restoreAllocHooks(t)
-		allocAlignedAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32, uint32) (uint64, error) {
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
 			return 7, nil
 		}
 		rw := newMemRW(8 * int(sb.blockSize))
@@ -326,7 +326,7 @@ func TestGrowInobt_Mocked(t *testing.T) {
 		// allocAllocBlocks returns block 16 → startIno = 16*8 = 128.
 		// Existing records: [56, 256]. The new record (128) must land in
 		// the middle.
-		allocAlignedAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32, uint32) (uint64, error) {
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
 			return 16, nil
 		}
 		agi := makeAGIBuffer(sb, 0, 5, 1, 0, 0)
@@ -375,7 +375,7 @@ func TestGrowInobt_Mocked(t *testing.T) {
 
 	t.Run("happy path", func(t *testing.T) {
 		restoreAllocHooks(t)
-		allocAlignedAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32, uint32) (uint64, error) {
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
 			return 7, nil
 		}
 		agi := makeAGIBuffer(sb, 0, 5, 1, 0, 0)
