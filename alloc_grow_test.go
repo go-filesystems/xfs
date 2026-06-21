@@ -410,13 +410,15 @@ func TestGrowInobt_Mocked(t *testing.T) {
 		if got := be.Uint32(savedAGI[agiOffFreeCount:]); got != inobtChunkInodes {
 			t.Fatalf("AGI freeCount: got %d, want %d", got, inobtChunkInodes)
 		}
-		// Leaf: numrecs 0 → 1, first record startIno = 7*8 = 56.
+		// Leaf: numrecs 0 → 1. The allocator returned block 7, which growInobt
+		// rounds up to the next blocksPerChunk (8) boundary → block 8, so
+		// startIno = 8*8 = 64 (a 64-inode-aligned chunk).
 		if nr := be.Uint16(savedLeaf[6:]); nr != 1 {
 			t.Fatalf("leaf numrecs: got %d, want 1", nr)
 		}
 		hdr := sb.agBTreeHdrSize()
-		if got := be.Uint32(savedLeaf[hdr:]); got != 56 {
-			t.Fatalf("leaf startIno: got %d, want 56", got)
+		if got := be.Uint32(savedLeaf[hdr:]); got != 64 {
+			t.Fatalf("leaf startIno: got %d, want 64", got)
 		}
 		if got := be.Uint32(savedLeaf[hdr+4:]); got != inobtChunkInodes {
 			t.Fatalf("leaf freeCount: got %d, want %d", got, inobtChunkInodes)

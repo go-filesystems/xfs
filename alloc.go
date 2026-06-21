@@ -99,6 +99,7 @@ var allocInobtFindRecord = inobtFindRecord
 var allocGrowInobt = growInobt
 var allocAllocBlocks = allocBlocks
 var allocWriteRawBlock = writeRawBlock
+var allocFreeBlocks = freeBlocks
 
 // inobtChunkInodes is the number of inodes per inobt record. The XFS spec
 // always uses 64-inode chunks (the irFree bitmap is 64 bits wide). With
@@ -343,6 +344,56 @@ func cntFindBlock(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, r
 		}
 		agRel = binary.BigEndian.Uint32(blk[lastPtr:])
 		level--
+	}
+}
+
+// agfRecomputeLongest walks the AGF free-space B-tree rooted at rootRel
+// (level deep) and returns the true maximum free-extent count, regardless of
+// the order records are stored in. It descends internal nodes to the leftmost
+// leaf, then follows the right-sibling chain across all leaves, taking the
+// largest count field. Used to refresh agf_longest after edits that may have
+// left a stale value (the simple allocator only ever lowers it).
+func agfRecomputeLongest(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, rootRel uint32, level int) (uint32, error) {
+	hdrSize := sb.agBTreeHdrSize()
+	be := binary.BigEndian
+
+	// Descend internal nodes to the leftmost leaf. level is the tree depth
+	// (number of B-tree levels); level==1 means the root is already a leaf,
+	// so descend level-1 times.
+	agRel := rootRel
+	for level > 1 {
+		blk, err := allocReadAGBlock(rw, partOff, sb, ag, agRel)
+		if err != nil {
+			return 0, err
+		}
+		numrecs := int(be.Uint16(blk[6:]))
+		ptrOff := hdrSize + numrecs*allocKeySize
+		if ptrOff+allocPtrSize > len(blk) {
+			return 0, fmt.Errorf("xfs: agfRecomputeLongest ag=%d: btree block too small", ag)
+		}
+		agRel = be.Uint32(blk[ptrOff:]) // leftmost child pointer
+		level--
+	}
+
+	// Walk the leaf chain left-to-right, keeping the largest count.
+	var longest uint32
+	for {
+		blk, err := allocReadAGBlock(rw, partOff, sb, ag, agRel)
+		if err != nil {
+			return 0, err
+		}
+		numrecs := int(be.Uint16(blk[6:]))
+		for i := 0; i < numrecs; i++ {
+			off := hdrSize + i*allocRecSize
+			if count := be.Uint32(blk[off+4:]); count > longest {
+				longest = count
+			}
+		}
+		rsib := be.Uint32(blk[12:])
+		if rsib == 0xFFFFFFFF {
+			return longest, nil
+		}
+		agRel = rsib
 	}
 }
 
@@ -819,18 +870,43 @@ func growInobt(rw readerWriterAt, partOff int64, sb *superblock, ag uint32) erro
 	}
 	blocksPerChunk := uint32(inobtChunkInodes) / uint32(sb.inopBlock)
 
-	// Allocate the backing blocks. Best-effort same-AG; the caller (allocInode)
-	// retries other AGs if this fails.
-	absStart, err := allocAllocBlocks(rw, partOff, sb, ag, blocksPerChunk)
+	// An inode chunk's starting inode number must be a multiple of
+	// XFS_INODES_PER_CHUNK (64); otherwise xfs_repair maps the chunk's inodes
+	// onto unrelated blocks. startIno = agBlockBase * inopBlock, so agBlockBase
+	// must be a multiple of blocksPerChunk (= 64/inopBlock). The bno/cnt
+	// allocator hands out whatever block fits, so over-allocate by up to one
+	// chunk's worth, carve out the aligned blocksPerChunk-block run, and free
+	// the unaligned head/tail slack back to the free-space B-trees.
+	wantBlocks := blocksPerChunk
+	if blocksPerChunk > 1 {
+		wantBlocks = 2*blocksPerChunk - 1 // enough slack to contain any aligned run
+	}
+	rawStart, err := allocAllocBlocks(rw, partOff, sb, ag, wantBlocks)
 	if err != nil {
-		return fmt.Errorf("growInobt: alloc %d blocks: %w", blocksPerChunk, err)
+		return fmt.Errorf("growInobt: alloc %d blocks: %w", wantBlocks, err)
 	}
 
-	// Compute the chunk's AG-relative starting inode number. startIno must
-	// not overlap the existing root chunk's 64-wide window; in practice
-	// the bno/cnt allocator hands out blocks well past the root inode block
-	// so startIno >= 56 ≥ 48+8 always, but the absolute spec window is 64.
-	agBlockBase := uint32(absStart % uint64(sb.agBlocks))
+	// Round the AG-relative start up to a blocksPerChunk boundary.
+	rawBase := uint32(rawStart % uint64(sb.agBlocks))
+	alignedBase := (rawBase + blocksPerChunk - 1) / blocksPerChunk * blocksPerChunk
+	headSlack := alignedBase - rawBase
+	absStart := rawStart + uint64(headSlack)
+	tailSlack := wantBlocks - headSlack - blocksPerChunk
+
+	// Return the slack so the space accounting and free-space trees stay
+	// correct (and xfs_repair sees no leaked blocks).
+	if headSlack > 0 {
+		if err := allocFreeBlocks(rw, partOff, sb, rawStart, headSlack); err != nil {
+			return fmt.Errorf("growInobt: free head slack: %w", err)
+		}
+	}
+	if tailSlack > 0 {
+		if err := allocFreeBlocks(rw, partOff, sb, absStart+uint64(blocksPerChunk), tailSlack); err != nil {
+			return fmt.Errorf("growInobt: free tail slack: %w", err)
+		}
+	}
+
+	agBlockBase := alignedBase
 	startIno := agBlockBase * uint32(sb.inopBlock)
 
 	// Pre-initialise every inode in the chunk. xfs_repair walks the chunk's

@@ -18,6 +18,7 @@ var deleteFreeBlocks = freeBlocks
 var deleteWriteInode = writeInode
 var deleteFreeInode = freeInode
 var deleteReadDir = readDir
+var deleteWriteWholeDir = writeWholeDir
 var deleteDirDeleteDir func(readerWriterAt, int64, *superblock, string) error
 var deleteDirDeleteFile func(readerWriterAt, int64, *superblock, string) error
 
@@ -163,31 +164,14 @@ func removeSFEntry(rw readerWriterAt, partOff int64, sb *superblock, in *inode, 
 // block tail mutually consistent (marking a slot free in place left the
 // bestfree table and leaf array stale, which xfs_repair flags).
 func removeBlockDirEntry(rw readerWriterAt, partOff int64, sb *superblock, in *inode, name string) error {
-	exts, err := dirExtents(rw, partOff, sb, in)
+	parentIno, err := dirParentIno(rw, partOff, sb, in)
 	if err != nil {
 		return err
 	}
-	leafLogBlock := dirLeafByteOffset / uint64(sb.blockSize)
-	var absBlock uint64
-	found := false
-	for _, e := range exts {
-		if e.startOff >= leafLogBlock {
-			continue
-		}
-		absBlock = e.startBlock
-		found = true
-		break
-	}
-	if !found {
-		return ErrNotFound
-	}
-
-	blk, err := readRawBlock(rw, partOff, sb, absBlock)
+	current, err := deleteReadDir(rw, partOff, sb, in) // excludes "." / ".."
 	if err != nil {
 		return err
 	}
-	parentIno := blockDirParent(blk, sb.hasFType, sb.hasCRC)
-	current := parseDirBlock(blk, sb.hasFType, sb.hasCRC) // excludes "." / ".."
 	entries := make([]dirEnt, 0, len(current))
 	removed := false
 	for _, e := range current {
@@ -200,12 +184,7 @@ func removeBlockDirEntry(rw readerWriterAt, partOff int64, sb *superblock, in *i
 	if !removed {
 		return ErrNotFound
 	}
-
-	nblk := make([]byte, len(blk))
-	if err := buildBlockDirBlock(sb, nblk, absBlock, in.num, parentIno, entries); err != nil {
-		return err
-	}
-	return writeRawBlock(rw, partOff, sb, absBlock, nblk)
+	return deleteWriteWholeDir(rw, partOff, sb, in, parentIno, entries)
 }
 
 // findEntryInBlock returns the byte offset and size of the directory entry
