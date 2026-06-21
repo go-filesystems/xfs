@@ -31,6 +31,14 @@ const (
 	magicDir2Block uint32 = 0x58443242 // "XD2B" — v4 single-block directory
 	magicDir2Data  uint32 = 0x58443244 // "XD2D" — v4 multi-block directory data
 
+	// Directory leaf / node / free-index block magic numbers. Unlike the
+	// data-block magics above, the leaf and node magics are 16-bit numeric
+	// values stored at byte offset 8 of the xfs_da3_blkinfo header.
+	magicDir3Leaf1 uint16 = 0x3df1     // XFS_DIR3_LEAF1_MAGIC — v5 single leaf index
+	magicDir3LeafN uint16 = 0x3dff     // XFS_DIR3_LEAFN_MAGIC — v5 node-form leaf
+	magicDa3Node   uint16 = 0x3ebe     // XFS_DA3_NODE_MAGIC   — v5 da-btree node
+	magicDir3Free  uint32 = 0x58444633 // "XDF3" — v5 directory free-index block
+
 	// AG free-space B-tree magic numbers.
 	magicABTB   uint32 = 0x41423342 // "AB3B" — v5 bno B-tree
 	magicABTC   uint32 = 0x41423343 // "AB3C" — v5 cnt B-tree
@@ -52,6 +60,10 @@ const (
 	// Logical byte offset at which directory leaf blocks begin.
 	// Data blocks live at logical blocks [0, dirLeafByteOffset/blockSize).
 	dirLeafByteOffset uint64 = 1 << 35 // 32 GiB
+
+	// Logical byte offset at which directory free-index blocks begin (node
+	// form). Leaf blocks live at [dirLeafByteOffset, dirFreeByteOffset).
+	dirFreeByteOffset uint64 = 1 << 36 // 64 GiB
 )
 
 // DirEntry is a parsed directory entry.

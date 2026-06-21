@@ -563,17 +563,23 @@ func TestDirectoryWriteHelpersAdditional(t *testing.T) {
 	t.Run("addEntryToBlockDir paths", func(t *testing.T) {
 		oldExts := writeDirExtents
 		oldRead := writeReadRawBlock
-		oldWrite := writeWriteRawBlock
-		writeDirExtents = func(io.ReaderAt, int64, *superblock, *inode) ([]extent, error) { return nil, errBoom }
+		oldReadDir := writeReadDir
+		oldWhole := writeWriteWholeDir
 		t.Cleanup(func() {
 			writeDirExtents = oldExts
 			writeReadRawBlock = oldRead
-			writeWriteRawBlock = oldWrite
+			writeReadDir = oldReadDir
+			writeWriteWholeDir = oldWhole
 		})
 		dirIn := newTestInode(15, 0x4000, inodeFmtExtents, 0)
+
+		// dirParentIno propagates a dirExtents error.
+		writeDirExtents = func(io.ReaderAt, int64, *superblock, *inode) ([]extent, error) { return nil, errBoom }
 		if err := addEntryToBlockDir(newMemRW(0), 0, sb, dirIn, 1, "file", 1); !errors.Is(err, errBoom) {
 			t.Fatalf("expected dirExtents error %v, got %v", errBoom, err)
 		}
+
+		// dirParentIno propagates a raw-block read error.
 		writeDirExtents = func(io.ReaderAt, int64, *superblock, *inode) ([]extent, error) {
 			return []extent{{startOff: 0, startBlock: 0, count: 1}}, nil
 		}
@@ -581,24 +587,41 @@ func TestDirectoryWriteHelpersAdditional(t *testing.T) {
 		if err := addEntryToBlockDir(newMemRW(0), 0, sb, dirIn, 1, "file", 1); !errors.Is(err, errBoom) {
 			t.Fatalf("expected readRawBlock error %v, got %v", errBoom, err)
 		}
+
+		// Parent reads back fine; readDir error propagates.
 		blk := make([]byte, sb.blockSize)
-		markSlotFree(blk, dirDataHdrSize(sb.hasCRC), len(blk)-dirDataHdrSize(sb.hasCRC))
 		writeReadRawBlock = func(io.ReaderAt, int64, *superblock, uint64) ([]byte, error) { return blk, nil }
-		writeWriteRawBlock = func(io.WriterAt, int64, *superblock, uint64, []byte) error { return errBoom }
+		writeReadDir = func(io.ReaderAt, int64, *superblock, *inode) ([]DirEntry, error) { return nil, errBoom }
 		if err := addEntryToBlockDir(newMemRW(0), 0, sb, dirIn, 1, "file", 1); !errors.Is(err, errBoom) {
-			t.Fatalf("expected writeRawBlock error %v, got %v", errBoom, err)
+			t.Fatalf("expected readDir error %v, got %v", errBoom, err)
 		}
-		writeWriteRawBlock = func(io.WriterAt, int64, *superblock, uint64, []byte) error { return nil }
+
+		// Existing entry with the same name is rejected before any layout work.
+		writeReadDir = func(io.ReaderAt, int64, *superblock, *inode) ([]DirEntry, error) {
+			return []DirEntry{{Inode: 9, Name: "file", FileType: 1}}, nil
+		}
+		if err := addEntryToBlockDir(newMemRW(0), 0, sb, dirIn, 1, "file", 1); err == nil {
+			t.Fatal("expected duplicate-name error")
+		}
+
+		// writeWholeDir error propagates.
+		writeReadDir = func(io.ReaderAt, int64, *superblock, *inode) ([]DirEntry, error) { return nil, nil }
+		writeWriteWholeDir = func(readerWriterAt, int64, *superblock, *inode, uint64, []dirEnt) error { return errBoom }
+		if err := addEntryToBlockDir(newMemRW(0), 0, sb, dirIn, 1, "file", 1); !errors.Is(err, errBoom) {
+			t.Fatalf("expected writeWholeDir error %v, got %v", errBoom, err)
+		}
+
+		// Happy path: writeWholeDir succeeds, new entry passed through.
+		var gotEntries []dirEnt
+		writeWriteWholeDir = func(_ readerWriterAt, _ int64, _ *superblock, _ *inode, _ uint64, ents []dirEnt) error {
+			gotEntries = ents
+			return nil
+		}
 		if err := addEntryToBlockDir(newMemRW(0), 0, sb, dirIn, 1, "file", 1); err != nil {
 			t.Fatalf("addEntryToBlockDir success: %v", err)
 		}
-		filled := make([]byte, sb.blockSize)
-		for i := range filled {
-			filled[i] = 1
-		}
-		writeReadRawBlock = func(io.ReaderAt, int64, *superblock, uint64) ([]byte, error) { return filled, nil }
-		if err := addEntryToBlockDir(newMemRW(0), 0, sb, dirIn, 1, "file", 1); err == nil {
-			t.Fatal("expected addEntryToBlockDir to fail when no free slot exists")
+		if len(gotEntries) != 1 || gotEntries[0].name != "file" {
+			t.Fatalf("expected new entry passed to writeWholeDir, got %+v", gotEntries)
 		}
 	})
 }
@@ -879,37 +902,42 @@ func TestWriteAdditionalFinalBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("addEntryToBlockDir skips leaf extents and rebuilds the data block", func(t *testing.T) {
+	t.Run("addEntryToBlockDir skips leaf extents to find the parent data block", func(t *testing.T) {
 		oldDirExtents := writeDirExtents
 		oldReadRaw := writeReadRawBlock
-		oldWriteRaw := writeWriteRawBlock
+		oldReadDir := writeReadDir
+		oldWhole := writeWriteWholeDir
 		leafLogBlock := dirLeafByteOffset / uint64(sb.blockSize)
-		// First extent is the leaf block (must be skipped); the data block is 2.
+		// First extent is a leaf block (must be skipped); the logical-0 data
+		// block holding ".." is block 2.
 		writeDirExtents = func(io.ReaderAt, int64, *superblock, *inode) ([]extent, error) {
 			return []extent{{startOff: leafLogBlock, startBlock: 1, count: 1}, {startOff: 0, startBlock: 2, count: 1}}, nil
 		}
+		var readBlock uint64
 		writeReadRawBlock = func(_ io.ReaderAt, _ int64, _ *superblock, block uint64) ([]byte, error) {
+			readBlock = block
 			if block != 2 {
 				t.Fatalf("read block %d; leaf extent should have been skipped", block)
 			}
 			return make([]byte, sb.blockSize), nil
 		}
-		var wroteBlock uint64
+		writeReadDir = func(io.ReaderAt, int64, *superblock, *inode) ([]DirEntry, error) { return nil, nil }
 		wrote := false
-		writeWriteRawBlock = func(_ io.WriterAt, _ int64, _ *superblock, block uint64, _ []byte) error {
-			wroteBlock, wrote = block, true
+		writeWriteWholeDir = func(readerWriterAt, int64, *superblock, *inode, uint64, []dirEnt) error {
+			wrote = true
 			return nil
 		}
 		t.Cleanup(func() {
 			writeDirExtents = oldDirExtents
 			writeReadRawBlock = oldReadRaw
-			writeWriteRawBlock = oldWriteRaw
+			writeReadDir = oldReadDir
+			writeWriteWholeDir = oldWhole
 		})
 		if err := addEntryToBlockDir(newMemRW(0), 0, sb, newTestInode(122, 0x4000, inodeFmtExtents, 0), 7, "file", 1); err != nil {
 			t.Fatalf("addEntryToBlockDir: %v", err)
 		}
-		if !wrote || wroteBlock != 2 {
-			t.Fatalf("expected rebuilt block written to data block 2, wrote=%v block=%d", wrote, wroteBlock)
+		if readBlock != 2 || !wrote {
+			t.Fatalf("expected parent read from data block 2 then writeWholeDir, readBlock=%d wrote=%v", readBlock, wrote)
 		}
 	})
 }

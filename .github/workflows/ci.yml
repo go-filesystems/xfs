@@ -1,0 +1,211 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Native runners: full build + vet + test (coverage) for the two
+  # architectures GitHub provides natively. xfsprogs (mkfs.xfs / xfs_repair /
+  # xfs_db) is installed so the kernel/userspace cross-check tests actually run
+  # instead of skipping: our writer formats an image, writes to it, then
+  # xfs_repair -n validates the on-disk result. This is where the
+  # COVERAGE_FLOOR gate is enforced.
+  native:
+    name: native ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-latest
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    env:
+      # Coverage floor enforced on the combined (-coverpkg=./...) profile.
+      # Measured at 94.2% on a full xfsprogs-backed run (mkfs.xfs / xfs_repair
+      # present); floored one whole point below to absorb run-to-run variance
+      # from the skip-on-missing-tool/image tests.
+      COVERAGE_FLOOR: "94.0"
+    steps:
+      - name: Checkout xfs
+        uses: actions/checkout@v4
+        with:
+          path: go-filesystems/xfs
+
+      # go.mod carries relative replaces:
+      #   replace github.com/go-filesystems/interface => ../interface
+      #   replace github.com/go-diskimages/qcow2     => ../../go-diskimages/qcow2
+      # so both sibling modules must sit at the matching relative paths.
+      - name: Checkout interface (sibling replace target)
+        uses: actions/checkout@v4
+        with:
+          repository: go-filesystems/interface
+          path: go-filesystems/interface
+
+      - name: Checkout qcow2 (sibling replace target)
+        uses: actions/checkout@v4
+        with:
+          repository: go-diskimages/qcow2
+          path: go-diskimages/qcow2
+
+      - name: Install xfsprogs (mkfs.xfs / xfs_repair / xfs_db)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+          cache-dependency-path: go-filesystems/xfs/go.mod
+
+      - name: Build
+        working-directory: go-filesystems/xfs
+        env:
+          CGO_ENABLED: "0"
+        run: go build ./...
+
+      - name: Vet
+        working-directory: go-filesystems/xfs
+        env:
+          CGO_ENABLED: "0"
+        run: go vet ./...
+
+      - name: Test (coverage)
+        working-directory: go-filesystems/xfs
+        env:
+          CGO_ENABLED: "0"
+        run: go test -coverpkg=./... -coverprofile=cover.out -count=1 -timeout=20m ./...
+
+      - name: Enforce coverage floor
+        working-directory: go-filesystems/xfs
+        run: |
+          set -euo pipefail
+          total=$(go tool cover -func=cover.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')
+          echo "total coverage: ${total}% (floor: ${COVERAGE_FLOOR}%)"
+          awk -v t="$total" -v f="$COVERAGE_FLOOR" \
+            'BEGIN { if (t+0 < f+0) { printf "coverage %.1f%% below floor %.1f%%\n", t, f; exit 1 } }'
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.arch }}
+          path: go-filesystems/xfs/cover.out
+          if-no-files-found: ignore
+
+  # Emulated runners: cross-compile a static (CGO_ENABLED=0) test binary per
+  # package and run it under QEMU for each non-native 64-bit arch.
+  #
+  # The bare Debian image carries no xfsprogs, so the mkfs.xfs / xfs_repair
+  # cross-check tests skip cleanly (t.Skip via exec.LookPath). What still runs
+  # is the pure-Go reader/writer path. That is exactly the byte-order test:
+  # XFS is a big-endian on-disk format and every metadata decoder/encoder uses
+  # explicit binary.BigEndian, so on the big-endian s390x host the parsed and
+  # emitted values must still come out correct.
+  emulated:
+    name: emulated ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: riscv64
+            image: debian:trixie
+            qemu: rv64,v=true,vlen=128
+          - arch: loong64
+            image: ghcr.io/loong64/debian:trixie
+            qemu: la464
+          - arch: ppc64le
+            image: debian:trixie
+            qemu: power9
+          - arch: s390x
+            image: debian:trixie
+            qemu: qemu
+    steps:
+      - name: Checkout xfs
+        uses: actions/checkout@v4
+        with:
+          path: go-filesystems/xfs
+
+      - name: Checkout interface (sibling replace target)
+        uses: actions/checkout@v4
+        with:
+          repository: go-filesystems/interface
+          path: go-filesystems/interface
+
+      - name: Checkout qcow2 (sibling replace target)
+        uses: actions/checkout@v4
+        with:
+          repository: go-diskimages/qcow2
+          path: go-diskimages/qcow2
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+          cache-dependency-path: go-filesystems/xfs/go.mod
+
+      - name: Register QEMU binfmt handlers
+        run: docker run --rm --privileged tonistiigi/binfmt --install all
+
+      - name: Cross-compile per-package test binaries
+        working-directory: go-filesystems/xfs
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/tests
+          for pkg in $(go list ./...); do
+            name=$(echo "$pkg" | tr '/' '_')
+            # Skip packages without test files (go test -c emits no binary).
+            go test -c -cover -o "/tmp/tests/${name}.test" "$pkg"
+            if [ -f "/tmp/tests/${name}.test" ]; then
+              echo "built ${name}.test"
+            fi
+          done
+          ls -la /tmp/tests
+
+      - name: Run test binaries under QEMU (${{ matrix.arch }})
+        env:
+          QEMU_CPU: ${{ matrix.qemu }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bins=(/tmp/tests/*.test)
+          if [ ${#bins[@]} -eq 0 ]; then
+            echo "no test binaries to run"; exit 0
+          fi
+          rc=0
+          for bin in "${bins[@]}"; do
+            echo "::group::$(basename "$bin")"
+            # --user 1000:1000: never run the suite as root inside the
+            # container, so permission-sensitive tests behave as on a normal
+            # developer machine. -test.short skips the slow paths impractical
+            # under emulation. -test.timeout guards against an emulation hang.
+            if ! docker run --rm \
+              --platform linux/${{ matrix.arch }} \
+              --user 1000:1000 \
+              -e QEMU_CPU="${QEMU_CPU}" \
+              -v /tmp/tests:/t -w /t \
+              ${{ matrix.image }} \
+              "./$(basename "$bin")" -test.v -test.short -test.timeout=20m; then
+              rc=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $rc

@@ -29,6 +29,8 @@ var writeWriteRawBlock = writeRawBlock
 var writeConvertSFToBlock = convertSFToBlock
 var writeSFReadDir = sfReadDir
 var writeInsertIntoSlot = insertIntoSlot
+var writeReadDir = readDir
+var writeWriteWholeDir = writeWholeDir
 
 // writeFile creates or overwrites the file at p within the XFS filesystem.
 // The parent directory must already exist.
@@ -507,6 +509,29 @@ func buildBlockDirBlock(sb *superblock, blk []byte, absBlock, ownerIno, parentIn
 	return nil
 }
 
+// dirParentIno reads the parent inode (the ".." entry) of a non-short-form
+// directory. The ".." entry always lives in logical data block 0, so this
+// reads just that block regardless of whether the directory is in block, leaf
+// or node form.
+func dirParentIno(rw readerWriterAt, partOff int64, sb *superblock, dirIn *inode) (uint64, error) {
+	exts, err := writeDirExtents(rw, partOff, sb, dirIn)
+	if err != nil {
+		return 0, err
+	}
+	leafLogBlock := dirLeafByteOffset / uint64(sb.blockSize)
+	for _, e := range exts {
+		if e.startOff != 0 || e.startOff >= leafLogBlock {
+			continue
+		}
+		blk, err := writeReadRawBlock(rw, partOff, sb, e.startBlock)
+		if err != nil {
+			return 0, err
+		}
+		return blockDirParent(blk, sb.hasFType, sb.hasCRC), nil
+	}
+	return 0, fmt.Errorf("xfs: directory inode %d has no data block", dirIn.num)
+}
+
 // blockDirParent returns the inode number stored in a block-form directory's
 // ".." entry (its parent), or 0 if not found.
 func blockDirParent(blk []byte, hasFType, hasCRC bool) uint64 {
@@ -593,36 +618,20 @@ func convertSFToBlock(rw readerWriterAt, partOff int64, sb *superblock, dirIn *i
 	return writeWriteInode(rw, partOff, sb, dirIn)
 }
 
-// addEntryToBlockDir adds an entry to an existing single-block directory by
-// reading its current entries, appending the new one, and rebuilding the block
-// through buildBlockDirBlock — keeping the data entries, free region, leaf
-// array and tail mutually consistent (which incremental insertion did not).
+// addEntryToBlockDir adds an entry to an existing block/leaf/node-form
+// directory by reading all of its current entries, appending the new one, and
+// re-laying-out the whole directory via writeWholeDir. writeWholeDir picks the
+// on-disk form (block when everything fits one block, otherwise leaf or node),
+// so this single path drives block→leaf→node growth as entries accumulate.
 func addEntryToBlockDir(rw readerWriterAt, partOff int64, sb *superblock, dirIn *inode, childIno uint64, name string, ftype uint8) error {
-	exts, err := writeDirExtents(rw, partOff, sb, dirIn)
+	parentIno, err := dirParentIno(rw, partOff, sb, dirIn)
 	if err != nil {
 		return err
 	}
-	leafLogBlock := dirLeafByteOffset / uint64(sb.blockSize)
-	var absBlock uint64
-	found := false
-	for _, e := range exts {
-		if e.startOff >= leafLogBlock {
-			continue
-		}
-		absBlock = e.startBlock
-		found = true
-		break
-	}
-	if !found {
-		return fmt.Errorf("xfs: directory inode %d has no data block", dirIn.num)
-	}
-
-	blk, err := writeReadRawBlock(rw, partOff, sb, absBlock)
+	existing, err := writeReadDir(rw, partOff, sb, dirIn) // excludes "." / ".."
 	if err != nil {
 		return err
 	}
-	parentIno := blockDirParent(blk, sb.hasFType, sb.hasCRC)
-	existing := parseDirBlock(blk, sb.hasFType, sb.hasCRC) // excludes "." / ".."
 	entries := make([]dirEnt, 0, len(existing)+1)
 	for _, e := range existing {
 		if e.Name == name {
@@ -631,10 +640,5 @@ func addEntryToBlockDir(rw readerWriterAt, partOff int64, sb *superblock, dirIn 
 		entries = append(entries, dirEnt{e.Name, e.Inode, e.FileType})
 	}
 	entries = append(entries, dirEnt{name, childIno, ftype})
-
-	nblk := make([]byte, len(blk))
-	if err := buildBlockDirBlock(sb, nblk, absBlock, dirIn.num, parentIno, entries); err != nil {
-		return err
-	}
-	return writeWriteRawBlock(rw, partOff, sb, absBlock, nblk)
+	return writeWriteWholeDir(rw, partOff, sb, dirIn, parentIno, entries)
 }
