@@ -1,4 +1,10 @@
+<p align="center"><img src="https://raw.githubusercontent.com/go-filesystems/brand/main/social/go-filesystems-xfs.png" alt="go-filesystems/xfs" width="720"></p>
+
 # xfs
+
+[![Go Reference](https://pkg.go.dev/badge/github.com/go-filesystems/xfs.svg)](https://pkg.go.dev/github.com/go-filesystems/xfs)
+[![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
+[![CI](https://github.com/go-filesystems/xfs/actions/workflows/ci.yml/badge.svg)](https://github.com/go-filesystems/xfs/actions/workflows/ci.yml)
 
 Pure-Go read/write access to XFS filesystem images — no root privileges, no external tools, no CGO.
 
