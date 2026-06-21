@@ -165,6 +165,11 @@ func restoreAllocHooks(t *testing.T) {
 	oldGrowInobt := allocGrowInobt
 	oldAllocBlocks := allocAllocBlocks
 	oldWriteRawBlock := allocWriteRawBlock
+	oldFreeBlocks := allocFreeBlocks
+	// Default the slack-free hook to a success no-op so growInobt mocks that
+	// don't set up a real AGF still exercise their target branch. Tests that
+	// care about the free path override this explicitly.
+	allocFreeBlocks = func(readerWriterAt, int64, *superblock, uint64, uint32) error { return nil }
 	t.Cleanup(func() {
 		allocAGFBlock = oldAGFBlock
 		allocWriteAGF = oldWriteAGF
@@ -184,6 +189,7 @@ func restoreAllocHooks(t *testing.T) {
 		allocGrowInobt = oldGrowInobt
 		allocAllocBlocks = oldAllocBlocks
 		allocWriteRawBlock = oldWriteRawBlock
+		allocFreeBlocks = oldFreeBlocks
 	})
 }
 

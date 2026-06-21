@@ -558,8 +558,10 @@ func TestDeleteDirectoryHelpersRemainingBranches(t *testing.T) {
 		leafOnly.nExts = 1
 		rec := encodeExtent(extent{startOff: dirLeafByteOffset / uint64(sb.blockSize), startBlock: 1, count: 1})
 		copy(leafOnly.dataFork(), rec[:])
-		if err := removeBlockDirEntry(newMemRW(0), 0, sb, leafOnly, "file"); !errors.Is(err, ErrNotFound) {
-			t.Fatalf("expected ErrNotFound for leaf-only extents, got %v", err)
+		// A directory whose only extent is a leaf block (no logical-0 data
+		// block holding "..") is malformed; resolving the parent inode fails.
+		if err := removeBlockDirEntry(newMemRW(0), 0, sb, leafOnly, "file"); err == nil || !contains(err.Error(), "no data block") {
+			t.Fatalf("expected no-data-block error for leaf-only extents, got %v", err)
 		}
 
 		copy(rw.data, blk)
