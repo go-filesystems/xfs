@@ -20,7 +20,7 @@ func TestOpenAdditional(t *testing.T) {
 		oldOpen := openFile
 		oldPart := openPartitionOffset
 		openFile = func(string, int, os.FileMode) (*os.File, error) { return f, nil }
-		openPartitionOffset = func(io.ReaderAt, int) (int64, error) { return 0, errBoom }
+		openPartitionOffset = func(io.ReaderAt, int64, int) (int64, error) { return 0, errBoom }
 		t.Cleanup(func() {
 			openFile = oldOpen
 			openPartitionOffset = oldPart
@@ -41,7 +41,7 @@ func TestOpenAdditional(t *testing.T) {
 		oldPart := openPartitionOffset
 		oldSB := openReadSuperblock
 		openFile = func(string, int, os.FileMode) (*os.File, error) { return f, nil }
-		openPartitionOffset = func(io.ReaderAt, int) (int64, error) { return 64, nil }
+		openPartitionOffset = func(io.ReaderAt, int64, int) (int64, error) { return 64, nil }
 		openReadSuperblock = func(io.ReaderAt, int64) (*superblock, error) { return nil, errBoom }
 		t.Cleanup(func() {
 			openFile = oldOpen
@@ -65,7 +65,7 @@ func TestOpenAdditional(t *testing.T) {
 		oldPart := openPartitionOffset
 		oldSB := openReadSuperblock
 		openFile = func(string, int, os.FileMode) (*os.File, error) { return f, nil }
-		openPartitionOffset = func(io.ReaderAt, int) (int64, error) { return 128, nil }
+		openPartitionOffset = func(io.ReaderAt, int64, int) (int64, error) { return 128, nil }
 		openReadSuperblock = func(io.ReaderAt, int64) (*superblock, error) { return sb, nil }
 		t.Cleanup(func() {
 			openFile = oldOpen

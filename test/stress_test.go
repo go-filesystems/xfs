@@ -114,8 +114,8 @@ func resolveStressKnobs(t testing.TB) stressKnobs {
 	longDuration := 30 * time.Second
 	shortFileMB := 16
 	longFileMB := 256
-	shortFiles := 32  // > 7 → exercises the inobt growth path under default runs
-	longFiles := 150  // long-mode: stress the inobt growth path heavily
+	shortFiles := 32 // > 7 → exercises the inobt growth path under default runs
+	longFiles := 150 // long-mode: stress the inobt growth path heavily
 
 	if testing.Short() {
 		// Pull each axis down further when running with -short.
@@ -633,9 +633,9 @@ func (b *flakyBackend) WriteAt(p []byte, off int64) (int, error) {
 	}
 	return b.f.WriteAt(p, off)
 }
-func (b *flakyBackend) Sync() error                { return b.f.Sync() }
-func (b *flakyBackend) Truncate(n int64) error     { return b.f.Truncate(n) }
-func (b *flakyBackend) Close() error               { return b.f.Close() }
+func (b *flakyBackend) Sync() error            { return b.f.Sync() }
+func (b *flakyBackend) Truncate(n int64) error { return b.f.Truncate(n) }
+func (b *flakyBackend) Close() error           { return b.f.Close() }
 func (b *flakyBackend) Size() (int64, error) {
 	fi, err := b.f.Stat()
 	if err != nil {

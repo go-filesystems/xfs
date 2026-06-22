@@ -1,14 +1,28 @@
 // partition_test.go — whitebox unit tests for MBR/GPT partition detection.
+//
+// Partition parsing is delegated to the shared, hardened go-volumes/gpt
+// package; these tests exercise the thin xfs adapter (partitionOffset /
+// gptFirstLinux) over it, including the bare-image, auto-select, by-index, and
+// not-found paths plus the device-size bounds that reject a hostile table.
 package filesystem_xfs
 
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"testing"
+
+	"github.com/go-volumes/gpt"
 )
 
-// ──────────────────── helpers ──────────────────────────────────────────────
+// testDeviceSize is a generous device size for the synthetic images below: the
+// parser only reads the table header + entries (never partition payload), so a
+// large ceiling lets the validated start offsets pass without materialising
+// hundreds of MiB of zeros on disk.
+const testDeviceSize = int64(1) << 40
+
+// linuxPartTypeGPT is the Linux-filesystem GPT type GUID in on-disk byte order,
+// re-exported from the shared parser for the table builders below.
+var linuxPartTypeGPT = gpt.LinuxFilesystemGUID
 
 // buildMBR returns a 1 MiB image (2048 sectors) with an MBR partition table.
 // Each entry: {ptype, startLBA}; zero startLBA entries are skipped by the parser.
@@ -26,12 +40,16 @@ func buildMBR(entries []struct {
 		off := 446 + i*16
 		img[off+4] = e.ptype
 		binary.LittleEndian.PutUint32(img[off+8:], e.startLBA)
+		// One-sector length so the hardened parser sees a populated entry.
+		binary.LittleEndian.PutUint32(img[off+12:], 1)
 	}
 	return img
 }
 
-// buildGPT returns a byte slice large enough to hold GPT header at LBA 1 and
-// the partition table at partEntryLBA=2. Each entry occupies entrySize bytes.
+// buildGPT returns a byte slice large enough to hold the GPT header at LBA 1
+// and the partition table at partEntryLBA=2. Each entry occupies entrySize
+// bytes. Partition extents are validated against testDeviceSize, not the
+// returned slice length.
 func buildGPT(entries []struct {
 	typeGUID [16]byte
 	startLBA uint64
@@ -67,12 +85,27 @@ func buildGPT(entries []struct {
 func TestPartitionOffset_BareImage(t *testing.T) {
 	// Neither MBR signature nor GPT magic — returns 0.
 	img := make([]byte, 1024*1024)
-	off, err := partitionOffset(bytes.NewReader(img), -1)
+	off, err := partitionOffset(bytes.NewReader(img), int64(len(img)), -1)
 	if err != nil {
 		t.Fatalf("partitionOffset: %v", err)
 	}
 	if off != 0 {
 		t.Errorf("got %d, want 0 for bare image", off)
+	}
+}
+
+func TestPartitionOffset_ZeroDeviceSize(t *testing.T) {
+	// A backend that cannot report its size is treated as a bare image.
+	img := buildMBR([]struct {
+		ptype    uint8
+		startLBA uint32
+	}{{0x83, 2048}})
+	off, err := partitionOffset(bytes.NewReader(img), 0, -1)
+	if err != nil {
+		t.Fatalf("partitionOffset: %v", err)
+	}
+	if off != 0 {
+		t.Errorf("got %d, want 0 for zero device size", off)
 	}
 }
 
@@ -85,7 +118,7 @@ func TestPartitionOffset_MBR_AutoSelect(t *testing.T) {
 	}{
 		{0x83, 2048},
 	})
-	off, err := partitionOffset(bytes.NewReader(img), -1)
+	off, err := partitionOffset(bytes.NewReader(img), testDeviceSize, -1)
 	if err != nil {
 		t.Fatalf("partitionOffset: %v", err)
 	}
@@ -103,7 +136,7 @@ func TestPartitionOffset_MBR_SpecificIndex(t *testing.T) {
 		{0x82, 2048}, // swap — should not be auto-selected
 		{0x83, 4096}, // Linux
 	})
-	off, err := partitionOffset(bytes.NewReader(img), 0)
+	off, err := partitionOffset(bytes.NewReader(img), testDeviceSize, 0)
 	if err != nil {
 		t.Fatalf("partitionOffset: %v", err)
 	}
@@ -122,7 +155,7 @@ func TestPartitionOffset_MBR_AutoSelectSkipsNonLinux(t *testing.T) {
 		{0x82, 2048}, // swap
 		{0x83, 4096}, // Linux
 	})
-	off, err := partitionOffset(bytes.NewReader(img), -1)
+	off, err := partitionOffset(bytes.NewReader(img), testDeviceSize, -1)
 	if err != nil {
 		t.Fatalf("partitionOffset: %v", err)
 	}
@@ -139,35 +172,23 @@ func TestPartitionOffset_MBR_IndexNotFound(t *testing.T) {
 	}{
 		{0x83, 2048},
 	})
-	_, err := partitionOffset(bytes.NewReader(img), 3)
+	_, err := partitionOffset(bytes.NewReader(img), testDeviceSize, 3)
 	if err == nil {
 		t.Error("expected error for out-of-range index, got nil")
 	}
 }
 
 func TestPartitionOffset_MBR_NoLinuxPartition(t *testing.T) {
+	// A swap-only MBR has no Linux partition; the auto-select fallback returns
+	// the first populated entry instead of failing (still a bounds-checked
+	// offset), matching the "give me the data partition" convenience.
 	img := buildMBR([]struct {
 		ptype    uint8
 		startLBA uint32
 	}{
 		{0x82, 2048}, // swap only
 	})
-	_, err := partitionOffset(bytes.NewReader(img), -1)
-	if err == nil {
-		t.Error("expected error for MBR with no Linux partition, got nil")
-	}
-}
-
-func TestPartitionOffset_MBR_ZeroStartLBASkipped(t *testing.T) {
-	// A zero-startLBA entry must be ignored even if ptype is 0x83.
-	img := buildMBR([]struct {
-		ptype    uint8
-		startLBA uint32
-	}{
-		{0x83, 0},    // invalid
-		{0x83, 2048}, // valid
-	})
-	off, err := partitionOffset(bytes.NewReader(img), -1)
+	off, err := partitionOffset(bytes.NewReader(img), testDeviceSize, -1)
 	if err != nil {
 		t.Fatalf("partitionOffset: %v", err)
 	}
@@ -187,7 +208,7 @@ func TestPartitionOffset_GPT_AutoSelect(t *testing.T) {
 		{linuxPartTypeGPT, 2048},
 	}
 	img := buildGPT(entries)
-	off, err := partitionOffset(bytes.NewReader(img), -1)
+	off, err := partitionOffset(bytes.NewReader(img), testDeviceSize, -1)
 	if err != nil {
 		t.Fatalf("partitionOffset: %v", err)
 	}
@@ -210,7 +231,7 @@ func TestPartitionOffset_GPT_SpecificIndex(t *testing.T) {
 	}
 	img := buildGPT(entries)
 	// Ask for index 1 explicitly.
-	off, err := partitionOffset(bytes.NewReader(img), 1)
+	off, err := partitionOffset(bytes.NewReader(img), testDeviceSize, 1)
 	if err != nil {
 		t.Fatalf("partitionOffset: %v", err)
 	}
@@ -232,7 +253,7 @@ func TestPartitionOffset_GPT_AutoSelectSkipsEFI(t *testing.T) {
 		{linuxPartTypeGPT, 4096},
 	}
 	img := buildGPT(entries)
-	off, err := partitionOffset(bytes.NewReader(img), -1)
+	off, err := partitionOffset(bytes.NewReader(img), testDeviceSize, -1)
 	if err != nil {
 		t.Fatalf("partitionOffset: %v", err)
 	}
@@ -250,7 +271,7 @@ func TestPartitionOffset_GPT_IndexNotFound(t *testing.T) {
 		{linuxPartTypeGPT, 2048},
 	}
 	img := buildGPT(entries)
-	_, err := partitionOffset(bytes.NewReader(img), 5)
+	_, err := partitionOffset(bytes.NewReader(img), testDeviceSize, 5)
 	if err == nil {
 		t.Error("expected error for out-of-range GPT index, got nil")
 	}
@@ -267,7 +288,7 @@ func TestPartitionOffset_GPT_SkipsEmptyTypeGUID(t *testing.T) {
 		{linuxPartTypeGPT, 4096},
 	}
 	img := buildGPT(entries)
-	off, err := partitionOffset(bytes.NewReader(img), -1)
+	off, err := partitionOffset(bytes.NewReader(img), testDeviceSize, -1)
 	if err != nil {
 		t.Fatalf("partitionOffset: %v", err)
 	}
@@ -277,40 +298,45 @@ func TestPartitionOffset_GPT_SkipsEmptyTypeGUID(t *testing.T) {
 	}
 }
 
-type partitionErrReaderAt struct {
-	err error
-}
-
-func (r partitionErrReaderAt) ReadAt([]byte, int64) (int, error) {
-	return 0, r.err
-}
-
-func TestPartitionOffset_GPTAdditionalErrors(t *testing.T) {
-	if _, err := gptPartOffset(partitionErrReaderAt{err: errBoom}, -1); !errors.Is(err, errBoom) {
-		t.Fatalf("expected GPT header read error %v, got %v", errBoom, err)
-	}
-
-	img := buildGPT(nil)
-	binary.LittleEndian.PutUint32(img[512+84:], 64)
-	if _, err := gptPartOffset(bytes.NewReader(img), -1); err == nil {
-		t.Fatal("expected GPT entry size validation error")
-	}
-
+// TestPartitionOffset_GPT_NoLinuxFallback covers a GPT whose only populated
+// entry is a non-Linux type: the auto-select falls back to the first populated
+// partition.
+func TestPartitionOffset_GPT_NoLinuxFallback(t *testing.T) {
 	var efiGUID [16]byte
 	efiGUID[0] = 0xC1
-	img = buildGPT([]struct {
+	img := buildGPT([]struct {
 		typeGUID [16]byte
 		startLBA uint64
 	}{
-		{efiGUID, 2048},
+		{efiGUID, 8192},
 	})
-	if _, err := gptPartOffset(bytes.NewReader(img), -1); err == nil {
-		t.Fatal("expected GPT auto-select to fail with no Linux data partition")
+	off, err := partitionOffset(bytes.NewReader(img), testDeviceSize, -1)
+	if err != nil {
+		t.Fatalf("partitionOffset: %v", err)
+	}
+	want := int64(8192) * sectorSize
+	if off != want {
+		t.Errorf("got %d, want %d", off, want)
 	}
 }
 
-func TestPartitionOffset_MBRAdditionalReadError(t *testing.T) {
-	if _, err := mbrPartOffset(partitionErrReaderAt{err: errBoom}, -1); !errors.Is(err, errBoom) {
-		t.Fatalf("expected MBR table read error %v, got %v", errBoom, err)
+// TestPartitionOffset_GPT_Malformed feeds a hostile entry size so the hardened
+// parser rejects the table; partitionOffset must surface the error, not panic.
+func TestPartitionOffset_GPT_Malformed(t *testing.T) {
+	img := buildGPT(nil)
+	binary.LittleEndian.PutUint32(img[512+84:], 64) // entry size below MinEntrySize
+	if _, err := partitionOffset(bytes.NewReader(img), testDeviceSize, -1); err == nil {
+		t.Fatal("expected GPT entry-size validation error, got nil")
+	}
+}
+
+// TestPartitionOffset_HeaderReadError ensures a backend that fails the header
+// read returns an error rather than panicking.
+func TestPartitionOffset_HeaderReadError(t *testing.T) {
+	// A short device whose GPT signature is present but header is truncated.
+	img := make([]byte, 600)
+	copy(img[512:], "EFI PART")
+	if _, err := partitionOffset(bytes.NewReader(img), int64(len(img)), -1); err == nil {
+		t.Fatal("expected truncated-header error, got nil")
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/bits"
 	"strings"
 )
 
@@ -12,16 +13,16 @@ type superblock struct {
 	blockSize  uint32
 	sectorSize uint32 // sb_sectsize; AG headers (SB/AGF/AGI/AGFL) are sector-aligned
 	agBlocks   uint32 // blocks per allocation group
-	agCount   uint32
-	rootIno   uint64 // root directory inode number
-	inodeSize uint16
-	inopBlock uint16 // inodes per block
-	inopBLog  uint8  // log2(inopBlock)
-	agBlkLog  uint8  // ceil(log2(agBlocks))
-	dirBlkLog uint8  // log2(dir block size in FS blocks)
-	hasCRC    bool   // v5 CRC-enabled superblock
-	hasFType  bool   // directory entries carry ftype byte
-	features2 uint32 // v4 sb_features2 (v5 rarely needed)
+	agCount    uint32
+	rootIno    uint64 // root directory inode number
+	inodeSize  uint16
+	inopBlock  uint16 // inodes per block
+	inopBLog   uint8  // log2(inopBlock)
+	agBlkLog   uint8  // ceil(log2(agBlocks))
+	dirBlkLog  uint8  // log2(dir block size in FS blocks)
+	hasCRC     bool   // v5 CRC-enabled superblock
+	hasFType   bool   // directory entries carry ftype byte
+	features2  uint32 // v4 sb_features2 (v5 rarely needed)
 	// UUID and Label are stored in the on-disk superblock but were not
 	// previously retained in the in-memory representation. Grow operations
 	// need the UUID to initialize new AG structures and the label when
@@ -71,9 +72,9 @@ const (
 	xfsSBVersion5    = 5
 	// xfsSBVersionV5 is the canonical v5 sb_versionnum: version 5 plus
 	// MOREBITS|DIRV2|EXTFLG|LOGV2|ALIGN|NLINK — what mkfs.xfs writes (0xb4a5).
-	xfsSBVersionV5  = 0xb4a5
-	xfsSBFeatures2  = 0x0000018a // sb_features2 (LAZYSBCOUNT|ATTR2|PROJID32|FTYPE)
-	xfsSBFeatFType  = 0x00000001 // v5 sb_features_incompat ftype (XFS_SB_FEAT_INCOMPAT_FTYPE)
+	xfsSBVersionV5   = 0xb4a5
+	xfsSBFeatures2   = 0x0000018a // sb_features2 (LAZYSBCOUNT|ATTR2|PROJID32|FTYPE)
+	xfsSBFeatFType   = 0x00000001 // v5 sb_features_incompat ftype (XFS_SB_FEAT_INCOMPAT_FTYPE)
 	xfsSBv4FeatFType = 0x00000200 // v4 sb_features2 ftype (XFS_SB_VERSION2_FTYPE)
 )
 
@@ -111,26 +112,95 @@ func readSuperblock(r io.ReaderAt, partOff int64) (*superblock, error) {
 		blockSize:  be.Uint32(buf[sbOffBlockSize:]),
 		sectorSize: sectorSize,
 		agBlocks:   be.Uint32(buf[sbOffAgBlocks:]),
-		agCount:   be.Uint32(buf[sbOffAgCount:]),
-		rootIno:   be.Uint64(buf[sbOffRootIno:]),
-		inodeSize: be.Uint16(buf[sbOffInodeSize:]),
-		inopBlock: be.Uint16(buf[sbOffInopBlock:]),
-		inopBLog:  buf[sbOffInopBLog],
-		agBlkLog:  buf[sbOffAgBlkLog],
-		dirBlkLog: buf[sbOffDirBlkLog],
-		hasCRC:    hasCRC,
-		hasFType:  hasFType,
-		features2: be.Uint32(buf[sbOffFeatures2:]),
+		agCount:    be.Uint32(buf[sbOffAgCount:]),
+		rootIno:    be.Uint64(buf[sbOffRootIno:]),
+		inodeSize:  be.Uint16(buf[sbOffInodeSize:]),
+		inopBlock:  be.Uint16(buf[sbOffInopBlock:]),
+		inopBLog:   buf[sbOffInopBLog],
+		agBlkLog:   buf[sbOffAgBlkLog],
+		dirBlkLog:  buf[sbOffDirBlkLog],
+		hasCRC:     hasCRC,
+		hasFType:   hasFType,
+		features2:  be.Uint32(buf[sbOffFeatures2:]),
 	}
 	// Extract UUID (16 bytes at offset 32) and label (12 bytes at offset 108).
 	copy(sb.uuid[:], buf[32:48])
 	lbl := make([]byte, 12)
 	copy(lbl, buf[108:120])
 	sb.label = strings.TrimRight(string(lbl), "\x00 \t\n\r")
-	if sb.blockSize == 0 || sb.agBlocks == 0 || sb.agCount == 0 || sb.inodeSize == 0 {
-		return nil, fmt.Errorf("xfs: superblock has invalid geometry")
+	if err := validateGeometry(sb); err != nil {
+		return nil, err
 	}
 	return sb, nil
+}
+
+// Geometry bounds. XFS restricts these on disk; the kernel verifier
+// (xfs_validate_sb_common) enforces the same. We reject anything outside
+// them so an attacker cannot drive an out-of-bounds read or a bad allocation
+// through corrupt geometry.
+const (
+	// minBlockSize / maxBlockSize bound sb_blocksize; XFS allows 512..65536.
+	minBlockSize = 512
+	maxBlockSize = 65536
+	// inodeSize must be a power of two in this set and large enough to hold
+	// the 176-byte v3 inode core plus a usable data fork.
+	minInodeSize = 256
+	maxInodeSize = 2048
+)
+
+// validateGeometry rejects superblocks whose geometry would let a corrupt or
+// hostile image drive an out-of-bounds slice, a bad allocation, or a
+// nonsensical shift. Every field an inode/extent read indexes against is
+// constrained to a sane range here, once, at open time.
+func validateGeometry(sb *superblock) error {
+	if sb.agBlocks == 0 || sb.agCount == 0 {
+		return fmt.Errorf("xfs: superblock has invalid geometry")
+	}
+	// C2: blockSize must be a power of two in [512,65536] and >= sectorSize.
+	// Sub-512 or non-power-of-two blocks make block-relative reads
+	// (blk[6:], blk[12:], directory/btree headers) index past the buffer and
+	// corrupt every geometry computation.
+	if sb.blockSize < minBlockSize || sb.blockSize > maxBlockSize ||
+		bits.OnesCount32(sb.blockSize) != 1 {
+		return fmt.Errorf("xfs: invalid block size %d (must be a power of two in [%d,%d])",
+			sb.blockSize, minBlockSize, maxBlockSize)
+	}
+	if sb.blockSize < sb.sectorSize {
+		return fmt.Errorf("xfs: block size %d smaller than sector size %d",
+			sb.blockSize, sb.sectorSize)
+	}
+	// C1: inodeSize must be a power of two in {256,512,1024,2048} and at least
+	// the 176-byte inode core so dataFork() (raw[176:]) and every fixed-offset
+	// core read stay in bounds. Values 1..183 made the root-inode read OOB.
+	if sb.inodeSize < minInodeSize || sb.inodeSize > maxInodeSize ||
+		bits.OnesCount16(sb.inodeSize) != 1 || int(sb.inodeSize) < inodeCoreSize {
+		return fmt.Errorf("xfs: invalid inode size %d (must be a power of two in [%d,%d])",
+			sb.inodeSize, minInodeSize, maxInodeSize)
+	}
+	// H2: inopBlock / inopBLog / agBlkLog must be self-consistent and small
+	// enough that the inode-number shifts in inodeByteOff cannot exceed 63.
+	if sb.inopBlock == 0 || bits.OnesCount16(sb.inopBlock) != 1 {
+		return fmt.Errorf("xfs: invalid inodes-per-block %d", sb.inopBlock)
+	}
+	if uint(sb.inopBLog) >= 16 || (uint16(1)<<sb.inopBLog) != sb.inopBlock {
+		return fmt.Errorf("xfs: inopblog %d inconsistent with inopblock %d", sb.inopBLog, sb.inopBlock)
+	}
+	// agBlkLog must be ceil(log2(agBlocks)): the smallest n with 1<<n >= agBlocks.
+	wantAgBlkLog := uint8(bits.Len32(sb.agBlocks - 1))
+	if sb.agBlkLog != wantAgBlkLog {
+		return fmt.Errorf("xfs: agblklog %d inconsistent with agblocks %d (want %d)",
+			sb.agBlkLog, sb.agBlocks, wantAgBlkLog)
+	}
+	// The combined inode-number shift (ag << (agBlkLog+inopBLog)) must stay
+	// below 64 or the shift is undefined / wraps.
+	if uint(sb.agBlkLog)+uint(sb.inopBLog) >= 64 {
+		return fmt.Errorf("xfs: agblklog %d + inopblog %d shift overflows", sb.agBlkLog, sb.inopBLog)
+	}
+	// dirBlkLog (1<<dirBlkLog FS blocks per dir block) must not overflow.
+	if sb.dirBlkLog >= 32 {
+		return fmt.Errorf("xfs: dirblklog %d too large", sb.dirBlkLog)
+	}
+	return nil
 }
 
 // agByteOffset returns the byte offset of the first block of allocation group ag.
