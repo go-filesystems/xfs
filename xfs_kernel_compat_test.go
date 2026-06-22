@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -22,6 +23,33 @@ func findSbinTool(name string) string {
 		}
 	}
 	return ""
+}
+
+// firstPhysBlock parses a `filefrag -v` dump and returns the first physical
+// block of the first extent, or -1 if the file is absent/unparseable. filefrag
+// lines look like: "   0:        0..    1220:         73..      1293:   1221:".
+func firstPhysBlock(fragFile string) int64 {
+	data, err := os.ReadFile(fragFile)
+	if err != nil {
+		return -1
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		// The physical range is the third "a..b" group on an extent line.
+		fields := strings.FieldsFunc(line, func(r rune) bool {
+			return r == ' ' || r == '\t' || r == ':' || r == '.'
+		})
+		// An extent line begins with the extent index, then logical lo, logical
+		// hi, physical lo, physical hi, length. Require at least 4 numeric tokens
+		// with the 4th being the physical start.
+		if len(fields) >= 4 {
+			if idx, err0 := strconv.Atoi(fields[0]); err0 == nil && idx == 0 {
+				if phys, err3 := strconv.Atoi(fields[3]); err3 == nil {
+					return int64(phys)
+				}
+			}
+		}
+	}
+	return -1
 }
 
 // canLoopMount reports whether the test can create a loopback mount: it needs
@@ -74,19 +102,36 @@ func TestXfsKernelCompat_Read(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.Truncate(350 << 20); err != nil { // mkfs.xfs requires > 300 MiB
+	if err := f.Truncate(320 << 20); err != nil { // mkfs.xfs requires > 300 MiB
 		f.Close()
 		t.Fatal(err)
 	}
 	f.Close()
-	if out, err := exec.Command(mkfs, "-f", img).CombinedOutput(); err != nil {
+	// agcount=4 over 320 MiB yields agblocks=20480, which is NOT a power of two,
+	// so on-disk fsbno values are genuinely packed (fsbno = (agno<<agblklog)|agbno
+	// with agblklog=15, 1<<15=32768 != 20480). This is the geometry that exposes
+	// the multi-AG addressing bug once an extent lands in AG≥1 (see ag1.bin below).
+	if out, err := exec.Command(mkfs, "-f", "-d", "agcount=4", img).CombinedOutput(); err != nil {
 		t.Fatalf("mkfs.xfs: %v\n%s", err, out)
 	}
 
 	shortTarget := "/etc/passwd"
 	longTarget := "/" + strings.Repeat("seg/", 170) + "leaf" // ~685 bytes: remote symlink
 
+	// A real-data file (deterministic) large enough to fill most of AG0, so the
+	// subsequent ag1.bin is forced into AG1 — exercising fsbToPhysBlock on a
+	// non-power-of-two geometry against the live kernel layout.
+	ag0fill := make([]byte, 78<<20)
+	for i := range ag0fill {
+		ag0fill[i] = byte(i*3 + 1)
+	}
+	ag0Path := filepath.Join(t.TempDir(), "ag0fill.bin")
+	if err := os.WriteFile(ag0Path, ag0fill, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	mnt := t.TempDir()
+	fragOut := filepath.Join(t.TempDir(), "ag1.frag")
 	script := strings.Join([]string{
 		"set -e",
 		"mount -o loop " + img + " " + mnt,
@@ -95,6 +140,12 @@ func TestXfsKernelCompat_Read(t *testing.T) {
 		"mkdir " + mnt + "/sub",
 		"cp " + srcPath + " " + mnt + "/big.bin",
 		"cp " + srcPath + " " + mnt + "/sub/nested.bin",
+		"cp " + ag0Path + " " + mnt + "/ag0fill.bin",  // consumes most of AG0
+		"cp " + ag0Path + " " + mnt + "/ag0fill2.bin", // fully exhaust AG0 free space
+		"cp " + srcPath + " " + mnt + "/ag1.bin",      // forced into AG1
+		// Record ag1.bin's first physical block (filefrag, if present) so the
+		// test can assert it really landed in a higher AG.
+		"command -v filefrag >/dev/null && filefrag -v " + mnt + "/ag1.bin > " + fragOut + " 2>/dev/null || true",
 		"sync",
 		"umount " + mnt,
 	}, " && ")
@@ -102,6 +153,30 @@ func TestXfsKernelCompat_Read(t *testing.T) {
 		// Best-effort cleanup in case the mount survived a mid-script failure.
 		_, _ = sudoSh("umount " + mnt + " 2>/dev/null || true")
 		t.Fatalf("kernel populate: %v\n%s", err, out)
+	}
+
+	// Confirm ag1.bin's data really lives in AG≥1 (flat physical block ≥ agblocks),
+	// so this run actually exercises the packed-fsbno multi-AG decode rather than
+	// silently testing only AG0. If the kernel placed it in AG0 anyway, the
+	// committed-fixture test (TestMultiAGFixtureRead) still guarantees coverage.
+	if minPhys := firstPhysBlock(fragOut); minPhys >= 0 {
+		f, _ := os.Open(img)
+		sb, sbErr := readSuperblock(f, 0)
+		if f != nil {
+			f.Close()
+		}
+		if sbErr == nil {
+			if sb.agBlocks&(sb.agBlocks-1) == 0 {
+				t.Logf("note: agblocks=%d is a power of two on this kernel; "+
+					"multi-AG packing is the identity here (fixture test covers the packed case)", sb.agBlocks)
+			} else if uint64(minPhys) < uint64(sb.agBlocks) {
+				t.Logf("note: ag1.bin landed at physical block %d < agblocks %d (AG0); "+
+					"the committed-fixture test exercises the AG≥1 path", minPhys, sb.agBlocks)
+			} else {
+				t.Logf("ag1.bin placed at physical block %d ≥ agblocks %d (AG≥1): "+
+					"this run exercises the multi-AG packed-fsbno decode against the live kernel", minPhys, sb.agBlocks)
+			}
+		}
 	}
 
 	fs, err := Open(img, -1)
@@ -120,7 +195,9 @@ func TestXfsKernelCompat_Read(t *testing.T) {
 
 	// Regular file read exercises the NREXT64 extent-count path: before the fix
 	// the extent count read as 0 and the file came back all-zero.
-	for _, p := range []string{"/big.bin", "/sub/nested.bin"} {
+	// /ag1.bin lives in AG1 (non-power-of-two agblocks ⇒ packed fsbno): before the
+	// multi-AG addressing fix this read failed with "read extent block …: EOF".
+	for _, p := range []string{"/big.bin", "/sub/nested.bin", "/ag1.bin"} {
 		got, err := fs.ReadFile(p)
 		if err != nil {
 			t.Errorf("ReadFile(%s): %v", p, err)

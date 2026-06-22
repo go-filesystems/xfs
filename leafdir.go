@@ -242,7 +242,7 @@ func writeDataRegion(rw readerWriterAt, partOff int64, sb *superblock, in *inode
 		abs := dataStart + uint64(b)
 		if sb.hasCRC {
 			be.PutUint32(blk[0:], magicDir3Data)
-			be.PutUint64(blk[8:], abs*fmtDaddrPerBlock)
+			be.PutUint64(blk[8:], sb.fsbToPhysBlock(abs)*fmtDaddrPerBlock)
 			copy(blk[24:40], sb.uuid[:])
 			be.PutUint64(blk[40:], in.num)
 		} else {
@@ -314,7 +314,7 @@ func writeLeaf1Index(rw readerWriterAt, partOff int64, sb *superblock, in *inode
 	// xfs_dir3_leaf_hdr: da3_blkinfo (magic@8, crc@12, blkno@16, uuid@32,
 	// owner@48) + count@56 + stale@58 + pad@60; lents start at 64.
 	be.PutUint16(leaf[8:], magicDir3Leaf1)
-	be.PutUint64(leaf[16:], leafBlock*fmtDaddrPerBlock)
+	be.PutUint64(leaf[16:], sb.fsbToPhysBlock(leafBlock)*fmtDaddrPerBlock)
 	copy(leaf[32:48], sb.uuid[:])
 	be.PutUint64(leaf[48:], in.num)
 	be.PutUint16(leaf[56:], uint16(len(lents)))
@@ -422,7 +422,7 @@ func writeNodeIndex(rw readerWriterAt, partOff int64, sb *superblock, in *inode,
 		be.PutUint32(buf[0:], forw)
 		be.PutUint32(buf[4:], back)
 		be.PutUint16(buf[8:], magicDir3LeafN)
-		be.PutUint64(buf[16:], absBlk*fmtDaddrPerBlock)
+		be.PutUint64(buf[16:], sb.fsbToPhysBlock(absBlk)*fmtDaddrPerBlock)
 		copy(buf[32:48], sb.uuid[:])
 		be.PutUint64(buf[48:], in.num)
 		be.PutUint16(buf[56:], uint16(len(chunk))) // count; stale@58=0, pad@60=0
@@ -438,7 +438,7 @@ func writeNodeIndex(rw readerWriterAt, partOff int64, sb *superblock, in *inode,
 	// da3 node root at region block 0 (logical leafLog).
 	root := region[0:blkSize]
 	be.PutUint16(root[8:], magicDa3Node)
-	be.PutUint64(root[16:], leafStart*fmtDaddrPerBlock)
+	be.PutUint64(root[16:], sb.fsbToPhysBlock(leafStart)*fmtDaddrPerBlock)
 	copy(root[32:48], sb.uuid[:])
 	be.PutUint64(root[48:], in.num)
 	be.PutUint16(root[56:], uint16(K)) // count
@@ -463,7 +463,7 @@ func writeNodeIndex(rw readerWriterAt, partOff int64, sb *superblock, in *inode,
 	// be16 bests array (one per data block) starts at 64.
 	free := make([]byte, blkSize)
 	be.PutUint32(free[0:], magicDir3Free)
-	be.PutUint64(free[8:], freeStart*fmtDaddrPerBlock)
+	be.PutUint64(free[8:], sb.fsbToPhysBlock(freeStart)*fmtDaddrPerBlock)
 	copy(free[24:40], sb.uuid[:])
 	be.PutUint64(free[40:], in.num)
 	be.PutUint32(free[48:], 0)         // firstdb: covers data blocks from 0

@@ -454,19 +454,23 @@ func (fs *xfsFS) Chtimes(path string, atime, mtime time.Time) error {
 	return chtimesInode(fs.f, fs.partOffset, fs.sb, path, atime, mtime)
 }
 
-// blockByteOffset converts an absolute filesystem block number to its byte
-// offset, rejecting any block number whose offset would overflow int64 (and
+// blockByteOffset converts a packed on-disk filesystem block number (fsbno) to
+// its byte offset. The fsbno is first decoded to a flat/physical block via
+// fsbToPhysBlock — XFS packs fsbno = (agno<<agblklog)|agbno and the default
+// mkfs.xfs agsize is not a power of two, so the raw fsbno is NOT a flat block
+// index. It then rejects any block whose offset would overflow int64 (and
 // therefore wrap negative). An attacker-controlled block pointer (from a forged
 // extent or btree node) could otherwise drive a negative ReadAt offset; some
 // backends panic on that rather than erroring. Returns ErrBlockOutOfRange when
 // the offset cannot be represented.
-func blockByteOffset(partOff int64, sb *superblock, blockNum uint64) (int64, error) {
+func blockByteOffset(partOff int64, sb *superblock, fsbno uint64) (int64, error) {
 	bs := int64(sb.blockSize)
-	// blockNum*bs must not overflow int64, and partOff+that must not either.
-	if bs <= 0 || blockNum > uint64((1<<63-1-partOff)/bs) {
-		return 0, fmt.Errorf("xfs: block %d offset overflows: %w", blockNum, ErrBlockOutOfRange)
+	phys := sb.fsbToPhysBlock(fsbno)
+	// phys*bs must not overflow int64, and partOff+that must not either.
+	if bs <= 0 || phys > uint64((1<<63-1-partOff)/bs) {
+		return 0, fmt.Errorf("xfs: block %d offset overflows: %w", fsbno, ErrBlockOutOfRange)
 	}
-	return partOff + int64(blockNum)*bs, nil
+	return partOff + int64(phys)*bs, nil
 }
 
 // ErrBlockOutOfRange is returned when a block number's byte offset would
@@ -487,9 +491,9 @@ func readRawBlock(f io.ReaderAt, partOff int64, sb *superblock, blockNum uint64)
 	return buf, nil
 }
 
-// writeRawBlock writes one filesystem block by absolute block number.
+// writeRawBlock writes one filesystem block by packed fsbno (see fsbToPhysBlock).
 func writeRawBlock(f io.WriterAt, partOff int64, sb *superblock, blockNum uint64, data []byte) error {
-	off := partOff + int64(blockNum)*int64(sb.blockSize)
+	off := partOff + int64(sb.fsbToPhysBlock(blockNum))*int64(sb.blockSize)
 	if _, err := f.WriteAt(data, off); err != nil {
 		return fmt.Errorf("xfs: write block %d: %w", blockNum, err)
 	}
