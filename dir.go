@@ -18,10 +18,15 @@ var dirInlineExtents = inlineExtents
 var dirBtreeExtents = btreeExtents
 var dirReadRawBlock = readRawBlock
 var dirBlockReadDir = blockReadDir
-var dirPathLookup func(io.ReaderAt, int64, *superblock, string) (*inode, error)
+
+// dirPathLookup is the recursive symlink-resolution seam. It carries the
+// running symlink depth so the C4 loop bound holds across hops without a
+// shared global (which would race under the FS read lock). Tests may replace
+// it to intercept recursive resolution.
+var dirPathLookup func(r io.ReaderAt, partOff int64, sb *superblock, p string, depth int) (*inode, error)
 
 func init() {
-	dirPathLookup = pathLookup
+	dirPathLookup = pathLookupResolve
 }
 
 // v5 directory data block header size (xfs_dir3_data_hdr).
@@ -35,8 +40,30 @@ const (
 // ErrNotFound is returned when a path component is not found.
 var ErrNotFound = errors.New("not found")
 
-// pathLookup resolves a slash-separated path and returns the inode.
+// maxSymlinkDepth bounds the chain of symlinks pathLookup will follow before
+// giving up, matching the Linux MAXSYMLINKS limit. C4: a symlink that points
+// at itself (or a cycle of symlinks) would otherwise recurse without bound and
+// overflow the stack on a hostile image.
+const maxSymlinkDepth = 40
+
+// ErrSymlinkLoop is returned when symlink resolution exceeds maxSymlinkDepth.
+var ErrSymlinkLoop = errors.New("xfs: too many levels of symbolic links")
+
+// pathLookup resolves a slash-separated path and returns the inode. It begins a
+// fresh symlink-resolution chain (depth 0).
 func pathLookup(r io.ReaderAt, partOff int64, sb *superblock, p string) (*inode, error) {
+	return pathLookupResolve(r, partOff, sb, p, 0)
+}
+
+// pathLookupResolve is the production symlink-following resolver bound to the
+// dirPathLookup hook. depth is the number of symlinks already followed to reach
+// this call; once it reaches maxSymlinkDepth the lookup fails with
+// ErrSymlinkLoop instead of recursing into a stack overflow (C4). depth is a
+// plain parameter, so concurrent lookups under the FS read lock do not race.
+func pathLookupResolve(r io.ReaderAt, partOff int64, sb *superblock, p string, depth int) (*inode, error) {
+	if depth >= maxSymlinkDepth {
+		return nil, ErrSymlinkLoop
+	}
 	p = path.Clean(p)
 	root, err := dirReadInode(r, partOff, sb, sb.rootIno)
 	if err != nil {
@@ -56,13 +83,13 @@ func pathLookup(r io.ReaderAt, partOff int64, sb *superblock, p string) (*inode,
 		if err != nil {
 			return nil, fmt.Errorf("xfs: inode %d: %w", childIno, err)
 		}
-		// Follow symlinks.
+		// Follow symlinks, bounding the chain depth (C4).
 		if child.isSymlink() {
 			target, err := dirReadSymlinkTarget(r, partOff, sb, child)
 			if err != nil {
 				return nil, err
 			}
-			cur, err = dirPathLookup(r, partOff, sb, string(target))
+			cur, err = dirPathLookup(r, partOff, sb, string(target), depth+1)
 			if err != nil {
 				return nil, err
 			}

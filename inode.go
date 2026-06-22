@@ -34,28 +34,28 @@ func (in *inode) dataFork() []byte {
 // v3 inode field offsets. All fields are big-endian unless tagged otherwise.
 // Layout mirrors `struct xfs_dinode` from fs/xfs/libxfs/xfs_format.h.
 const (
-	inoOffMagic    = 0
-	inoOffMode     = 2
-	inoOffVersion  = 4
-	inoOffFormat   = 5
-	inoOffUID      = 8  // __be32
-	inoOffGID      = 12 // __be32
-	inoOffNLink    = 16 // __be32
-	inoOffATime    = 32 // legacy timespec: sec(be32) + nsec(be32), 8 bytes total
-	inoOffMTime    = 40
-	inoOffCTime    = 48
-	inoOffSize     = 56
-	inoOffNBlocks  = 64
-	inoOffNExtents = 76
-	inoOffForkOff  = 82
-	inoOffAFormat  = 83 // di_aformat (attribute-fork format)
+	inoOffMagic        = 0
+	inoOffMode         = 2
+	inoOffVersion      = 4
+	inoOffFormat       = 5
+	inoOffUID          = 8  // __be32
+	inoOffGID          = 12 // __be32
+	inoOffNLink        = 16 // __be32
+	inoOffATime        = 32 // legacy timespec: sec(be32) + nsec(be32), 8 bytes total
+	inoOffMTime        = 40
+	inoOffCTime        = 48
+	inoOffSize         = 56
+	inoOffNBlocks      = 64
+	inoOffNExtents     = 76
+	inoOffForkOff      = 82
+	inoOffAFormat      = 83  // di_aformat (attribute-fork format)
 	inoOffGen          = 92  // __be32 inode generation
 	inoOffNextUnlinked = 96  // __be32 di_next_unlinked; NULLAGINO when not on the unlinked list
 	inoOffCRC          = 100 // __le32, v3 only
-	inoOffFlags2   = 120 // __be64 di_flags2, v3 only
-	inoOffCRTime   = 144 // v3 only: legacy timespec (sec+nsec)
-	inoOffIno      = 152 // uint64 absolute inode number, v3 only
-	inoOffUUID     = 160 // di_uuid (16 bytes), v3 only — must match sb_uuid
+	inoOffFlags2       = 120 // __be64 di_flags2, v3 only
+	inoOffCRTime       = 144 // v3 only: legacy timespec (sec+nsec)
+	inoOffIno          = 152 // uint64 absolute inode number, v3 only
+	inoOffUUID         = 160 // di_uuid (16 bytes), v3 only — must match sb_uuid
 
 	// di_big_nextents: 64-bit data-fork extent count present when the inode
 	// carries the NREXT64 feature. It overlays the legacy v3 padding right

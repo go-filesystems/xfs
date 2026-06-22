@@ -5,7 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+
+	"github.com/go-volumes/safeio"
 )
+
+// allocBTreeMaxSteps is the global ceiling on the number of blocks any single
+// AGF free-space B-tree traversal (descent + leaf-sibling walk) may visit
+// before it is treated as corrupt. A real tree is far smaller; this only fires
+// on a forged cyclic or pathologically deep chain (H3).
+const allocBTreeMaxSteps = 1 << 20
 
 // errInobtFull is returned by inobtFindFree when every record in the inobt
 // has freecount==0. allocInode uses this sentinel to decide whether to
@@ -20,18 +28,18 @@ const (
 	agfOffMagic     = 0
 	agfOffVersion   = 4 // agf_versionnum (= 1)
 	agfOffSeqNo     = 8
-	agfOffLength    = 12 // AG size in blocks
-	agfOffBnoRoot   = 16 // agf_roots[0]: bno B-tree root (AG-relative block)
-	agfOffCntRoot   = 20 // agf_roots[1]: cnt B-tree root
-	agfOffBnoLevel  = 28 // agf_levels[0]: bno B-tree depth
-	agfOffCntLevel  = 32 // agf_levels[1]: cnt B-tree depth
-	agfOffFLFirst   = 40 // first valid AGFL index
-	agfOffFLLast    = 44 // last valid AGFL index
-	agfOffFLCount   = 48 // number of blocks in the free list
-	agfOffFreeBlks  = 52 // free block count
-	agfOffLongest   = 56 // longest free run
-	agfOffBtreeBlks = 60 // blocks held by the free-space btrees
-	agfOffUUID      = 64 // sb_uuid (16 bytes)
+	agfOffLength    = 12  // AG size in blocks
+	agfOffBnoRoot   = 16  // agf_roots[0]: bno B-tree root (AG-relative block)
+	agfOffCntRoot   = 20  // agf_roots[1]: cnt B-tree root
+	agfOffBnoLevel  = 28  // agf_levels[0]: bno B-tree depth
+	agfOffCntLevel  = 32  // agf_levels[1]: cnt B-tree depth
+	agfOffFLFirst   = 40  // first valid AGFL index
+	agfOffFLLast    = 44  // last valid AGFL index
+	agfOffFLCount   = 48  // number of blocks in the free list
+	agfOffFreeBlks  = 52  // free block count
+	agfOffLongest   = 56  // longest free run
+	agfOffBtreeBlks = 60  // blocks held by the free-space btrees
+	agfOffUUID      = 64  // sb_uuid (16 bytes)
 	agfOffCRC       = 216 // __le32 v5 CRC (covers the sector); agf_crc field after agf_lsn@208
 	agfStructSize   = 224
 )
@@ -311,10 +319,30 @@ func cntFindBlock(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, r
 	var blk []byte
 	var err error
 
+	// H3: bound the whole traversal and reject a cyclic block chain so a forged
+	// rsib loop or a descent that never reaches a leaf terminates with an error
+	// instead of spinning forever. A B-tree has at most ~level + leaf-chain
+	// blocks; allocCntFindBlockMaxSteps is a generous global ceiling.
+	guard := safeio.NewLoopGuard(allocBTreeMaxSteps)
+	var seen safeio.VisitSet
+	// prevLvl tracks the on-disk level of the last internal node descended
+	// through; each child must have a strictly smaller level so a corrupt tree
+	// cannot loop between two non-leaf blocks. Seed it above any legal level.
+	prevLvl := 1 << 30
+
 	for {
+		if err := guard.Next(); err != nil {
+			return 0, nil, 0, fmt.Errorf("xfs: cnt B-tree AG %d traversal: %w", ag, err)
+		}
+		if err := seen.Check(uint64(agRel)); err != nil {
+			return 0, nil, 0, fmt.Errorf("xfs: cnt B-tree AG %d cycle: %w", ag, err)
+		}
 		blk, err = allocReadAGBlock(rw, partOff, sb, ag, agRel)
 		if err != nil {
 			return 0, nil, 0, err
+		}
+		if len(blk) < hdrSize {
+			return 0, nil, 0, fmt.Errorf("xfs: cnt B-tree block too small")
 		}
 		lvl := int(binary.BigEndian.Uint16(blk[4:]))
 		numrecs := int(binary.BigEndian.Uint16(blk[6:]))
@@ -323,6 +351,9 @@ func cntFindBlock(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, r
 			// At a leaf: find the first record with count >= need.
 			for i := 0; i < numrecs; i++ {
 				off := hdrSize + i*allocRecSize
+				if off+8 > len(blk) {
+					break
+				}
 				count := binary.BigEndian.Uint32(blk[off+4:])
 				if count >= need {
 					return agRel, blk, i, nil
@@ -336,14 +367,22 @@ func cntFindBlock(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, r
 			agRel = rsib
 			continue
 		}
-		// Internal node: follow the rightmost pointer (largest counts on right).
+		// Internal node: the on-disk level must strictly decrease as we
+		// descend, or a corrupt tree could loop between two non-leaf blocks.
+		if lvl >= prevLvl {
+			return 0, nil, 0, fmt.Errorf("xfs: cnt B-tree AG %d non-decreasing level %d", ag, lvl)
+		}
+		prevLvl = lvl
+		// Follow the rightmost pointer (largest counts on right).
+		if numrecs <= 0 {
+			return 0, nil, 0, fmt.Errorf("xfs: cnt B-tree internal node with no records")
+		}
 		ptrOff := hdrSize + numrecs*allocKeySize
 		lastPtr := ptrOff + (numrecs-1)*allocPtrSize
-		if lastPtr+4 > len(blk) {
+		if lastPtr < 0 || lastPtr+4 > len(blk) {
 			return 0, nil, 0, fmt.Errorf("cnt B-tree block too small")
 		}
 		agRel = binary.BigEndian.Uint32(blk[lastPtr:])
-		level--
 	}
 }
 
@@ -359,32 +398,59 @@ func agfRecomputeLongest(rw readerWriterAt, partOff int64, sb *superblock, ag ui
 
 	// Descend internal nodes to the leftmost leaf. level is the tree depth
 	// (number of B-tree levels); level==1 means the root is already a leaf,
-	// so descend level-1 times.
+	// so descend level-1 times. H3: bound the descent and reject revisited
+	// blocks so a corrupt pointer chain cannot spin forever.
+	descend := safeio.NewLoopGuard(allocBTreeMaxSteps)
+	var descendSeen safeio.VisitSet
 	agRel := rootRel
 	for level > 1 {
+		if err := descend.Next(); err != nil {
+			return 0, fmt.Errorf("xfs: agfRecomputeLongest ag=%d descent: %w", ag, err)
+		}
+		if err := descendSeen.Check(uint64(agRel)); err != nil {
+			return 0, fmt.Errorf("xfs: agfRecomputeLongest ag=%d descent cycle: %w", ag, err)
+		}
 		blk, err := allocReadAGBlock(rw, partOff, sb, ag, agRel)
 		if err != nil {
 			return 0, err
 		}
+		if len(blk) < hdrSize {
+			return 0, fmt.Errorf("xfs: agfRecomputeLongest ag=%d: btree block too small", ag)
+		}
 		numrecs := int(be.Uint16(blk[6:]))
 		ptrOff := hdrSize + numrecs*allocKeySize
-		if ptrOff+allocPtrSize > len(blk) {
+		if ptrOff < 0 || ptrOff+allocPtrSize > len(blk) {
 			return 0, fmt.Errorf("xfs: agfRecomputeLongest ag=%d: btree block too small", ag)
 		}
 		agRel = be.Uint32(blk[ptrOff:]) // leftmost child pointer
 		level--
 	}
 
-	// Walk the leaf chain left-to-right, keeping the largest count.
+	// Walk the leaf chain left-to-right, keeping the largest count. H3: bound
+	// the iteration count and reject a cyclic sibling chain.
+	walk := safeio.NewLoopGuard(allocBTreeMaxSteps)
+	var leafSeen safeio.VisitSet
 	var longest uint32
 	for {
+		if err := walk.Next(); err != nil {
+			return 0, fmt.Errorf("xfs: agfRecomputeLongest ag=%d leaf walk: %w", ag, err)
+		}
+		if err := leafSeen.Check(uint64(agRel)); err != nil {
+			return 0, fmt.Errorf("xfs: agfRecomputeLongest ag=%d sibling cycle: %w", ag, err)
+		}
 		blk, err := allocReadAGBlock(rw, partOff, sb, ag, agRel)
 		if err != nil {
 			return 0, err
 		}
+		if len(blk) < hdrSize {
+			return 0, fmt.Errorf("xfs: agfRecomputeLongest ag=%d: btree block too small", ag)
+		}
 		numrecs := int(be.Uint16(blk[6:]))
 		for i := 0; i < numrecs; i++ {
 			off := hdrSize + i*allocRecSize
+			if off+8 > len(blk) {
+				break
+			}
 			if count := be.Uint32(blk[off+4:]); count > longest {
 				longest = count
 			}

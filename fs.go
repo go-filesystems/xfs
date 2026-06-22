@@ -143,7 +143,11 @@ func Open(imagePath string, partIndex int) (FS, error) {
 // blockBackend. Layered callers (LUKS / qcow2 / in-memory) feed
 // the FS without an *os.File-backed image.
 func OpenFromDevice(dev BlockBackend, partIndex int) (FS, error) {
-	off, err := openPartitionOffset(dev, partIndex)
+	// The hardened partition parser validates every offset against the device
+	// size; a backend that cannot report its size (or reports 0) is treated as
+	// a bare filesystem image at offset 0.
+	devSize, _ := dev.Size()
+	off, err := openPartitionOffset(dev, devSize, partIndex)
 	if err != nil {
 		dev.Close()
 		return nil, err
@@ -450,11 +454,33 @@ func (fs *xfsFS) Chtimes(path string, atime, mtime time.Time) error {
 	return chtimesInode(fs.f, fs.partOffset, fs.sb, path, atime, mtime)
 }
 
+// blockByteOffset converts an absolute filesystem block number to its byte
+// offset, rejecting any block number whose offset would overflow int64 (and
+// therefore wrap negative). An attacker-controlled block pointer (from a forged
+// extent or btree node) could otherwise drive a negative ReadAt offset; some
+// backends panic on that rather than erroring. Returns ErrBlockOutOfRange when
+// the offset cannot be represented.
+func blockByteOffset(partOff int64, sb *superblock, blockNum uint64) (int64, error) {
+	bs := int64(sb.blockSize)
+	// blockNum*bs must not overflow int64, and partOff+that must not either.
+	if bs <= 0 || blockNum > uint64((1<<63-1-partOff)/bs) {
+		return 0, fmt.Errorf("xfs: block %d offset overflows: %w", blockNum, ErrBlockOutOfRange)
+	}
+	return partOff + int64(blockNum)*bs, nil
+}
+
+// ErrBlockOutOfRange is returned when a block number's byte offset would
+// overflow int64 (a forged extent/btree pointer).
+var ErrBlockOutOfRange = fmt.Errorf("xfs: block offset out of range")
+
 // readRawBlock reads one filesystem block (sb.blockSize bytes) by absolute
 // block number.
 func readRawBlock(f io.ReaderAt, partOff int64, sb *superblock, blockNum uint64) ([]byte, error) {
+	off, err := blockByteOffset(partOff, sb, blockNum)
+	if err != nil {
+		return nil, err
+	}
 	buf := make([]byte, sb.blockSize)
-	off := partOff + int64(blockNum)*int64(sb.blockSize)
 	if _, err := f.ReadAt(buf, off); err != nil {
 		return nil, fmt.Errorf("xfs: read block %d: %w", blockNum, err)
 	}

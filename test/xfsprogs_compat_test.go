@@ -228,4 +228,3 @@ func TestWriteThenXfsDb(t *testing.T) {
 		t.Fatalf("xfs_db output missing 'magicnum' field (parse likely failed):\n%s", out)
 	}
 }
-
