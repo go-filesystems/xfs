@@ -512,6 +512,208 @@ func TestHardenPartitionGPTErrNoTableFallback(t *testing.T) {
 	}
 }
 
+// TestHardenSymlinkLocalSizeOverflow covers the local-format symlink whose
+// di_size exceeds the inline fork space.
+func TestHardenSymlinkLocalSizeOverflow(t *testing.T) {
+	sb := defaultSB()
+	in := newTestInode(40, 0xA000, inodeFmtLocal, 1<<20) // size ≫ fork
+	if _, err := readSymlinkTarget(newMemRW(0), 0, sb, in); err == nil {
+		t.Fatal("expected local symlink size-exceeds-fork error")
+	}
+}
+
+// TestHardenSymlinkUnsupportedFormat covers the default (unsupported format)
+// branch of the remote symlink reader.
+func TestHardenSymlinkUnsupportedFormat(t *testing.T) {
+	sb := defaultSB()
+	in := newTestInode(41, 0xA000, 9 /* bogus format */, 4)
+	if _, err := readSymlinkTarget(newMemRW(0), 0, sb, in); err == nil {
+		t.Fatal("expected unsupported-format symlink error")
+	}
+}
+
+// TestHardenSymlinkHeaderOnlyBlock covers the "block is only a header, no
+// payload" continue path (len(blk) <= hdr).
+func TestHardenSymlinkHeaderOnlyBlock(t *testing.T) {
+	sb := defaultSB()
+	rw := newMemRW(int(sb.blockSize * 4))
+	// Block 1 holds just the XSLM magic and nothing else meaningful; di_size
+	// still claims bytes, so the reader walks but finds no payload.
+	copy(rw.data[sb.blockSize:], []byte(xfsSymlinkMagic))
+	in := newTestInode(42, 0xA000, inodeFmtExtents, 64)
+	setInodeNBlocks(in, 1)
+	in.nExts = 1
+	rec := encodeExtent(extent{startOff: 0, startBlock: 1, count: 1})
+	copy(in.dataFork(), rec[:])
+	// Should return whatever (possibly truncated) bytes follow the header,
+	// without panicking.
+	if _, err := readSymlinkTarget(rw, 0, sb, in); err != nil {
+		t.Fatalf("readSymlinkTarget header-only: %v", err)
+	}
+}
+
+// TestHardenSymlinkBtreeError covers the btree-format extent-error wrap in the
+// remote symlink reader: a btree fork too short to parse.
+func TestHardenSymlinkBtreeError(t *testing.T) {
+	sb := defaultSB()
+	in := newTestInode(43, 0xA000, inodeFmtBtree, 16)
+	// Internal root (level 1, 1 rec) pointing at a block that overflows the
+	// offset computation, so btreeExtents returns an error.
+	fork := in.dataFork()
+	be := binary.BigEndian
+	be.PutUint16(fork[0:], 1)
+	be.PutUint16(fork[2:], 1)
+	be.PutUint64(fork[20:], 0x3038000000000000)
+	if _, err := readSymlinkTarget(newMemRW(int(sb.blockSize)), 0, sb, in); err == nil {
+		t.Fatal("expected btree symlink extent error")
+	}
+}
+
+// TestHardenSymlinkPayloadClamp covers the payload-longer-than-remaining clamp:
+// di_size is smaller than the block payload, so the last block is truncated.
+func TestHardenSymlinkPayloadClamp(t *testing.T) {
+	sb := defaultSB()
+	rw := newMemRW(int(sb.blockSize * 4))
+	// Fill block 1 with more bytes than di_size claims.
+	for i := 0; i < int(sb.blockSize); i++ {
+		rw.data[int(sb.blockSize)+i] = 'a'
+	}
+	in := newTestInode(44, 0xA000, inodeFmtExtents, 5) // only 5 bytes wanted
+	setInodeNBlocks(in, 1)
+	in.nExts = 1
+	rec := encodeExtent(extent{startOff: 0, startBlock: 1, count: 1})
+	copy(in.dataFork(), rec[:])
+	got, err := readSymlinkTarget(rw, 0, sb, in)
+	if err != nil || len(got) != 5 {
+		t.Fatalf("readSymlinkTarget clamp = (%q, %v), want 5 bytes", got, err)
+	}
+}
+
+// TestHardenGptFirstLinuxListError covers gptFirstLinux's gpt.List error
+// propagation (a malformed GPT) and the no-populated-partition path.
+func TestHardenGptFirstLinuxListError(t *testing.T) {
+	// Malformed GPT (entry size 0) → List returns an error that propagates.
+	img := buildGPT(nil)
+	binary.LittleEndian.PutUint32(img[512+84:], 0)
+	if _, err := gptFirstLinux(bytes.NewReader(img), testDeviceSize); err == nil {
+		t.Fatal("gptFirstLinux accepted malformed GPT")
+	}
+	// A GPT with only empty slots → no populated partition.
+	img2 := buildGPT(nil)
+	if _, err := gptFirstLinux(bytes.NewReader(img2), testDeviceSize); !errors.Is(err, gpt.ErrNotFound) {
+		t.Fatalf("gptFirstLinux empty table err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestHardenCntFindBlockEmptyInternal covers the numrecs<=0 internal-node guard
+// and the leaf record-bound break.
+func TestHardenCntFindBlockEmptyInternal(t *testing.T) {
+	restoreAllocHooks(t)
+	sb := defaultSB()
+	// Internal node (level 1) with zero records.
+	empty := makeAllocInternal(sb, nil, nil)
+	allocReadAGBlock = func(_ io.ReaderAt, _ int64, _ *superblock, _ uint32, _ uint32) ([]byte, error) {
+		return empty, nil
+	}
+	if _, _, _, err := cntFindBlock(newMemRW(0), 0, sb, 0, 2, 5, 5); err == nil {
+		t.Fatal("cntFindBlock accepted empty internal node")
+	}
+}
+
+// TestHardenCntFindBlockExhausted covers the leaf record-bound break, the
+// "no free extent" terminal return, the block-too-small guard, and the read
+// error path.
+func TestHardenCntFindBlockExhausted(t *testing.T) {
+	sb := defaultSB()
+
+	// (a) Leaf with one too-small record (count<need) and rsib=FFFFFFFF.
+	restoreAllocHooks(t)
+	leaf := makeAllocLeaf(sb, 0xFFFFFFFF, allocRec{start: 1, count: 1})
+	allocReadAGBlock = func(_ io.ReaderAt, _ int64, _ *superblock, _ uint32, _ uint32) ([]byte, error) {
+		return leaf, nil
+	}
+	if _, _, _, err := cntFindBlock(newMemRW(0), 0, sb, 0, 2, 0, 5); err == nil {
+		t.Fatal("expected 'no free extent' error")
+	}
+
+	// (b) Block shorter than the header.
+	restoreAllocHooks(t)
+	allocReadAGBlock = func(_ io.ReaderAt, _ int64, _ *superblock, _ uint32, _ uint32) ([]byte, error) {
+		return make([]byte, sb.agBTreeHdrSize()-1), nil
+	}
+	if _, _, _, err := cntFindBlock(newMemRW(0), 0, sb, 0, 2, 0, 5); err == nil {
+		t.Fatal("expected cnt block-too-small error")
+	}
+
+	// (c) Read error propagates.
+	restoreAllocHooks(t)
+	allocReadAGBlock = func(_ io.ReaderAt, _ int64, _ *superblock, _ uint32, _ uint32) ([]byte, error) {
+		return nil, errBoom
+	}
+	if _, _, _, err := cntFindBlock(newMemRW(0), 0, sb, 0, 2, 0, 5); !errors.Is(err, errBoom) {
+		t.Fatalf("cntFindBlock read err = %v, want errBoom", err)
+	}
+}
+
+// TestHardenAgfRecomputeLongestBlockTooSmall covers the block-too-small guards
+// in both the descent and the leaf walk.
+func TestHardenAgfRecomputeLongestBlockTooSmall(t *testing.T) {
+	restoreAllocHooks(t)
+	sb := defaultSB()
+	tiny := make([]byte, sb.agBTreeHdrSize()-1) // below header
+	allocReadAGBlock = func(_ io.ReaderAt, _ int64, _ *superblock, _ uint32, _ uint32) ([]byte, error) {
+		return tiny, nil
+	}
+	// level 2 → descent path reads the tiny block first.
+	if _, err := agfRecomputeLongest(newMemRW(0), 0, sb, 0, 2, 2); err == nil {
+		t.Fatal("agfRecomputeLongest accepted too-small descent block")
+	}
+	// level 1 → leaf walk reads the tiny block.
+	if _, err := agfRecomputeLongest(newMemRW(0), 0, sb, 0, 2, 1); err == nil {
+		t.Fatal("agfRecomputeLongest accepted too-small leaf block")
+	}
+}
+
+// TestHardenDecodeInodeTimeBranches exercises both the bigtime and legacy
+// timestamp decoders so a corrupt flags2 byte cannot reach an untested path.
+func TestHardenDecodeInodeTimeBranches(t *testing.T) {
+	raw := make([]byte, 16)
+	// Legacy: sec=1, nsec=2.
+	binary.BigEndian.PutUint32(raw[0:], 1)
+	binary.BigEndian.PutUint32(raw[4:], 2)
+	if tm := decodeInodeTime(raw, 0, false); tm.Unix() != 1 {
+		t.Fatalf("legacy decode = %v, want sec 1", tm)
+	}
+	// Bigtime: a 64-bit ns count since the bigtime epoch.
+	binary.BigEndian.PutUint64(raw[8:], uint64(xfsBigtimeEpochOffset)*1_000_000_000)
+	if tm := decodeInodeTime(raw, 8, true); tm.Unix() != 0 {
+		t.Fatalf("bigtime decode = %v, want unix epoch", tm)
+	}
+}
+
+// TestHardenReadInodeNrext64 covers the NREXT64 extent-count override branch in
+// readInode: a v3 inode with di_flags2 NREXT64 reads its extent count from the
+// 64-bit di_big_nextents field, not the legacy slot.
+func TestHardenReadInodeNrext64(t *testing.T) {
+	sb := defaultSB()
+	const off = 65536
+	image := make([]byte, off+int(sb.inodeSize))
+	buf := buildInodeBuf(128, 0x8000, inodeFmtExtents, 0)
+	be := binary.BigEndian
+	be.PutUint64(buf[inoOffFlags2:], xfsDiflag2Nrext64)
+	be.PutUint64(buf[inoOffBigNExtents:], 7) // big_nextents=7
+	be.PutUint32(buf[inoOffNExtents:], 0)    // legacy slot empty
+	copy(image[off:], buf)
+
+	in, err := readInode(bytes.NewReader(image), 0, sb, 128)
+	if err != nil {
+		t.Fatalf("readInode: %v", err)
+	}
+	if in.nExts != 7 {
+		t.Fatalf("nExts = %d, want 7 (from di_big_nextents)", in.nExts)
+	}
+}
+
 // ─────────────────────────── Fuzz targets ──────────────────────────────────
 
 // FuzzReadSuperblock feeds arbitrary 512-byte superblock buffers and asserts
