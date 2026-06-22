@@ -137,14 +137,15 @@ func TestReadExtentsAdditional(t *testing.T) {
 	rw := newMemRW(int(sb.blockSize * 2))
 	copy(rw.data[sb.blockSize:], []byte("payload"))
 	exts := []extent{{startOff: 0, startBlock: 1, count: 1}, {startOff: 2, startBlock: 1, count: 1}}
+	in := newTestInode(10, 0x8000, inodeFmtExtents, 7)
 
-	data, err := readExtents(rw, 0, sb, exts, 7)
+	data, err := readExtents(rw, 0, sb, exts, 7, in)
 	if err != nil || string(data) != "payload" {
 		t.Fatalf("readExtents = %q, %v; want payload, nil", data, err)
 	}
 
 	rw.readHook = func(int64, []byte) error { return errBoom }
-	if _, err := readExtents(rw, 0, sb, exts[:1], 7); !errors.Is(err, errBoom) {
+	if _, err := readExtents(rw, 0, sb, exts[:1], 7, in); !errors.Is(err, errBoom) {
 		t.Fatalf("expected readExtents error %v, got %v", errBoom, err)
 	}
 }

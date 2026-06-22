@@ -4,7 +4,25 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+
+	"github.com/go-volumes/safeio"
 )
+
+// inodeMaxBytes returns a safe ceiling for any allocation sized from an
+// inode's attacker-controlled di_size. A file/symlink cannot legitimately
+// occupy more bytes than its allocated blocks (di_nblocks × blockSize); we
+// add one block of slack for tail rounding. This bounds class-(A) OOM:
+// di_size = 2^60 no longer drives a 2^60-byte make().
+func inodeMaxBytes(sb *superblock, in *inode) int64 {
+	blocks := in.nBlocks
+	// Guard the multiply: nBlocks is a 64-bit on-disk field. Cap at a value
+	// whose ×blockSize cannot overflow int64.
+	const cap = (1 << 48)
+	if blocks > cap {
+		blocks = cap
+	}
+	return (int64(blocks) + 1) * int64(sb.blockSize)
+}
 
 // readFileData reads and returns the full content of a regular file.
 func readFileData(r io.ReaderAt, partOff int64, sb *superblock, in *inode) ([]byte, error) {
@@ -24,14 +42,14 @@ func readFileData(r io.ReaderAt, partOff int64, sb *superblock, in *inode) ([]by
 		if err != nil {
 			return nil, fmt.Errorf("xfs: inode %d extents: %w", in.num, err)
 		}
-		return readExtents(r, partOff, sb, exts, in.size)
+		return readExtents(r, partOff, sb, exts, in.size, in)
 
 	case inodeFmtBtree:
 		exts, err := btreeExtents(r, partOff, sb, in)
 		if err != nil {
 			return nil, fmt.Errorf("xfs: inode %d btree extents: %w", in.num, err)
 		}
-		return readExtents(r, partOff, sb, exts, in.size)
+		return readExtents(r, partOff, sb, exts, in.size, in)
 
 	default:
 		return nil, fmt.Errorf("xfs: inode %d unsupported fork format %d", in.num, in.format)
@@ -84,7 +102,13 @@ func readSymlinkTarget(r io.ReaderAt, partOff int64, sb *superblock, in *inode) 
 		return nil, fmt.Errorf("xfs: symlink inode %d extents: %w", in.num, err)
 	}
 
-	out := make([]byte, 0, in.size)
+	// C3: bound the target buffer by the inode's allocated blocks, not by the
+	// attacker-controlled di_size, so a 2^60 di_size cannot OOM.
+	buf, err := safeio.MakeBytes(int64(in.size), inodeMaxBytes(sb, in))
+	if err != nil {
+		return nil, fmt.Errorf("xfs: symlink inode %d size %d: %w", in.num, in.size, err)
+	}
+	out := buf[:0]
 	remaining := int(in.size)
 	for _, e := range exts {
 		for b := uint32(0); b < e.count && remaining > 0; b++ {
@@ -155,31 +179,56 @@ func btreeExtents(r io.ReaderAt, partOff int64, sb *superblock, in *inode) ([]ex
 	if len(fork) < ptrOff+int(numrecs)*8 {
 		return nil, fmt.Errorf("inode %d btree root too small", in.num)
 	}
-	// Follow the leftmost pointer (first child) at each level.
+	// Follow the leftmost pointer (first child) at each level. H4: bound the
+	// descent depth and guard every block against being too small to index
+	// blk[6:] before reading numrecs (live now that C2 admits small blocks).
+	hdrSize := btreeHdrSize(sb.hasCRC)
+	descend := safeio.NewLoopGuard(int(level))
+	var descendSeen safeio.VisitSet
 	ptr := be.Uint64(fork[ptrOff:])
 	for lvl := level - 1; lvl > 0; lvl-- {
+		if err := descend.Next(); err != nil {
+			return nil, fmt.Errorf("xfs: inode %d btree too deep: %w", in.num, err)
+		}
+		if err := descendSeen.Check(ptr); err != nil {
+			return nil, fmt.Errorf("xfs: inode %d btree descent cycle: %w", in.num, err)
+		}
 		blk, err := readRawBlock(r, partOff, sb, ptr)
 		if err != nil {
 			return nil, err
 		}
-		hdrSize := btreeHdrSize(sb.hasCRC)
+		if len(blk) < hdrSize+8 {
+			return nil, fmt.Errorf("xfs: inode %d btree block too small", in.num)
+		}
 		nr := int(be.Uint16(blk[6:]))
 		ptrStart := hdrSize + nr*16 // skip header + keys
-		if len(blk) < ptrStart+8 {
+		if ptrStart < 0 || ptrStart+8 > len(blk) {
 			return nil, fmt.Errorf("xfs: btree block too small")
 		}
 		ptr = be.Uint64(blk[ptrStart:])
 	}
 
-	// Read all leaf blocks at level 0 by following right-sibling links.
+	// Read all leaf blocks at level 0 by following right-sibling links. H4:
+	// bound the iteration count AND reject a cyclic sibling chain so a forged
+	// rsib loop terminates instead of spinning forever.
 	const maxLeaves = 65536
+	walk := safeio.NewLoopGuard(maxLeaves)
+	var leafSeen safeio.VisitSet
 	var exts []extent
-	for i := 0; i < maxLeaves; i++ {
+	for {
+		if err := walk.Next(); err != nil {
+			return nil, fmt.Errorf("xfs: inode %d btree leaf walk: %w", in.num, err)
+		}
+		if err := leafSeen.Check(ptr); err != nil {
+			return nil, fmt.Errorf("xfs: inode %d btree sibling cycle: %w", in.num, err)
+		}
 		blk, err := readRawBlock(r, partOff, sb, ptr)
 		if err != nil {
 			return nil, err
 		}
-		hdrSize := btreeHdrSize(sb.hasCRC)
+		if len(blk) < hdrSize+8 {
+			return nil, fmt.Errorf("xfs: inode %d btree leaf block too small", in.num)
+		}
 		nr := int(be.Uint16(blk[6:]))
 		leaf := btreeLeafExtents(blk[hdrSize:], nr)
 		exts = append(exts, leaf...)
@@ -212,8 +261,13 @@ func btreeHdrSize(hasCRC bool) int {
 }
 
 // readExtents reads file data from an extent list up to size bytes.
-func readExtents(r io.ReaderAt, partOff int64, sb *superblock, exts []extent, size uint64) ([]byte, error) {
-	out := make([]byte, size)
+func readExtents(r io.ReaderAt, partOff int64, sb *superblock, exts []extent, size uint64, in *inode) ([]byte, error) {
+	// C3: di_size is attacker-controlled; bound the output buffer by the
+	// inode's allocated blocks so a forged 2^60 size cannot OOM the host.
+	out, err := safeio.MakeBytes(int64(size), inodeMaxBytes(sb, in))
+	if err != nil {
+		return nil, fmt.Errorf("xfs: inode %d size %d: %w", in.num, size, err)
+	}
 	for _, e := range exts {
 		byteStart := e.startOff * uint64(sb.blockSize)
 		if byteStart >= size {
@@ -223,7 +277,11 @@ func readExtents(r io.ReaderAt, partOff int64, sb *superblock, exts []extent, si
 		if byteEnd > size {
 			byteEnd = size
 		}
-		physOff := partOff + int64(e.startBlock)*int64(sb.blockSize)
+		// Reject a forged startBlock whose byte offset overflows int64.
+		physOff, err := blockByteOffset(partOff, sb, e.startBlock)
+		if err != nil {
+			return nil, err
+		}
 		n := int(byteEnd - byteStart)
 		if _, err := r.ReadAt(out[byteStart:byteStart+uint64(n)], physOff); err != nil {
 			return nil, fmt.Errorf("xfs: read extent block %d: %w", e.startBlock, err)

@@ -355,10 +355,10 @@ func fmtWriteAG(f fmtFile, sb *superblock, ag uint32, uuid [16]byte) error {
 	inobt := fmtBtreeHeader(absBase, uuid, ag, magicIAB3, fmtInobtRoot)
 	if l.hasInodeChunk {
 		hdr := btreeHdrSizeV5
-		be.PutUint16(inobt[6:], 1)                                  // numrecs
-		be.PutUint32(inobt[hdr:], uint32(fmtRootIno(sb.agCount)))   // ir_startino (AG-relative in AG 0)
-		be.PutUint32(inobt[hdr+4:], fmtInodesPerChunk-3)            // ir_freecount
-		be.PutUint64(inobt[hdr+8:], 0xFFFFFFFFFFFFFFF8)             // ir_free: inodes 0,1,2 in use
+		be.PutUint16(inobt[6:], 1)                                // numrecs
+		be.PutUint32(inobt[hdr:], uint32(fmtRootIno(sb.agCount))) // ir_startino (AG-relative in AG 0)
+		be.PutUint32(inobt[hdr+4:], fmtInodesPerChunk-3)          // ir_freecount
+		be.PutUint64(inobt[hdr+8:], 0xFFFFFFFFFFFFFFF8)           // ir_free: inodes 0,1,2 in use
 	}
 	updateCRC(inobt, btreeCRCOff, fmtBlockSize)
 	if _, err := f.WriteAt(inobt, agBase+int64(fmtInobtRoot)*int64(sb.blockSize)); err != nil {
@@ -379,7 +379,7 @@ func fmtBtreeHeader(absBase uint64, uuid [16]byte, ag uint32, magic uint32, agRe
 	be.PutUint32(blk[8:], 0xFFFFFFFF)  // left sibling: none
 	be.PutUint32(blk[12:], 0xFFFFFFFF) // right sibling: none
 	be.PutUint64(blk[16:], (absBase+uint64(agRelBlock))*fmtDaddrPerBlock)
-	copy(blk[32:], uuid[:]) // bb_uuid
+	copy(blk[32:], uuid[:])    // bb_uuid
 	be.PutUint32(blk[48:], ag) // bb_owner = AG number
 	return blk
 }
@@ -389,8 +389,8 @@ func fmtWriteFreeBtree(f fmtFile, agBase int64, absBase uint64, uuid [16]byte, a
 	be := binary.BigEndian
 	blk := fmtBtreeHeader(absBase, uuid, ag, magic, agRelBlock)
 	hdr := btreeHdrSizeV5
-	be.PutUint16(blk[6:], 1)        // numrecs
-	be.PutUint32(blk[hdr:], start)  // record: start block
+	be.PutUint16(blk[6:], 1)         // numrecs
+	be.PutUint32(blk[hdr:], start)   // record: start block
 	be.PutUint32(blk[hdr+4:], count) // record: block count
 	updateCRC(blk, btreeCRCOff, fmtBlockSize)
 	if _, err := f.WriteAt(blk, agBase+int64(agRelBlock)*fmtBlockSize); err != nil {
@@ -474,16 +474,16 @@ func fmtWriteLog(f fmtFile, sb *superblock, agCount uint32) error {
 
 	// Basic block 0: the log record header.
 	hdr := make([]byte, fmtSectorSize)
-	be.PutUint32(hdr[0:], xlogHeaderMagic)        // h_magicno
-	be.PutUint32(hdr[4:], 1)                       // h_cycle
-	be.PutUint32(hdr[8:], 2)                        // h_version
-	be.PutUint32(hdr[12:], fmtSectorSize)           // h_len (data length = 1 BB)
-	be.PutUint64(hdr[16:], 1<<32)                   // h_lsn      = (cycle 1, block 0)
-	be.PutUint64(hdr[24:], 1<<32)                   // h_tail_lsn = (cycle 1, block 0)
+	be.PutUint32(hdr[0:], xlogHeaderMagic) // h_magicno
+	be.PutUint32(hdr[4:], 1)               // h_cycle
+	be.PutUint32(hdr[8:], 2)               // h_version
+	be.PutUint32(hdr[12:], fmtSectorSize)  // h_len (data length = 1 BB)
+	be.PutUint64(hdr[16:], 1<<32)          // h_lsn      = (cycle 1, block 0)
+	be.PutUint64(hdr[24:], 1<<32)          // h_tail_lsn = (cycle 1, block 0)
 	// h_crc (offset 32) stays 0, as mkfs.xfs writes it for the seed record.
-	be.PutUint32(hdr[36:], 0xFFFFFFFF)              // h_prev_block = -1
-	be.PutUint32(hdr[40:], 1)                        // h_num_logops = 1
-	be.PutUint32(hdr[44:], 0xB0C0D0D0)              // h_cycle_data[0]: displaced first word of BB1
+	be.PutUint32(hdr[36:], 0xFFFFFFFF) // h_prev_block = -1
+	be.PutUint32(hdr[40:], 1)          // h_num_logops = 1
+	be.PutUint32(hdr[44:], 0xB0C0D0D0) // h_cycle_data[0]: displaced first word of BB1
 	if _, err := f.WriteAt(hdr, logByte); err != nil {
 		return fmt.Errorf("write log header: %w", err)
 	}
@@ -492,10 +492,10 @@ func fmtWriteLog(f fmtFile, sb *superblock, agCount uint32) error {
 	// cycle stamp (1); the original (oh_tid = 0xB0C0D0D0) is saved in
 	// h_cycle_data[0] above.
 	data := make([]byte, fmtSectorSize)
-	be.PutUint32(data[0:], 1)            // cycle stamp (displaces oh_tid)
-	be.PutUint32(data[4:], 8)             // oh_len = 8 (unmount record payload)
-	data[8] = 0xAA                        // oh_clientid = XFS_LOG
-	data[9] = 0x20                        // oh_flags
+	be.PutUint32(data[0:], 1) // cycle stamp (displaces oh_tid)
+	be.PutUint32(data[4:], 8) // oh_len = 8 (unmount record payload)
+	data[8] = 0xAA            // oh_clientid = XFS_LOG
+	data[9] = 0x20            // oh_flags
 	// xfs_unmount_log_format.magic at byte 12 (native/host order, as mkfs writes).
 	data[12] = byte(xlogUnmountType & 0xFF)
 	data[13] = byte(xlogUnmountType >> 8)
@@ -568,8 +568,8 @@ func buildSuperblockBuffer(sb *superblock, agCount uint32, uuid [16]byte, label 
 	// realtime geometry".
 	be.PutUint32(buf[sbOffRExtSize:], 1)
 
-	copy(buf[32:], uuid[:])   // sb_uuid
-	copy(buf[108:], label)    // sb_fname
+	copy(buf[32:], uuid[:]) // sb_uuid
+	copy(buf[108:], label)  // sb_fname
 
 	// CRC (v5 only, __le32 at offset 224, covers bytes [0, 224)).
 	updateCRC(buf, sbOffCRC, sbCRCLen)
