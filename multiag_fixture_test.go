@@ -4,12 +4,20 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/md5"
+	_ "embed"
 	"encoding/hex"
 	"io"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+// multiagFixtureGz is the committed mkfs.xfs fixture, embedded so the test runs
+// on every CI arch — including the cross-compiled emulated binaries whose
+// working directory does not contain testdata/.
+//
+//go:embed testdata/xfs-multiag.img.gz
+var multiagFixtureGz []byte
 
 // TestMultiAGFixtureRead reads a committed, real mkfs.xfs image whose default
 // geometry has a NON-power-of-two sb_agblocks (agblocks=20480, agblklog=15,
@@ -34,7 +42,7 @@ import (
 // It is stored gzip-compressed (the AG0 filler is highly compressible) to keep
 // the committed blob small.
 func TestMultiAGFixtureRead(t *testing.T) {
-	img := decompressFixture(t, filepath.Join("testdata", "xfs-multiag.img.gz"))
+	img := decompressFixture(t)
 
 	fs, err := Open(img, -1)
 	if err != nil {
@@ -101,7 +109,7 @@ func TestMultiAGFixtureRead(t *testing.T) {
 // bug-triggering non-power-of-two geometry, so the test above keeps exercising
 // the multi-AG path even if the fixture is ever regenerated.
 func TestMultiAGFixtureGeometry(t *testing.T) {
-	img := decompressFixture(t, filepath.Join("testdata", "xfs-multiag.img.gz"))
+	img := decompressFixture(t)
 	f, err := os.Open(img)
 	if err != nil {
 		t.Fatal(err)
@@ -124,16 +132,11 @@ func TestMultiAGFixtureGeometry(t *testing.T) {
 	}
 }
 
-// decompressFixture gunzips a committed fixture into a temp file and returns
-// its path.
-func decompressFixture(t *testing.T, gzPath string) string {
+// decompressFixture gunzips the embedded committed fixture into a temp file and
+// returns its path.
+func decompressFixture(t *testing.T) string {
 	t.Helper()
-	in, err := os.Open(gzPath)
-	if err != nil {
-		t.Fatalf("open fixture %s: %v", gzPath, err)
-	}
-	defer in.Close()
-	zr, err := gzip.NewReader(in)
+	zr, err := gzip.NewReader(bytes.NewReader(multiagFixtureGz))
 	if err != nil {
 		t.Fatalf("gzip reader: %v", err)
 	}
