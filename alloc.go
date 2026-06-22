@@ -168,9 +168,14 @@ func writeAGI(rw io.WriterAt, partOff int64, sb *superblock, ag uint32, buf []by
 	return nil
 }
 
-// agAbsBlock converts an AG-relative block number to an absolute FS block.
+// agAbsBlock converts an AG number + AG-relative block to a packed on-disk
+// XFS filesystem block number (fsbno = (agno<<agblklog)|agbno). This is the
+// value stored in on-disk extent/bmbt records and B-tree pointers; translate it
+// with fsbToPhysBlock before computing a byte offset or a 512-byte daddr.
+// (When sb_agblocks is a power of two — as our own Format produces — packing is
+// numerically identical to a flat block index.)
 func (sb *superblock) agAbsBlock(ag, agRel uint32) uint64 {
-	return uint64(ag)*uint64(sb.agBlocks) + uint64(agRel)
+	return uint64(ag)<<uint64(sb.agBlkLog) | uint64(agRel)
 }
 
 // syncSuperblockCounts recomputes the filesystem-wide free counters

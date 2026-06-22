@@ -208,6 +208,21 @@ func (sb *superblock) agByteOffset(ag uint32) int64 {
 	return int64(ag) * int64(sb.agBlocks) * int64(sb.blockSize)
 }
 
+// fsbToPhysBlock converts a packed on-disk XFS filesystem block number (fsbno)
+// to a flat/physical block index within the image.
+//
+// XFS packs an fsbno as fsbno = (agno << sb_agblklog) | agbno, where agblklog is
+// ceil(log2(sb_agblocks)). mkfs.xfs's DEFAULT agsize is NOT a power of two, so
+// sb_agblocks != 1<<agblklog and the packed fsbno cannot be treated as a flat
+// block number: agno*sb_agblocks + agbno is the physical block. (When
+// sb_agblocks is a power of two — as our own Format always produces — packing is
+// the identity and this returns fsbno unchanged.)
+func (sb *superblock) fsbToPhysBlock(fsbno uint64) uint64 {
+	agno := fsbno >> uint64(sb.agBlkLog)
+	agbno := fsbno & ((uint64(1) << uint64(sb.agBlkLog)) - 1)
+	return agno*uint64(sb.agBlocks) + agbno
+}
+
 // sectSize returns the on-disk sector size, defaulting to 512 for an
 // in-memory superblock built before the field was populated.
 func (sb *superblock) sectSize() int64 {

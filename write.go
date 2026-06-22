@@ -139,7 +139,7 @@ func writeExtentsInPlace(rw readerWriterAt, partOff int64, sb *superblock, in *i
 	total := int64(len(data))
 
 	for _, e := range exts {
-		physOff := partOff + int64(e.startBlock)*bs
+		physOff := partOff + int64(sb.fsbToPhysBlock(e.startBlock))*bs
 		for b := uint32(0); b < e.count; b++ {
 			blk := make([]byte, bs)
 			start := written
@@ -440,7 +440,7 @@ func buildBlockDirBlock(sb *superblock, blk []byte, absBlock, ownerIno, parentIn
 	if sb.hasCRC {
 		// xfs_dir3_blk_hdr: magic@0, crc@4, blkno@8, lsn@16, uuid@24, owner@40.
 		be.PutUint32(blk[0:], magicDir3Block)
-		be.PutUint64(blk[8:], absBlock*fmtDaddrPerBlock)
+		be.PutUint64(blk[8:], sb.fsbToPhysBlock(absBlock)*fmtDaddrPerBlock)
 		copy(blk[24:40], sb.uuid[:])
 		be.PutUint64(blk[40:], ownerIno)
 	} else {

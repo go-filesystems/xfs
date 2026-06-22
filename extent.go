@@ -4,9 +4,15 @@ import "encoding/binary"
 
 // extent is a decoded bmbt record: a contiguous run of file blocks mapped to
 // a contiguous run of filesystem blocks.
+//
+// startBlock holds the on-disk XFS filesystem block number (fsbno), which is
+// *packed*: fsbno = (agno << sb_agblklog) | agbno. It is NOT a flat block index
+// unless sb_agblocks happens to be a power of two (i.e. sb_agblocks == 1<<agblklog).
+// Use superblock.fsbToPhysBlock to translate it to a flat/physical block number
+// before computing a byte offset or a 512-byte disk address (daddr).
 type extent struct {
 	startOff   uint64 // file block offset
-	startBlock uint64 // absolute filesystem block number
+	startBlock uint64 // on-disk filesystem block number (packed fsbno)
 	count      uint32
 	unwritten  bool
 }
