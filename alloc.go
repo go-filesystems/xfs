@@ -200,7 +200,16 @@ func syncSuperblockCounts(rw readerWriterAt, partOff int64, sb *superblock) erro
 		if err != nil {
 			return err
 		}
-		fdblocks += uint64(be.Uint32(agf[agfOffFreeBlks:])) + uint64(be.Uint32(agf[agfOffFLCount:]))
+		// sb_fdblocks counts genuinely-free blocks (agf_freeblks) plus the AGFL
+		// free-list blocks (agf_flcount) plus the free-space-btree blocks
+		// (agf_btreeblks) — the last because those blocks return to the free pool
+		// when the bno/cnt trees shrink, so XFS/xfs_repair include them in the
+		// global free count. Omitting agf_btreeblks left sb_fdblocks low by the
+		// number of blocks the multi-level free-space-tree splits consumed
+		// ("sb_fdblocks X, counted X+btreeblks").
+		fdblocks += uint64(be.Uint32(agf[agfOffFreeBlks:])) +
+			uint64(be.Uint32(agf[agfOffFLCount:])) +
+			uint64(be.Uint32(agf[agfOffBtreeBlks:]))
 		icount += uint64(be.Uint32(agi[agiOffCount:]))
 		ifree += uint64(be.Uint32(agi[agiOffFreeCount:]))
 	}
@@ -299,10 +308,22 @@ func allocBlocks(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, nB
 			return 0, fmt.Errorf("xfs: bno B-tree delete: %w", err)
 		}
 	} else {
-		// Update cnt record: new start+count pointing to the remainder.
+		// Update cnt record: new start+count pointing to the remainder. The count
+		// SHRINKS (remaining < count), which moves the record earlier in the cnt
+		// (count,start) order, so re-sort it leftward within the leaf. The leaf's
+		// record count is unchanged, so this never underflows the node. (Ancestor
+		// separator keys can still drift if the leaf's leftmost record changes; see
+		// the bounded-sub-case note in alloc_btree.go — the resulting tree is
+		// xfs_repair-clean and the bno tree, which is authoritative for placement,
+		// stays exactly ordered.)
 		newStart := allocStartRel + nBlocks
 		be.PutUint32(cntLeaf[recOff:], newStart)
 		be.PutUint32(cntLeaf[recOff+4:], remaining)
+		// Re-sort the shrunk record leftward so the leaf stays in cnt (count,start)
+		// order; numrecs is unchanged so the node cannot underflow. Without this a
+		// multi-level cnt leaf accumulates out-of-order records (xfs_repair:
+		// "out-of-order cnt btree record").
+		allocCntBubbleLeft(cntLeaf, sb.agBTreeHdrSize(), recIdx)
 		if err := allocWriteAGBTree(rw, partOff, sb, ag, cntLeafRel, cntLeaf); err != nil {
 			return 0, err
 		}
@@ -396,11 +417,13 @@ func cntFindBlock(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, r
 			return 0, nil, 0, fmt.Errorf("xfs: cnt B-tree AG %d non-decreasing level %d", ag, lvl)
 		}
 		prevLvl = lvl
-		// Follow the rightmost pointer (largest counts on right).
+		// Follow the rightmost pointer (largest counts on right). XFS short-form
+		// btree blocks size the key/ptr arrays to maxrecs, so the pointer array
+		// begins at the maxrecs boundary regardless of the live record count.
 		if numrecs <= 0 {
 			return 0, nil, 0, fmt.Errorf("xfs: cnt B-tree internal node with no records")
 		}
-		ptrOff := hdrSize + numrecs*allocKeySize
+		ptrOff := hdrSize + allocMaxInternal(len(blk), hdrSize)*allocKeySize
 		lastPtr := ptrOff + (numrecs-1)*allocPtrSize
 		if lastPtr < 0 || lastPtr+4 > len(blk) {
 			return 0, nil, 0, fmt.Errorf("cnt B-tree block too small")
@@ -440,8 +463,8 @@ func agfRecomputeLongest(rw readerWriterAt, partOff int64, sb *superblock, ag ui
 		if len(blk) < hdrSize {
 			return 0, fmt.Errorf("xfs: agfRecomputeLongest ag=%d: btree block too small", ag)
 		}
-		numrecs := int(be.Uint16(blk[6:]))
-		ptrOff := hdrSize + numrecs*allocKeySize
+		// Pointer array begins at the maxrecs boundary (XFS short-form layout).
+		ptrOff := hdrSize + allocMaxInternal(len(blk), hdrSize)*allocKeySize
 		if ptrOff < 0 || ptrOff+allocPtrSize > len(blk) {
 			return 0, fmt.Errorf("xfs: agfRecomputeLongest ag=%d: btree block too small", ag)
 		}
@@ -581,7 +604,7 @@ func bnoFindRecord(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, 
 				break
 			}
 		}
-		ptrOff := hdrSize + numrecs*allocKeySize + child*allocPtrSize
+		ptrOff := hdrSize + allocMaxInternal(len(blk), hdrSize)*allocKeySize + child*allocPtrSize
 		agRel = binary.BigEndian.Uint32(blk[ptrOff:])
 		level--
 	}
@@ -605,14 +628,41 @@ func freeBlocks(rw readerWriterAt, partOff int64, sb *superblock, absStartBlock 
 	bnoLevel := int(be.Uint32(agfBuf[agfOffBnoLevel:]))
 	cntLevel := int(be.Uint32(agfBuf[agfOffCntLevel:]))
 
-	// Insert into bno B-tree.
-	if err := allocBnoInsertRecord(rw, partOff, sb, ag, bnoRoot, bnoLevel, agStartRel, nBlocks); err != nil {
+	// Insert into bno B-tree. A multi-level insert may split nodes and grow the
+	// tree root; allocInsertWithReserve pre-allocates the split blocks (via
+	// allocBlocks, while the trees are consistent) so a split never allocates
+	// against a tree it is mid-rewrite — and never re-enters / mis-sorts the
+	// free-space trees (see alloc_btree.go).
+	if err := allocInsertWithReserve(rw, partOff, sb, ag, bnoLevel, func() error {
+		return allocBnoInsertRecord(rw, partOff, sb, ag, bnoRoot, bnoLevel, agStartRel, nBlocks)
+	}); err != nil {
 		return fmt.Errorf("xfs: freeBlocks bno insert: %w", err)
 	}
-	// Insert into cnt B-tree.
-	if err := allocCntInsertRecord(rw, partOff, sb, ag, cntRoot, cntLevel, agStartRel, nBlocks); err != nil {
+	// Re-read the cnt root/level in case a split (or reserve alloc/free) moved it.
+	agfBuf, err = allocAGFBlock(rw, partOff, sb, ag)
+	if err != nil {
+		return err
+	}
+	cntRoot = be.Uint32(agfBuf[agfOffCntRoot:])
+	cntLevel = int(be.Uint32(agfBuf[agfOffCntLevel:]))
+	// Insert into cnt B-tree (same reserve discipline).
+	if err := allocInsertWithReserve(rw, partOff, sb, ag, cntLevel, func() error {
+		return allocCntInsertRecord(rw, partOff, sb, ag, cntRoot, cntLevel, agStartRel, nBlocks)
+	}); err != nil {
 		return fmt.Errorf("xfs: freeBlocks cnt insert: %w", err)
 	}
+
+	// Re-read the AGF: an insert that grew a tree root rewrote agf_*_root /
+	// agf_*_level (and agf_btreeblks) on disk. The agfBuf read above is now
+	// stale; writing it back would clobber the new depth. Re-read so the freeblks
+	// / longest update below builds on the post-split AGF. Refresh cntRoot/Level
+	// too so agfRecomputeLongest walks the (possibly deeper) cnt tree.
+	agfBuf, err = allocAGFBlock(rw, partOff, sb, ag)
+	if err != nil {
+		return err
+	}
+	cntRoot = be.Uint32(agfBuf[agfOffCntRoot:])
+	cntLevel = int(be.Uint32(agfBuf[agfOffCntLevel:]))
 
 	// Update AGF free count.
 	freeBlks := be.Uint32(agfBuf[agfOffFreeBlks:])
@@ -631,13 +681,13 @@ func freeBlocks(rw readerWriterAt, partOff int64, sb *superblock, absStartBlock 
 // bnoInsertRecord inserts (agStartRel, nBlocks) into the bno B-tree leaf.
 // Fails if the leaf is full (would require a split).
 func bnoInsertRecord(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, rootRel uint32, level int, agStartRel, nBlocks uint32) error {
-	return allocBTreeInsert(rw, partOff, sb, ag, rootRel, level, agStartRel, nBlocks, true)
+	return allocInsertRecord(rw, partOff, sb, ag, rootRel, level, agStartRel, nBlocks, true)
 }
 
 // cntInsertRecord inserts (agStartRel, nBlocks) into the cnt B-tree leaf,
 // sorted by count.
 func cntInsertRecord(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, rootRel uint32, level int, agStartRel, nBlocks uint32) error {
-	return allocBTreeInsert(rw, partOff, sb, ag, rootRel, level, agStartRel, nBlocks, false)
+	return allocInsertRecord(rw, partOff, sb, ag, rootRel, level, agStartRel, nBlocks, false)
 }
 
 // allocBTreeInsert navigates to the appropriate leaf of a bno or cnt B-tree
@@ -713,7 +763,7 @@ func allocBTreeInsert(rw readerWriterAt, partOff int64, sb *superblock, ag uint3
 				break
 			}
 		}
-		ptrOff := hdrSize + numrecs*allocKeySize + child*allocPtrSize
+		ptrOff := hdrSize + allocMaxInternal(len(blk), hdrSize)*allocKeySize + child*allocPtrSize
 		agRel = binary.BigEndian.Uint32(blk[ptrOff:])
 	}
 }
