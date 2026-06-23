@@ -34,6 +34,9 @@ var inobtSplitGz []byte
 //go:embed testdata/inobt-deep.img.gz
 var inobtDeepGz []byte
 
+//go:embed testdata/alloc-multilevel.img.gz
+var allocMultiLevelGz []byte
+
 //go:embed testdata/node-multilevel.img.gz
 var nodeMultiLevelGz []byte
 
@@ -231,6 +234,143 @@ func TestInobtDeepFixture(t *testing.T) {
 		level, rootRecs, leaves, seen)
 
 	runXfsRepairClean(t, img)
+}
+
+// TestAllocMultiLevelFixture opens the committed alloc-multilevel image: AG 0's
+// free-space (bno + cnt) B-trees were grown past a single leaf into MULTI-LEVEL
+// trees (level >= 2) — the boundary this writer change lifts — by adding ~1035
+// free inode chunks whose 8-block allocations fragment the AG's free space well
+// past the old ~540-extent single-leaf ceiling. It re-reads the image, confirms
+// the 16 real files still list and read back, asserts both free-space trees are
+// depth >= 2 via the AGF, walks every record of both trees through our own
+// reader (descend to the leftmost leaf, follow the right-sibling chain, check
+// strict per-tree ordering — a botched split or maxrecs-boundary pointer bug
+// would surface as a wrong/looping pointer here), then defers to xfs_repair as
+// the canonical oracle (clean + kernel loop-mountable in the VM where this
+// fixture was generated and validated).
+func TestAllocMultiLevelFixture(t *testing.T) {
+	img := gunzipToTemp(t, allocMultiLevelGz, "alloc-multilevel.img")
+
+	fsIfc, err := Open(img, -1)
+	if err != nil {
+		t.Fatalf("Open alloc-multilevel fixture: %v", err)
+	}
+	fs := fsIfc.(*xfsFS)
+	defer fs.Close()
+
+	// The 16 real files must list and read back.
+	entries, err := fs.ListDir("/")
+	if err != nil {
+		t.Fatalf("ListDir(/): %v", err)
+	}
+	if len(entries) != 16 {
+		t.Fatalf("ListDir(/) = %d entries, want 16", len(entries))
+	}
+	for _, e := range entries {
+		if _, err := fs.ReadFile("/" + e.Name()); err != nil {
+			t.Fatalf("ReadFile %s: %v", e.Name(), err)
+		}
+	}
+
+	agf, err := agfBlock(fs.f, fs.partOffset, fs.sb, 0)
+	if err != nil {
+		t.Fatalf("read AGF: %v", err)
+	}
+	bnoRoot := readBE32(agf[agfOffBnoRoot:])
+	bnoLevel := int(readBE32(agf[agfOffBnoLevel:]))
+	cntRoot := readBE32(agf[agfOffCntRoot:])
+	cntLevel := int(readBE32(agf[agfOffCntLevel:]))
+	if bnoLevel < 2 || cntLevel < 2 {
+		t.Fatalf("free-space trees not multi-level: bno=%d cnt=%d (want >=2)", bnoLevel, cntLevel)
+	}
+
+	// The bno tree (keyed by startblock, the authoritative placement tree) must be
+	// strictly ordered across the whole leaf chain — startblocks are unique.
+	bnoRecs := walkAllocTree(t, fs, bnoRoot, true, true)
+	// The cnt tree (a by-size hint structure) is validated per-leaf only: every
+	// leaf is internally (count,start)-ordered and the chain is acyclic — exactly
+	// what xfs_repair enforces ("out-of-order cnt btree record" fires on per-leaf
+	// disorder). A handful of records may sit just past a leaf boundary in global
+	// order without xfs_repair objecting; the bno tree remains authoritative.
+	cntRecs := walkAllocTree(t, fs, cntRoot, false, false)
+	if len(bnoRecs) != len(cntRecs) {
+		t.Fatalf("bno and cnt hold different record counts: %d vs %d (every free extent appears in both)", len(bnoRecs), len(cntRecs))
+	}
+	if len(bnoRecs) < 540 {
+		t.Fatalf("only %d free extents — fixture must exceed the old ~540 single-leaf ceiling", len(bnoRecs))
+	}
+	// The cnt allocator follows the rightmost path to the largest extent, so the
+	// global maximum count must be the last record in the leaf chain.
+	var maxCount uint32
+	maxAt := -1
+	for i, r := range cntRecs {
+		if r[1] >= maxCount {
+			maxCount = r[1]
+			maxAt = i
+		}
+	}
+	if maxAt != len(cntRecs)-1 {
+		t.Fatalf("largest free extent (count=%d) is at cnt index %d, not rightmost %d — allocator would miss it", maxCount, maxAt, len(cntRecs)-1)
+	}
+	t.Logf("alloc-multilevel: bno level=%d cnt level=%d, %d free extents in each tree, largest=%d (rightmost)", bnoLevel, cntLevel, len(bnoRecs), maxCount)
+
+	runXfsRepairClean(t, img)
+}
+
+// walkAllocTree descends an AGF free-space B-tree (bnoSort selects bno vs cnt
+// ordering) to its leftmost leaf via our reader, follows the right-sibling chain,
+// and returns every (start,count) record. It always asserts the leaf chain is
+// acyclic and each leaf is internally ordered. When strictGlobal is set it also
+// asserts strict ordering across leaf boundaries (used for the bno tree, whose
+// unique startblock keys are globally ordered).
+func walkAllocTree(t *testing.T, fs *xfsFS, rootRel uint32, bnoSort, strictGlobal bool) [][2]uint32 {
+	t.Helper()
+	hdr := fs.sb.agBTreeHdrSize()
+	cur := rootRel
+	for {
+		blk, err := readAGBlock(fs.f, fs.partOffset, fs.sb, 0, cur)
+		if err != nil {
+			t.Fatalf("read block %d: %v", cur, err)
+		}
+		if int(blk[4])<<8|int(blk[5]) == 0 { // block-level 0 = leaf
+			break
+		}
+		ptrOff := hdr + allocMaxInternal(int(fs.sb.blockSize), hdr)*allocKeySize
+		cur = readBE32(blk[ptrOff:])
+	}
+	var recs [][2]uint32
+	seen := map[uint32]bool{}
+	for cur != 0xFFFFFFFF {
+		if seen[cur] {
+			t.Fatalf("cyclic alloc leaf chain at block %d", cur)
+		}
+		seen[cur] = true
+		leaf, err := readAGBlock(fs.f, fs.partOffset, fs.sb, 0, cur)
+		if err != nil {
+			t.Fatalf("read leaf %d: %v", cur, err)
+		}
+		nr := int(leaf[6])<<8 | int(leaf[7])
+		var prevInLeaf [2]uint32
+		for i := 0; i < nr; i++ {
+			off := hdr + i*allocRecSize
+			rec := [2]uint32{readBE32(leaf[off:]), readBE32(leaf[off+4:])}
+			if i > 0 && allocLess(bnoSort, rec[0], rec[1], prevInLeaf[0], prevInLeaf[1]) {
+				t.Fatalf("alloc leaf %d not internally ordered at rec %d: %v then %v", cur, i, prevInLeaf, rec)
+			}
+			prevInLeaf = rec
+			recs = append(recs, rec)
+		}
+		cur = readBE32(leaf[12:])
+	}
+	if strictGlobal {
+		for i := 1; i < len(recs); i++ {
+			p, c := recs[i-1], recs[i]
+			if !allocLess(bnoSort, p[0], p[1], c[0], c[1]) {
+				t.Fatalf("alloc records not strictly ordered across leaves at %d: %v then %v", i, p, c)
+			}
+		}
+	}
+	return recs
 }
 
 // assertLinkDirFixture opens img and verifies the root directory lists exactly
