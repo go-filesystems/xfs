@@ -139,7 +139,10 @@ func makeInobtInternal(sb *superblock, keys []uint32, ptrs []uint32) []byte {
 	for i, key := range keys {
 		be.PutUint32(blk[hdr+i*inobtKeySize:], key)
 	}
-	ptrOff := hdr + len(keys)*inobtKeySize
+	// XFS short-form btree blocks size the key/ptr arrays to maxrecs, so the
+	// pointer array begins at the maxrecs boundary (matching the on-disk format
+	// xfs_repair expects), not packed right after numrecs keys.
+	ptrOff := hdr + inobtMaxInternal(int(sb.blockSize), hdr)*inobtKeySize
 	for i, ptr := range ptrs {
 		be.PutUint32(blk[ptrOff+i*inobtPtrSize:], ptr)
 	}

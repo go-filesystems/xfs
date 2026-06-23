@@ -31,6 +31,9 @@ import (
 //go:embed testdata/inobt-split.img.gz
 var inobtSplitGz []byte
 
+//go:embed testdata/inobt-deep.img.gz
+var inobtDeepGz []byte
+
 //go:embed testdata/node-multilevel.img.gz
 var nodeMultiLevelGz []byte
 
@@ -128,6 +131,105 @@ func TestInobtSplitFixture(t *testing.T) {
 	if lvl := readBE32(agi[agiOffLevel:]); lvl < 2 {
 		t.Fatalf("AG0 inobt depth=%d, want >=2 (split fixture)", lvl)
 	}
+	runXfsRepairClean(t, img)
+}
+
+// TestInobtDeepFixture opens the committed inobt-deep image: AG 0's inobt was
+// grown well past the first leaf split so the interior root carries multiple
+// records (i.e. several leaf-splits propagated key/ptr inserts up an already
+// depth-2 tree). It asserts the depth/width, then walks EVERY inobt record
+// through our own reader — proving the reader follows interior pointers at the
+// XFS maxrecs boundary and the deep-insert path produced a consistent tree —
+// before deferring to xfs_repair as the canonical oracle (clean + kernel-
+// mountable in the VM where this fixture was generated).
+func TestInobtDeepFixture(t *testing.T) {
+	img := gunzipToTemp(t, inobtDeepGz, "inobt-deep.img")
+
+	fsIfc, err := Open(img, -1)
+	if err != nil {
+		t.Fatalf("Open inobt-deep fixture: %v", err)
+	}
+	fs := fsIfc.(*xfsFS)
+	defer fs.Close()
+	if _, err := fs.ListDir("/"); err != nil {
+		t.Fatalf("ListDir(/): %v", err)
+	}
+
+	agi, err := agiBlock(fs.f, fs.partOffset, fs.sb, 0)
+	if err != nil {
+		t.Fatalf("read AGI: %v", err)
+	}
+	if lvl := readBE32(agi[agiOffLevel:]); lvl < 2 {
+		t.Fatalf("AG0 inobt depth=%d, want >=2 (deep fixture)", lvl)
+	}
+	rootRel := readBE32(agi[agiOffRoot:])
+	rootBlk, err := readAGBlock(fs.f, fs.partOffset, fs.sb, 0, rootRel)
+	if err != nil {
+		t.Fatalf("read inobt root: %v", err)
+	}
+	rootRecs := int(rootBlk[6])<<8 | int(rootBlk[7])
+	if rootRecs < 3 {
+		t.Fatalf("inobt interior root holds %d records, want >=3 (multiple deep inserts)", rootRecs)
+	}
+
+	// Walk the whole inobt: descend to the leftmost leaf via the real reader,
+	// then follow the right-sibling chain, asserting every record's startIno is
+	// strictly ascending and each is independently locatable through the
+	// multi-level inobtFindRecord descent. A maxrecs-boundary pointer bug or a
+	// botched split would surface here as a wrong/looping pointer or a record
+	// the descent can't find.
+	hdr := fs.sb.agBTreeHdrSize()
+	level := int(readBE32(agi[agiOffLevel:]))
+	// Leftmost-leaf descent mirrors inobtFindFree's interior step.
+	cur := rootRel
+	for {
+		blk, err := readAGBlock(fs.f, fs.partOffset, fs.sb, 0, cur)
+		if err != nil {
+			t.Fatalf("read block %d: %v", cur, err)
+		}
+		if int(blk[4])<<8|int(blk[5]) == 0 { // block-level 0 → leaf
+			break
+		}
+		ptrOff := hdr + inobtMaxInternal(int(fs.sb.blockSize), hdr)*inobtKeySize
+		cur = readBE32(blk[ptrOff:])
+	}
+
+	var prev uint32
+	var seen, leaves int
+	first := true
+	for cur != 0xFFFFFFFF {
+		leaf, err := readAGBlock(fs.f, fs.partOffset, fs.sb, 0, cur)
+		if err != nil {
+			t.Fatalf("read leaf %d: %v", cur, err)
+		}
+		leaves++
+		nr := int(leaf[6])<<8 | int(leaf[7])
+		for i := 0; i < nr; i++ {
+			start := readBE32(leaf[hdr+i*inobtRecSize:])
+			if !first && start <= prev {
+				t.Fatalf("inobt records not strictly ascending: %d after %d", start, prev)
+			}
+			first = false
+			prev = start
+			seen++
+			// Every record's first inode must be locatable through the depth-2
+			// descent and land in the record whose chunk covers it.
+			_, fleaf, idx, err := inobtFindRecord(fs.f, fs.partOffset, fs.sb, 0, rootRel, level, start)
+			if err != nil {
+				t.Fatalf("find record startIno=%d: %v", start, err)
+			}
+			if got := readBE32(fleaf[hdr+idx*inobtRecSize:]); got != start {
+				t.Fatalf("find record startIno=%d returned start %d", start, got)
+			}
+		}
+		cur = readBE32(leaf[12:]) // right sibling
+	}
+	if leaves < 2 {
+		t.Fatalf("inobt has %d leaves, want >=2 (split fixture)", leaves)
+	}
+	t.Logf("inobt-deep: depth=%d, interior root records=%d, leaves=%d, total chunk records=%d",
+		level, rootRecs, leaves, seen)
+
 	runXfsRepairClean(t, img)
 }
 

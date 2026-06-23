@@ -185,36 +185,22 @@ func TestGrowInobt_Mocked(t *testing.T) {
 		}
 	})
 
-	t.Run("multi-level inobt rejected", func(t *testing.T) {
-		restoreAllocHooks(t)
-		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
-			return 7, nil
-		}
-		agi := makeAGIBuffer(sb, 0, 5, 2 /* level=2 */, 0, 0)
-		allocAGIBlock = func(io.ReaderAt, int64, *superblock, uint32) ([]byte, error) {
-			return agi, nil
-		}
-		err := growInobt(newMemRW(8*int(sb.blockSize)), 0, sb, 0)
-		if err == nil || !contains(err.Error(), "level 2") {
-			t.Fatalf("growInobt level>1: got %v, want error mentioning 'level 2'", err)
-		}
-	})
-
 	t.Run("leaf full triggers split to depth 2", func(t *testing.T) {
 		restoreAllocHooks(t)
 		hdr := sb.agBTreeHdrSize()
 		maxRecs := (int(sb.blockSize) - hdr) / inobtRecSize
 
-		// The chunk alloc returns block 2100 → startIno = 2100*8 = 16800,
-		// larger than every existing record (max maxRecs*64) so the new record
-		// lands at the end. The split alloc then hands out blocks 201 (right
-		// leaf) and 202 (internal root).
+		// The chunk alloc returns block 2096 (2096 % 1024 = 48, a multiple of
+		// blocksPerChunk=8 → growInobt's aligned fast path, one alloc, no slack)
+		// → startIno = 2096*8 = 16768, larger than every existing record so the
+		// new record lands at the end. The split alloc then hands out blocks 201
+		// (right leaf) and 202 (internal root).
 		var allocCalls int
 		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
 			allocCalls++
 			switch allocCalls {
 			case 1:
-				return 2100, nil // inode chunk
+				return 2096, nil // inode chunk (aligned)
 			case 2:
 				return 201, nil // right leaf
 			default:
@@ -307,41 +293,17 @@ func TestGrowInobt_Mocked(t *testing.T) {
 		}
 	})
 
-	t.Run("split deep tree rejected", func(t *testing.T) {
-		restoreAllocHooks(t)
-		hdr := sb.agBTreeHdrSize()
-		maxRecs := (int(sb.blockSize) - hdr) / inobtRecSize
-		// AGI claims level 1 but the leaf read back is full AND we force the
-		// post-read level check to see a deeper tree by handing back level 2.
-		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
-			return 200, nil
-		}
-		// growInobt rejects level!=1 up front, so to exercise the split's own
-		// deep-tree guard we must reach inobtInsertChunkRecord with a full leaf
-		// while agiBuf still says level 1 — that always splits. The deep-tree
-		// guard inside inobtInsertChunkRecord is therefore covered directly.
-		agi := makeAGIBuffer(sb, 0, 5, 1, 0, 0)
-		be.PutUint32(agi[agiOffLevel:], 2) // pretend depth 2
-		full := make([]byte, sb.blockSize)
-		be.PutUint16(full[6:], uint16(maxRecs))
-		var rec [inobtRecSize]byte
-		be.PutUint32(rec[0:], 9999)
-		allocReadAGBlock = func(io.ReaderAt, int64, *superblock, uint32, uint32) ([]byte, error) {
-			return full, nil
-		}
-		err := inobtInsertChunkRecord(newMemRW(8*int(sb.blockSize)), 0, sb, 0, agi, 5, 9999)
-		if err == nil || !contains(err.Error(), "deep-tree insert not implemented") {
-			t.Fatalf("deep-tree split guard: got %v", err)
-		}
-	})
-
 	t.Run("split allocation and write failures", func(t *testing.T) {
 		hdr := sb.agBTreeHdrSize()
 		maxRecs := (int(sb.blockSize) - hdr) / inobtRecSize
-		// A genuinely full leaf with sorted records so the split partitions it.
+		// A genuinely full leaf (level 0) with sorted records so the leaf split
+		// partitions it. selfRel=5, rightsib=null so no old-right fixup.
 		fullLeaf := func() []byte {
 			leaf := make([]byte, sb.blockSize)
+			be.PutUint16(leaf[4:], 0) // level 0
 			be.PutUint16(leaf[6:], uint16(maxRecs))
+			be.PutUint32(leaf[8:], 0xFFFFFFFF)
+			be.PutUint32(leaf[12:], 0xFFFFFFFF)
 			for i := 0; i < maxRecs; i++ {
 				be.PutUint32(leaf[hdr+i*inobtRecSize:], uint32(1+i))
 			}
@@ -350,33 +312,17 @@ func TestGrowInobt_Mocked(t *testing.T) {
 		var rec [inobtRecSize]byte
 		be.PutUint32(rec[0:], 1<<20) // larger than every existing record
 
-		// right-leaf allocation fails.
+		// inobtSplitLeaf: right-leaf allocation fails.
 		restoreAllocHooks(t)
 		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
 			return 0, errBoom
 		}
-		agi := makeAGIBuffer(sb, 0, 5, 1, 0, 0)
-		if err := inobtSplitRootLeaf(newMemRW(0), 0, sb, 0, agi, 5, fullLeaf(), maxRecs, rec[:]); !errors.Is(err, errBoom) {
-			t.Fatalf("right-leaf alloc fail: got %v", err)
+		if _, err := inobtSplitLeaf(newMemRW(0), 0, sb, 0, 5, fullLeaf(), maxRecs, rec[:]); !errors.Is(err, errBoom) {
+			t.Fatalf("leaf-split alloc fail: got %v", err)
 		}
 
-		// root allocation fails (first alloc ok, second fails).
-		restoreAllocHooks(t)
-		var n int
-		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
-			n++
-			if n == 1 {
-				return 200, nil
-			}
-			return 0, errBoom
-		}
-		agi = makeAGIBuffer(sb, 0, 5, 1, 0, 0)
-		if err := inobtSplitRootLeaf(newMemRW(0), 0, sb, 0, agi, 5, fullLeaf(), maxRecs, rec[:]); !errors.Is(err, errBoom) {
-			t.Fatalf("root alloc fail: got %v", err)
-		}
-
-		// Each of the three btree writes (left leaf, right leaf, root) fails.
-		for failOn := 1; failOn <= 3; failOn++ {
+		// inobtSplitLeaf: each of the two btree writes (left, right) fails.
+		for failOn := 1; failOn <= 2; failOn++ {
 			restoreAllocHooks(t)
 			allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
 				return 200, nil
@@ -389,24 +335,68 @@ func TestGrowInobt_Mocked(t *testing.T) {
 				}
 				return nil
 			}
-			agi = makeAGIBuffer(sb, 0, 5, 1, 0, 0)
-			if err := inobtSplitRootLeaf(newMemRW(0), 0, sb, 0, agi, 5, fullLeaf(), maxRecs, rec[:]); !errors.Is(err, errBoom) {
-				t.Fatalf("split write fail #%d: got %v", failOn, err)
+			if _, err := inobtSplitLeaf(newMemRW(0), 0, sb, 0, 5, fullLeaf(), maxRecs, rec[:]); !errors.Is(err, errBoom) {
+				t.Fatalf("leaf-split write fail #%d: got %v", failOn, err)
 			}
 		}
 
-		// Clean split: AGI updated to root=200, level=2.
+		// Clean leaf split returns a sorted separator and the right block number.
 		restoreAllocHooks(t)
 		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
-			return 200, nil
+			return 201, nil
 		}
 		allocWriteAGBTree = func(io.WriterAt, int64, *superblock, uint32, uint32, []byte) error { return nil }
+		res, err := inobtSplitLeaf(newMemRW(0), 0, sb, 0, 5, fullLeaf(), maxRecs, rec[:])
+		if err != nil || !res.split || res.rightRel != 201 {
+			t.Fatalf("clean leaf split: res=%+v err=%v", res, err)
+		}
+
+		// inobtInsertChunkRecord: the new-root allocation (after a root leaf
+		// split) fails. Mock a full level-0 leaf for any block read.
+		restoreAllocHooks(t)
+		full := fullLeaf()
+		allocReadAGBlock = func(io.ReaderAt, int64, *superblock, uint32, uint32) ([]byte, error) {
+			return full, nil
+		}
+		allocWriteAGBTree = func(io.WriterAt, int64, *superblock, uint32, uint32, []byte) error { return nil }
+		var n int
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
+			n++
+			if n == 1 {
+				return 201, nil // right leaf for the split
+			}
+			return 0, errBoom // new root alloc fails
+		}
+		agi := makeAGIBuffer(sb, 0, 5, 1, 0, 0)
+		if err := inobtInsertChunkRecord(newMemRW(0), 0, sb, 0, agi, 5, 1, 1<<20); !errors.Is(err, errBoom) {
+			t.Fatalf("new-root alloc fail: got %v", err)
+		}
+
+		// Clean root split via inobtInsertChunkRecord: AGI promoted to level 2,
+		// root repointed at the freshly-allocated internal node (202).
+		restoreAllocHooks(t)
+		full = fullLeaf()
+		allocReadAGBlock = func(io.ReaderAt, int64, *superblock, uint32, uint32) ([]byte, error) {
+			return full, nil
+		}
+		allocWriteAGBTree = func(io.WriterAt, int64, *superblock, uint32, uint32, []byte) error { return nil }
+		var m int
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
+			m++
+			if m == 1 {
+				return 201, nil // right leaf
+			}
+			return 202, nil // new root
+		}
 		agi = makeAGIBuffer(sb, 0, 5, 1, 0, 0)
-		if err := inobtSplitRootLeaf(newMemRW(0), 0, sb, 0, agi, 5, fullLeaf(), maxRecs, rec[:]); err != nil {
-			t.Fatalf("clean split: %v", err)
+		if err := inobtInsertChunkRecord(newMemRW(0), 0, sb, 0, agi, 5, 1, 1<<20); err != nil {
+			t.Fatalf("clean root split: %v", err)
 		}
 		if be.Uint32(agi[agiOffLevel:]) != 2 {
-			t.Fatalf("clean split AGI level = %d, want 2", be.Uint32(agi[agiOffLevel:]))
+			t.Fatalf("clean root split AGI level = %d, want 2", be.Uint32(agi[agiOffLevel:]))
+		}
+		if be.Uint32(agi[agiOffRoot:]) != 202 {
+			t.Fatalf("clean root split AGI root = %d, want 202", be.Uint32(agi[agiOffRoot:]))
 		}
 	})
 
@@ -495,6 +485,55 @@ func TestGrowInobt_Mocked(t *testing.T) {
 		rw.writeHook = func(int64, []byte) error { return errBoom }
 		if err := growInobt(rw, 0, sb, 0); !errors.Is(err, errBoom) {
 			t.Fatalf("growInobt inode-slot write: got %v, want %v", err, errBoom)
+		}
+	})
+
+	t.Run("misaligned probe takes over-allocate fallback", func(t *testing.T) {
+		restoreAllocHooks(t)
+		// First alloc (the exact-size probe) returns a misaligned block (3 % 8 !=
+		// 0), forcing growInobt to free the probe and over-allocate 2*8-1 blocks,
+		// then trim the head/tail slack. Subsequent allocs serve the chunk's
+		// aligned run; the inobt insert lands in a single-leaf root with room.
+		var calls int
+		var freed int
+		allocAllocBlocks = func(_ readerWriterAt, _ int64, _ *superblock, _ uint32, n uint32) (uint64, error) {
+			calls++
+			if calls == 1 {
+				return 3, nil // misaligned probe
+			}
+			return 16, nil // aligned-enough over-alloc run (16 % 8 == 0)
+		}
+		allocFreeBlocks = func(readerWriterAt, int64, *superblock, uint64, uint32) error {
+			freed++
+			return nil
+		}
+		agi := makeAGIBuffer(sb, 0, 5, 1, 0, 0)
+		leaf := make([]byte, sb.blockSize)
+		be.PutUint16(leaf[6:], 0) // empty leaf root, has room
+		allocAGIBlock = func(io.ReaderAt, int64, *superblock, uint32) ([]byte, error) {
+			return agi, nil
+		}
+		allocReadAGBlock = func(io.ReaderAt, int64, *superblock, uint32, uint32) ([]byte, error) {
+			return leaf, nil
+		}
+		allocWriteAGBTree = func(io.WriterAt, int64, *superblock, uint32, uint32, []byte) error { return nil }
+		allocWriteAGI = func(io.WriterAt, int64, *superblock, uint32, []byte) error { return nil }
+		if err := growInobt(newMemRW(8*int(sb.blockSize)), 0, sb, 0); err != nil {
+			t.Fatalf("growInobt misaligned-probe fallback: %v", err)
+		}
+		if freed == 0 {
+			t.Fatalf("expected the fallback to free the probe + slack, but no free happened")
+		}
+	})
+
+	t.Run("misaligned probe free-back fails", func(t *testing.T) {
+		restoreAllocHooks(t)
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
+			return 3, nil // misaligned → fallback frees the probe, which fails
+		}
+		allocFreeBlocks = func(readerWriterAt, int64, *superblock, uint64, uint32) error { return errBoom }
+		if err := growInobt(newMemRW(8*int(sb.blockSize)), 0, sb, 0); !errors.Is(err, errBoom) {
+			t.Fatalf("growInobt probe free-back fail: got %v", err)
 		}
 	})
 
@@ -718,6 +757,236 @@ func TestAllocInode_FindFreeFailsAfterGrow(t *testing.T) {
 	}
 }
 
+// TestInobtDeepInsertErrors covers the error branches of the deep-insert
+// helpers: in-place interior insert (child did not split), interior-node split
+// allocation/write/old-right-sibling failures, leaf-split old-right-sibling
+// failures, and the new-root re-read / write failures during a depth grow.
+func TestInobtDeepInsertErrors(t *testing.T) {
+	sb := deepInobtSB()
+	be := binary.BigEndian
+	hdr := sb.agBTreeHdrSize()
+	maxLeaf := (int(sb.blockSize) - hdr) / inobtRecSize
+	maxNode := (int(sb.blockSize) - hdr) / (inobtKeySize + inobtPtrSize)
+
+	fullLeaf := func(self, lsib, rsib, base uint32) []byte {
+		blk := make([]byte, sb.blockSize)
+		be.PutUint16(blk[4:], 0)
+		be.PutUint16(blk[6:], uint16(maxLeaf))
+		be.PutUint32(blk[8:], lsib)
+		be.PutUint32(blk[12:], rsib)
+		for i := 0; i < maxLeaf; i++ {
+			be.PutUint32(blk[hdr+i*inobtRecSize:], base+uint32(i)*uint32(inobtChunkInodes))
+		}
+		return blk
+	}
+
+	t.Run("in-place insert under interior (child no split)", func(t *testing.T) {
+		restoreAllocHooks(t)
+		rw := newMemRW(int(sb.agBlocks) * int(sb.blockSize))
+		// Root(block 1) → leaf 10 (has room: 1 record) , leaf 11.
+		leaf10 := make([]byte, sb.blockSize)
+		be.PutUint16(leaf10[6:], 1)
+		be.PutUint32(leaf10[12:], 11)
+		be.PutUint32(leaf10[hdr:], 64) // single record startIno=64
+		leaf11 := fullLeaf(11, 10, 0xFFFFFFFF, 1<<20)
+		root := makeInobtInternal(sb, []uint32{64, 1 << 20}, []uint32{10, 11})
+		putFSBlock(rw, 0, sb, 0, 10, leaf10)
+		putFSBlock(rw, 0, sb, 0, 11, leaf11)
+		putFSBlock(rw, 0, sb, 0, 1, root)
+
+		agi := makeAGIBuffer(sb, 0, 1, 2, 0, 0)
+		// New record 128: descends into leaf 10 (which has room) → no split, no
+		// alloc. Exercises the interior !res.split early return.
+		if err := inobtInsertChunkRecord(rw, 0, sb, 0, agi, 1, 2, 128); err != nil {
+			t.Fatalf("in-place interior insert: %v", err)
+		}
+		l10, _ := readAGBlock(rw, 0, sb, 0, 10)
+		if nr := be.Uint16(l10[6:]); nr != 2 {
+			t.Fatalf("leaf 10 numrecs: got %d, want 2", nr)
+		}
+		// Root unchanged (still depth 2, same root, 2 records).
+		if be.Uint32(agi[agiOffLevel:]) != 2 || be.Uint16(root[6:]) != 2 {
+			t.Fatalf("root changed unexpectedly")
+		}
+	})
+
+	t.Run("interior child read fail propagates", func(t *testing.T) {
+		restoreAllocHooks(t)
+		root := makeInobtInternal(sb, []uint32{64, 1 << 20}, []uint32{10, 11})
+		allocReadAGBlock = func(_ io.ReaderAt, _ int64, _ *superblock, _ uint32, agRel uint32) ([]byte, error) {
+			if agRel == 1 {
+				return root, nil
+			}
+			return nil, errBoom // child read fails
+		}
+		agi := makeAGIBuffer(sb, 0, 1, 2, 0, 0)
+		if err := inobtInsertChunkRecord(newMemRW(0), 0, sb, 0, agi, 1, 2, 128); !errors.Is(err, errBoom) {
+			t.Fatalf("child read fail: got %v", err)
+		}
+	})
+
+	t.Run("interior node split error branches", func(t *testing.T) {
+		// A full interior node with sorted keys/ptrs; insert at the end.
+		fullNode := func() []byte {
+			keys := make([]uint32, maxNode)
+			ptrs := make([]uint32, maxNode)
+			for i := 0; i < maxNode; i++ {
+				keys[i] = uint32(64 + i*1000)
+				ptrs[i] = uint32(1000 + i)
+			}
+			n := makeInobtInternal(sb, keys, ptrs)
+			be.PutUint32(n[12:], 0xFFFFFFFF) // no old-right sibling
+			return n
+		}
+
+		// alloc fails.
+		restoreAllocHooks(t)
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
+			return 0, errBoom
+		}
+		if _, err := inobtSplitNode(newMemRW(0), 0, sb, 0, 5, fullNode(), maxNode, 1<<30, 9999); !errors.Is(err, errBoom) {
+			t.Fatalf("node-split alloc fail: got %v", err)
+		}
+
+		// left/right writes fail.
+		for failOn := 1; failOn <= 2; failOn++ {
+			restoreAllocHooks(t)
+			allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
+				return 300, nil
+			}
+			var w int
+			allocWriteAGBTree = func(io.WriterAt, int64, *superblock, uint32, uint32, []byte) error {
+				w++
+				if w == failOn {
+					return errBoom
+				}
+				return nil
+			}
+			if _, err := inobtSplitNode(newMemRW(0), 0, sb, 0, 5, fullNode(), maxNode, 1<<30, 9999); !errors.Is(err, errBoom) {
+				t.Fatalf("node-split write fail #%d: got %v", failOn, err)
+			}
+		}
+
+		// old-right-sibling read then write fail.
+		nodeWithRight := func() []byte {
+			n := fullNode()
+			be.PutUint32(n[12:], 77) // old right sibling = block 77
+			return n
+		}
+		// sibling read fails.
+		restoreAllocHooks(t)
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) { return 300, nil }
+		allocWriteAGBTree = func(io.WriterAt, int64, *superblock, uint32, uint32, []byte) error { return nil }
+		allocReadAGBlock = func(_ io.ReaderAt, _ int64, _ *superblock, _ uint32, agRel uint32) ([]byte, error) {
+			if agRel == 77 {
+				return nil, errBoom
+			}
+			return make([]byte, sb.blockSize), nil
+		}
+		if _, err := inobtSplitNode(newMemRW(0), 0, sb, 0, 5, nodeWithRight(), maxNode, 1<<30, 9999); !errors.Is(err, errBoom) {
+			t.Fatalf("node-split old-right read fail: got %v", err)
+		}
+		// sibling write fails.
+		restoreAllocHooks(t)
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) { return 300, nil }
+		allocReadAGBlock = func(io.ReaderAt, int64, *superblock, uint32, uint32) ([]byte, error) {
+			return make([]byte, sb.blockSize), nil
+		}
+		var w int
+		allocWriteAGBTree = func(_ io.WriterAt, _ int64, _ *superblock, _ uint32, agRel uint32, _ []byte) error {
+			w++
+			if agRel == 77 {
+				return errBoom // the sibling fixup write
+			}
+			return nil
+		}
+		if _, err := inobtSplitNode(newMemRW(0), 0, sb, 0, 5, nodeWithRight(), maxNode, 1<<30, 9999); !errors.Is(err, errBoom) {
+			t.Fatalf("node-split old-right write fail: got %v", err)
+		}
+	})
+
+	t.Run("leaf split old-right-sibling fixup", func(t *testing.T) {
+		// A full leaf whose right sibling is a real block (so the fixup runs).
+		mkLeaf := func() []byte {
+			l := fullLeaf(5, 0xFFFFFFFF, 88, 64) // rsib = 88
+			return l
+		}
+		// sibling read fails.
+		restoreAllocHooks(t)
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) { return 300, nil }
+		allocWriteAGBTree = func(io.WriterAt, int64, *superblock, uint32, uint32, []byte) error { return nil }
+		allocReadAGBlock = func(_ io.ReaderAt, _ int64, _ *superblock, _ uint32, agRel uint32) ([]byte, error) {
+			if agRel == 88 {
+				return nil, errBoom
+			}
+			return make([]byte, sb.blockSize), nil
+		}
+		var rec [inobtRecSize]byte
+		be.PutUint32(rec[0:], 1<<20)
+		if _, err := inobtSplitLeaf(newMemRW(0), 0, sb, 0, 5, mkLeaf(), maxLeaf, rec[:]); !errors.Is(err, errBoom) {
+			t.Fatalf("leaf-split old-right read fail: got %v", err)
+		}
+		// sibling write fails.
+		restoreAllocHooks(t)
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) { return 300, nil }
+		allocReadAGBlock = func(io.ReaderAt, int64, *superblock, uint32, uint32) ([]byte, error) {
+			return make([]byte, sb.blockSize), nil
+		}
+		allocWriteAGBTree = func(_ io.WriterAt, _ int64, _ *superblock, _ uint32, agRel uint32, _ []byte) error {
+			if agRel == 88 {
+				return errBoom
+			}
+			return nil
+		}
+		if _, err := inobtSplitLeaf(newMemRW(0), 0, sb, 0, 5, mkLeaf(), maxLeaf, rec[:]); !errors.Is(err, errBoom) {
+			t.Fatalf("leaf-split old-right write fail: got %v", err)
+		}
+	})
+
+	t.Run("grow new-root read and write failures", func(t *testing.T) {
+		// Full single-leaf root: split promotes to depth 2 via the new-root path.
+		fullRootLeaf := func() []byte { return fullLeaf(5, 0xFFFFFFFF, 0xFFFFFFFF, 64) }
+
+		// Old-root re-read (for leftKey/level) fails after the leaf split.
+		restoreAllocHooks(t)
+		var rcount int
+		allocReadAGBlock = func(_ io.ReaderAt, _ int64, _ *superblock, _ uint32, agRel uint32) ([]byte, error) {
+			rcount++
+			if rcount == 1 {
+				return fullRootLeaf(), nil // initial descend read
+			}
+			return nil, errBoom // the post-split old-root re-read
+		}
+		allocWriteAGBTree = func(io.WriterAt, int64, *superblock, uint32, uint32, []byte) error { return nil }
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) { return 201, nil }
+		agi := makeAGIBuffer(sb, 0, 5, 1, 0, 0)
+		if err := inobtInsertChunkRecord(newMemRW(0), 0, sb, 0, agi, 5, 1, 1<<20); !errors.Is(err, errBoom) {
+			t.Fatalf("grow old-root re-read fail: got %v", err)
+		}
+
+		// New-root write fails.
+		restoreAllocHooks(t)
+		allocReadAGBlock = func(io.ReaderAt, int64, *superblock, uint32, uint32) ([]byte, error) {
+			return fullRootLeaf(), nil
+		}
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) { return 201, nil }
+		var w int
+		allocWriteAGBTree = func(_ io.WriterAt, _ int64, _ *superblock, _ uint32, agRel uint32, _ []byte) error {
+			w++
+			// Let the two leaf-split writes pass; fail the new-root write (the
+			// 3rd write, to a freshly-allocated block).
+			if w == 3 {
+				return errBoom
+			}
+			return nil
+		}
+		agi = makeAGIBuffer(sb, 0, 5, 1, 0, 0)
+		if err := inobtInsertChunkRecord(newMemRW(0), 0, sb, 0, agi, 5, 1, 1<<20); !errors.Is(err, errBoom) {
+			t.Fatalf("grow new-root write fail: got %v", err)
+		}
+	})
+}
+
 func contains(s, substr string) bool {
 	for i := 0; i+len(substr) <= len(s); i++ {
 		if s[i:i+len(substr)] == substr {
@@ -725,4 +994,197 @@ func contains(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// deepInobtSB is a small-block geometry (512-byte blocks) chosen so a single
+// interior node fills quickly: leaf maxRecs = (512-56)/16 = 28, interior
+// maxRecs = (512-56)/8 = 57. agBlkLog=12 keeps every AG-0 block number equal to
+// its absolute block (ag<<12 | rel = rel for ag 0), so a memRW indexed by block
+// number backs the whole tree.
+func deepInobtSB() *superblock {
+	return &superblock{
+		blockSize: 512,
+		agBlocks:  4096,
+		agCount:   2,
+		inodeSize: 256,
+		inopBlock: 8,
+		inopBLog:  3,
+		agBlkLog:  12,
+		hasCRC:    true,
+		hasFType:  true,
+	}
+}
+
+// TestInobtDeepInsert drives the *real* recursive inobt insert against a
+// hand-built multi-level tree in a memRW (real readAGBlock/writeAGBTree, only
+// block allocation mocked). It covers the three deep-tree cases the depth-1
+// split never reaches:
+//
+//  1. insert into a full leaf under an already-depth-2 root that still has room
+//     → leaf split + interior key/ptr insert in place;
+//  2. insert into a full leaf under a *full* interior root → leaf split that
+//     overflows the root → interior-node split → tree grows to depth 3;
+//  3. the resulting depth-3 tree is internally consistent: every record (old +
+//     new) is reachable through inobtFindRecord with the right startIno.
+func TestInobtDeepInsert(t *testing.T) {
+	sb := deepInobtSB()
+	be := binary.BigEndian
+	hdr := sb.agBTreeHdrSize()
+	maxLeaf := (int(sb.blockSize) - hdr) / inobtRecSize                  // 28
+	maxNode := (int(sb.blockSize) - hdr) / (inobtKeySize + inobtPtrSize) // 57
+
+	// chunkStride keeps every record's startIno a clean multiple of the 64-inode
+	// chunk so the tree mirrors a real inobt.
+	const chunkStride = uint32(inobtChunkInodes)
+
+	// fullLeaf builds a level-0 leaf of maxLeaf records starting at base,
+	// stepping by chunkStride, with the given left/right siblings.
+	fullLeaf := func(self, lsib, rsib, base uint32) []byte {
+		blk := make([]byte, sb.blockSize)
+		be.PutUint16(blk[4:], 0)
+		be.PutUint16(blk[6:], uint16(maxLeaf))
+		be.PutUint32(blk[8:], lsib)
+		be.PutUint32(blk[12:], rsib)
+		be.PutUint64(blk[16:], sb.fsbToPhysBlock(sb.agAbsBlock(0, self))*fmtDaddrPerBlock)
+		for i := 0; i < maxLeaf; i++ {
+			off := hdr + i*inobtRecSize
+			be.PutUint32(blk[off:], base+uint32(i)*chunkStride)
+			be.PutUint32(blk[off+4:], 0) // full chunk
+			be.PutUint64(blk[off+8:], 0)
+		}
+		return blk
+	}
+
+	t.Run("leaf split propagates into interior root with room", func(t *testing.T) {
+		restoreAllocHooks(t)
+		rw := newMemRW(int(sb.agBlocks) * int(sb.blockSize))
+
+		// Tree: root(block 1, interior, 2 ptrs) → leaf 10 (full) , leaf 11 (full).
+		// Insert lands in leaf 10 (lowest range) and splits it; the root absorbs
+		// the new separator (numrecs 2 → 3) without splitting.
+		base0 := uint32(64)                            // leaf 10 records
+		base1 := base0 + uint32(maxLeaf)*chunkStride*2 // leaf 11 records (well above)
+		leaf10 := fullLeaf(10, 0xFFFFFFFF, 11, base0)
+		leaf11 := fullLeaf(11, 10, 0xFFFFFFFF, base1)
+		root := makeInobtInternal(sb, []uint32{base0, base1}, []uint32{10, 11})
+		putFSBlock(rw, 0, sb, 0, 10, leaf10)
+		putFSBlock(rw, 0, sb, 0, 11, leaf11)
+		putFSBlock(rw, 0, sb, 0, 1, root)
+
+		var next uint32 = 100
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
+			b := next
+			next++
+			return uint64(b), nil
+		}
+
+		agi := makeAGIBuffer(sb, 0, 1, 2, 0, 0) // depth 2, root=block 1
+		// New record between base0 and base0+stride: lands inside full leaf 10.
+		newStart := base0 + chunkStride/2*0 + chunkStride*uint32(maxLeaf) - chunkStride // just below leaf 11's range edge but in leaf 10
+		newStart = base0 + uint32(maxLeaf)*chunkStride - chunkStride/2                  // mid-range, > all of leaf 10's keys but < base1
+		if err := inobtInsertChunkRecord(rw, 0, sb, 0, agi, 1, 2, newStart); err != nil {
+			t.Fatalf("deep insert (root has room): %v", err)
+		}
+		// Root must stay at the same block and depth 2, now with 3 children.
+		if be.Uint32(agi[agiOffRoot:]) != 1 || be.Uint32(agi[agiOffLevel:]) != 2 {
+			t.Fatalf("root moved/grew unexpectedly: root=%d level=%d", be.Uint32(agi[agiOffRoot:]), be.Uint32(agi[agiOffLevel:]))
+		}
+		rootBlk, _ := readAGBlock(rw, 0, sb, 0, 1)
+		if nr := be.Uint16(rootBlk[6:]); nr != 3 {
+			t.Fatalf("root numrecs after leaf split: got %d, want 3", nr)
+		}
+		// The new record is reachable.
+		agRel := newStart // record startIno == AG-relative inode of slot 0
+		_, leaf, _, err := inobtFindRecord(rw, 0, sb, 0, 1, 2, agRel)
+		if err != nil {
+			t.Fatalf("find new record: %v", err)
+		}
+		_ = leaf
+	})
+
+	t.Run("interior root split grows tree to depth 3", func(t *testing.T) {
+		restoreAllocHooks(t)
+		rw := newMemRW(int(sb.agBlocks) * int(sb.blockSize))
+
+		// Build a depth-2 tree with a FULL interior root: maxNode leaves, the
+		// first one full and targeted by the insert. Leaf blocks live at 10..10+
+		// maxNode-1, each holding maxLeaf records in disjoint ascending ranges.
+		// rangeStride is the key span of one full leaf.
+		rangeStride := uint32(maxLeaf) * chunkStride
+		keys := make([]uint32, maxNode)
+		ptrs := make([]uint32, maxNode)
+		for i := 0; i < maxNode; i++ {
+			self := uint32(10 + i)
+			base := uint32(64) + uint32(i)*rangeStride*2 // *2 leaves a gap between leaves
+			var lsib, rsib uint32 = 0xFFFFFFFF, 0xFFFFFFFF
+			if i > 0 {
+				lsib = uint32(10 + i - 1)
+			}
+			if i < maxNode-1 {
+				rsib = uint32(10 + i + 1)
+			}
+			putFSBlock(rw, 0, sb, 0, self, fullLeaf(self, lsib, rsib, base))
+			keys[i] = base
+			ptrs[i] = self
+		}
+		root := makeInobtInternal(sb, keys, ptrs)
+		const rootBlk = uint32(1)
+		putFSBlock(rw, 0, sb, 0, rootBlk, root)
+
+		var next uint32 = 200
+		allocAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) {
+			b := next
+			next++
+			return uint64(b), nil
+		}
+
+		agi := makeAGIBuffer(sb, 0, rootBlk, 2, 0, 0)
+		// Target the FIRST leaf (keys[0]..) mid-range so it splits; the new
+		// separator must be inserted into the already-full root, splitting it
+		// and growing the tree to depth 3.
+		newStart := keys[0] + rangeStride - chunkStride/2 // inside leaf 0's range, distinct from its keys
+		// Ensure it doesn't collide with an existing record: pick a value not on
+		// the chunkStride grid of leaf 0 by nudging to an odd multiple offset.
+		if newStart%chunkStride == 0 {
+			newStart += chunkStride / 2
+		}
+		if err := inobtInsertChunkRecord(rw, 0, sb, 0, agi, rootBlk, 2, newStart); err != nil {
+			t.Fatalf("deep insert (root full → grow): %v", err)
+		}
+		// Tree must have grown to depth 3 with a brand-new root.
+		newRoot := be.Uint32(agi[agiOffRoot:])
+		if be.Uint32(agi[agiOffLevel:]) != 3 {
+			t.Fatalf("expected depth 3 after interior split, got level %d", be.Uint32(agi[agiOffLevel:]))
+		}
+		if newRoot == rootBlk {
+			t.Fatalf("root block unchanged after grow: %d", newRoot)
+		}
+		nrBlk, _ := readAGBlock(rw, 0, sb, 0, newRoot)
+		if lvl := be.Uint16(nrBlk[4:]); lvl != 2 {
+			t.Fatalf("new root block-level: got %d, want 2", lvl)
+		}
+		if nr := be.Uint16(nrBlk[6:]); nr != 2 {
+			t.Fatalf("new root numrecs: got %d, want 2", nr)
+		}
+
+		// Every original record plus the new one is reachable through the depth-3
+		// tree, landing in a record whose chunk covers it.
+		check := func(agRel uint32) {
+			_, leaf, idx, err := inobtFindRecord(rw, 0, sb, 0, newRoot, 3, agRel)
+			if err != nil {
+				t.Fatalf("find %d in depth-3 tree: %v", agRel, err)
+			}
+			recOff := hdr + idx*inobtRecSize
+			start := be.Uint32(leaf[recOff:])
+			if agRel < start || agRel >= start+inobtChunkInodes {
+				t.Fatalf("find %d returned wrong record (start %d)", agRel, start)
+			}
+		}
+		// First record of the first leaf, a middle leaf, the last leaf, and the
+		// freshly-inserted record.
+		check(64)
+		check(keys[maxNode/2])
+		check(keys[maxNode-1])
+		check(newStart)
+	})
 }
