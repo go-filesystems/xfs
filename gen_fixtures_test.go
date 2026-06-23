@@ -94,6 +94,85 @@ func TestGenInobtSplitImage(t *testing.T) {
 	}
 }
 
+// TestGenInobtDeepImage writes inobt-deep.img: it drives growInobt well past
+// the first leaf split so the AG-0 inobt is already depth 2 *with multiple
+// interior records*, exercising the general record-insert path that splits a
+// leaf under an existing interior node and propagates the new key/ptr up the
+// existing tree. Every added inode is left FREE (xfs_repair accepts free
+// chunks), so this is far cheaper than creating millions of real files while
+// exercising exactly the deep-insert path on the real oracle.
+//
+// Bounded sub-case: this fixture stops at a wide depth-2 tree rather than a
+// depth-3 root. Reaching depth 3 here would need ~maxNode×maxChunks ≈ 127k free
+// chunks, but the writer's deliberately-simple bno/cnt free-space allocator is
+// single-leaf (no free-space-tree split) and overflows around ~540 chunks once
+// the inobt's own block allocations fragment the free space — a *separate*
+// not-implemented boundary (free-space-btree split). The depth-2→3 growth code
+// itself is fully exercised by the unit test TestInobtDeepInsert
+// ("interior root split grows tree to depth 3").
+func TestGenInobtDeepImage(t *testing.T) {
+	dir := genOutDir(t)
+	out := filepath.Join(dir, "inobt-deep.img")
+
+	// 2 GiB gives a big AG 0 so the free-space trees have room for the many
+	// 8-block inode chunks plus the inobt's own leaf/interior blocks.
+	fsIfc, err := Format(out, 2<<30, FormatConfig{Label: "inobtdeep"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	fs := fsIfc.(*xfsFS)
+
+	hdr := fs.sb.agBTreeHdrSize()
+	maxChunks := (int(fs.sb.blockSize) - hdr) / inobtRecSize                // records per leaf
+	maxNode := (int(fs.sb.blockSize) - hdr) / (inobtKeySize + inobtPtrSize) // ptrs per interior node
+
+	// Target: enough chunks to put several records in the interior root (so the
+	// split-leaf-then-insert-into-interior path runs many times). Each ~maxChunks
+	// further inserts past the first split adds one interior record; 2 maxChunks
+	// past the first split (≈3×maxChunks total) yields a depth-2 root with 3-4
+	// children, well into the new deep-insert path. We cap below the point where
+	// the simplistic bno/cnt free-space allocator (single-leaf, no split) would
+	// itself overflow — extending that allocator is a separate boundary.
+	target := maxChunks * 2
+	level := uint32(1)
+	added := 0
+	for i := 0; i < target; i++ {
+		if err := growInobt(fs.f, fs.partOffset, fs.sb, 0); err != nil {
+			t.Fatalf("growInobt #%d: %v", i, err)
+		}
+		added++
+		agi, err := agiBlock(fs.f, fs.partOffset, fs.sb, 0)
+		if err != nil {
+			t.Fatalf("read AGI: %v", err)
+		}
+		level = binary.BigEndian.Uint32(agi[agiOffLevel:])
+	}
+
+	// Inspect the interior root so the log records how deep/wide we got.
+	agi, err := agiBlock(fs.f, fs.partOffset, fs.sb, 0)
+	if err != nil {
+		t.Fatalf("read AGI: %v", err)
+	}
+	rootRel := binary.BigEndian.Uint32(agi[agiOffRoot:])
+	rootBlk, err := readAGBlock(fs.f, fs.partOffset, fs.sb, 0, rootRel)
+	if err != nil {
+		t.Fatalf("read inobt root: %v", err)
+	}
+	rootRecs := binary.BigEndian.Uint16(rootBlk[6:])
+
+	if err := syncSuperblockCounts(fs.f, fs.partOffset, fs.sb); err != nil {
+		t.Fatalf("sync counts: %v", err)
+	}
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	t.Logf("inobt-deep.img: AG0 inobt depth=%d, root holds %d records (maxNode=%d) after %d chunks",
+		level, rootRecs, maxNode, added)
+	if level < 2 || rootRecs < 3 {
+		t.Fatalf("inobt not deep enough: depth=%d rootRecs=%d (want depth>=2 with >=3 interior records)", level, rootRecs)
+	}
+}
+
 // writeBulkLinkImage produces an image whose root directory holds n entries
 // (named namePrefix+index) all hardlinking one backing inode, then closes it.
 func writeBulkLinkImage(t *testing.T, out string, n int, namePrefix string) {

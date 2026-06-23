@@ -240,6 +240,15 @@ func (sb *superblock) agBTreeHdrSize() int {
 	return btreeHdrSize(sb.hasCRC)
 }
 
+// inobtMaxInternal returns the maximum number of key/ptr pairs an interior
+// inobt block of length blockLen (with header hdrSize) can hold. XFS short-form
+// btree blocks size the key and pointer arrays to this maxrecs, so an interior
+// node's pointer array always begins at hdrSize + maxInternal*inobtKeySize —
+// independent of how many records the node currently holds.
+func inobtMaxInternal(blockLen, hdrSize int) int {
+	return (blockLen - hdrSize) / (inobtKeySize + inobtPtrSize)
+}
+
 // ──────────────────── Block allocation ─────────────────────────────────────
 
 // allocBlocks allocates nBlocks contiguous blocks from allocation group ag
@@ -840,8 +849,10 @@ func inobtFindFree(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, 
 			agRel = rsib
 			continue
 		}
-		// Follow leftmost child.
-		ptrOff := hdrSize + numrecs*inobtKeySize
+		// Follow leftmost child. XFS short-form btree blocks size the key and
+		// pointer arrays to the block's maxrecs, so pointers start at the maxrecs
+		// boundary (not numrecs).
+		ptrOff := hdrSize + inobtMaxInternal(len(blk), hdrSize)*inobtKeySize
 		agRel = binary.BigEndian.Uint32(blk[ptrOff:])
 		level--
 	}
@@ -920,7 +931,7 @@ func inobtFindRecord(rw readerWriterAt, partOff int64, sb *superblock, ag uint32
 				break
 			}
 		}
-		ptrOff := hdrSize + numrecs*inobtKeySize + child*inobtPtrSize
+		ptrOff := hdrSize + inobtMaxInternal(len(blk), hdrSize)*inobtKeySize + child*inobtPtrSize
 		agRel = binary.BigEndian.Uint32(blk[ptrOff:])
 		level--
 	}
@@ -942,8 +953,10 @@ func inobtFindRecord(rw readerWriterAt, partOff int64, sb *superblock, ag uint32
 // When the single root leaf fills (~252 chunks at blockSize=4096), the record
 // insert promotes the inobt from one level to two: the full leaf is split in
 // half into two leaf blocks and a fresh internal root (level 1) is written
-// above them, with the AGI root/level updated. Deeper trees (already level >=2)
-// remain unsupported and return an explicit error.
+// above them, with the AGI root/level updated. The insert generalises to any
+// depth: a full leaf under an already-deep tree is split and the new key/ptr
+// propagated up; a full interior node is split in turn, and if the root itself
+// splits the tree grows one level deeper (depth 2→3, …) with a fresh root.
 func growInobt(rw readerWriterAt, partOff int64, sb *superblock, ag uint32) error {
 	be := binary.BigEndian
 
@@ -962,36 +975,54 @@ func growInobt(rw readerWriterAt, partOff int64, sb *superblock, ag uint32) erro
 	// allocator hands out whatever block fits, so over-allocate by up to one
 	// chunk's worth, carve out the aligned blocksPerChunk-block run, and free
 	// the unaligned head/tail slack back to the free-space B-trees.
-	wantBlocks := blocksPerChunk
-	if blocksPerChunk > 1 {
-		wantBlocks = 2*blocksPerChunk - 1 // enough slack to contain any aligned run
-	}
-	rawStart, err := allocAllocBlocks(rw, partOff, sb, ag, wantBlocks)
+	// Fast path: ask for exactly blocksPerChunk. The cnt allocator carves from
+	// the front of the largest free extent, so once that extent's start is
+	// chunk-aligned every subsequent exact allocation is aligned too — yielding
+	// zero slack and, crucially, no slack-free fragmentation of the bno/cnt
+	// trees (a steady stream of unaligned slack frees would otherwise overflow a
+	// free-space leaf). Only when the returned run is misaligned do we fall back
+	// to the over-allocate-and-trim path below.
+	probeStart, err := allocAllocBlocks(rw, partOff, sb, ag, blocksPerChunk)
 	if err != nil {
-		return fmt.Errorf("growInobt: alloc %d blocks: %w", wantBlocks, err)
+		return fmt.Errorf("growInobt: alloc %d blocks: %w", blocksPerChunk, err)
 	}
+	probeBase := uint32(probeStart % uint64(sb.agBlocks))
 
-	// Round the AG-relative start up to a blocksPerChunk boundary.
-	rawBase := uint32(rawStart % uint64(sb.agBlocks))
-	alignedBase := (rawBase + blocksPerChunk - 1) / blocksPerChunk * blocksPerChunk
-	headSlack := alignedBase - rawBase
-	absStart := rawStart + uint64(headSlack)
-	tailSlack := wantBlocks - headSlack - blocksPerChunk
-
-	// Return the slack so the space accounting and free-space trees stay
-	// correct (and xfs_repair sees no leaked blocks).
-	if headSlack > 0 {
-		if err := allocFreeBlocks(rw, partOff, sb, rawStart, headSlack); err != nil {
-			return fmt.Errorf("growInobt: free head slack: %w", err)
+	var absStart uint64
+	var agBlockBase uint32
+	if probeBase%blocksPerChunk == 0 {
+		absStart = probeStart
+		agBlockBase = probeBase
+	} else {
+		// Misaligned: hand the probe run back and over-allocate enough slack to
+		// contain an aligned blocksPerChunk-block run, then free the unaligned
+		// head/tail so xfs_repair sees no leaked blocks.
+		if err := allocFreeBlocks(rw, partOff, sb, probeStart, blocksPerChunk); err != nil {
+			return fmt.Errorf("growInobt: free probe run: %w", err)
 		}
-	}
-	if tailSlack > 0 {
-		if err := allocFreeBlocks(rw, partOff, sb, absStart+uint64(blocksPerChunk), tailSlack); err != nil {
-			return fmt.Errorf("growInobt: free tail slack: %w", err)
+		wantBlocks := 2*blocksPerChunk - 1
+		rawStart, err := allocAllocBlocks(rw, partOff, sb, ag, wantBlocks)
+		if err != nil {
+			return fmt.Errorf("growInobt: alloc %d blocks: %w", wantBlocks, err)
 		}
+		rawBase := uint32(rawStart % uint64(sb.agBlocks))
+		alignedBase := (rawBase + blocksPerChunk - 1) / blocksPerChunk * blocksPerChunk
+		headSlack := alignedBase - rawBase
+		absStart = rawStart + uint64(headSlack)
+		tailSlack := wantBlocks - headSlack - blocksPerChunk
+		if headSlack > 0 {
+			if err := allocFreeBlocks(rw, partOff, sb, rawStart, headSlack); err != nil {
+				return fmt.Errorf("growInobt: free head slack: %w", err)
+			}
+		}
+		if tailSlack > 0 {
+			if err := allocFreeBlocks(rw, partOff, sb, absStart+uint64(blocksPerChunk), tailSlack); err != nil {
+				return fmt.Errorf("growInobt: free tail slack: %w", err)
+			}
+		}
+		agBlockBase = alignedBase
 	}
 
-	agBlockBase := alignedBase
 	startIno := agBlockBase * uint32(sb.inopBlock)
 
 	// Pre-initialise every inode in the chunk. xfs_repair walks the chunk's
@@ -1026,12 +1057,9 @@ func growInobt(rw readerWriterAt, partOff int64, sb *superblock, ag uint32) erro
 		return err
 	}
 	inobtRoot := be.Uint32(agiBuf[agiOffRoot:])
-	inobtLevel := int(be.Uint32(agiBuf[agiOffLevel:]))
-	if inobtLevel != 1 {
-		return fmt.Errorf("growInobt: inobt level %d (>1) not supported yet", inobtLevel)
-	}
+	inobtLevel := be.Uint32(agiBuf[agiOffLevel:])
 
-	if err := inobtInsertChunkRecord(rw, partOff, sb, ag, agiBuf, inobtRoot, startIno); err != nil {
+	if err := inobtInsertChunkRecord(rw, partOff, sb, ag, agiBuf, inobtRoot, inobtLevel, startIno); err != nil {
 		return err
 	}
 
@@ -1046,38 +1074,30 @@ func growInobt(rw readerWriterAt, partOff int64, sb *superblock, ag uint32) erro
 	return allocWriteAGI(rw, partOff, sb, ag, agiBuf)
 }
 
+// inobtSplit carries the result of a node split back up the recursion: when a
+// child block at relative position selfRel overflows it is split, and the lower
+// half stays in selfRel while the upper half moves to a freshly-allocated block
+// at rightRel whose first key is rightKey. The parent (or, at the root, the
+// caller) must insert the (rightKey → rightRel) separator next to the pointer
+// it followed to reach selfRel. When split is false the insert was absorbed in
+// place and the other fields are unset.
+type inobtSplit struct {
+	split    bool
+	rightKey uint32 // first ir_startino in the new right sibling
+	rightRel uint32 // AG-relative block number of the new right sibling
+}
+
 // inobtInsertChunkRecord inserts one freshly-allocated 64-inode chunk record
 // (startIno, freecount=64, ir_free=all-ones) into the inobt of AG ag, keeping
-// the leaf records sorted by ir_startino. The inobt root passed in must be a
-// single leaf root (depth 1). When the leaf still has room the record is
-// inserted in place; when it is full the leaf is split in two and a fresh
-// internal root (level 1) is written above them, promoting the tree to depth 2.
-// On a split, agiBuf's root/level fields are updated in place so the caller
-// persists them with its subsequent AGI write.
-func inobtInsertChunkRecord(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, agiBuf []byte, leafRel, startIno uint32) error {
+// records sorted by ir_startino. It mirrors xfsprogs' xfs_inobt_insert →
+// xfs_btree_insrec → xfs_btree_split: the tree is descended from the root, the
+// record is inserted into the target leaf, and when a block fills it is split
+// and the new separator key/ptr propagated up. If the root itself splits, a
+// fresh root one level higher is written and the AGI root/level fields are
+// updated in place (so the caller persists them with its AGI write). This grows
+// the tree depth-1→2, depth-2→3, … on demand.
+func inobtInsertChunkRecord(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, agiBuf []byte, rootRel uint32, rootLevel, startIno uint32) error {
 	be := binary.BigEndian
-	hdrSize := sb.agBTreeHdrSize()
-
-	leaf, err := allocReadAGBlock(rw, partOff, sb, ag, leafRel)
-	if err != nil {
-		return err
-	}
-	numrecs := int(be.Uint16(leaf[6:]))
-	maxRecs := (len(leaf) - hdrSize) / inobtRecSize
-
-	// Find the insertion position (sorted by startIno) and reject duplicates.
-	insertAt := numrecs
-	for i := 0; i < numrecs; i++ {
-		off := hdrSize + i*inobtRecSize
-		existingStart := be.Uint32(leaf[off:])
-		if startIno < existingStart {
-			insertAt = i
-			break
-		}
-		if startIno == existingStart {
-			return fmt.Errorf("growInobt: inobt already has a record at startIno %d", startIno)
-		}
-	}
 
 	// Build the new record once: startIno, freecount=64, ir_free=all-free.
 	var rec [inobtRecSize]byte
@@ -1085,112 +1105,282 @@ func inobtInsertChunkRecord(rw readerWriterAt, partOff int64, sb *superblock, ag
 	be.PutUint32(rec[4:], inobtChunkInodes)
 	be.PutUint64(rec[8:], 0xFFFFFFFFFFFFFFFF)
 
-	if numrecs < maxRecs {
-		// Room in the leaf: shift records right and drop the new one in place.
-		insertOff := hdrSize + insertAt*inobtRecSize
-		copy(leaf[insertOff+inobtRecSize:], leaf[insertOff:hdrSize+numrecs*inobtRecSize])
-		copy(leaf[insertOff:], rec[:])
-		be.PutUint16(leaf[6:], uint16(numrecs+1))
-		return allocWriteAGBTree(rw, partOff, sb, ag, leafRel, leaf)
+	res, err := inobtInsertInto(rw, partOff, sb, ag, rootRel, startIno, rec[:])
+	if err != nil {
+		return err
+	}
+	if !res.split {
+		return nil
 	}
 
-	// Leaf is full → split. Only a single-leaf-root tree (depth 1) can be split
-	// here; inserting into a tree that is already deeper is not implemented.
-	if lvl := int(be.Uint32(agiBuf[agiOffLevel:])); lvl != 1 {
-		return fmt.Errorf("growInobt: inobt leaf full at level %d; deep-tree insert not implemented", lvl)
+	// The root split. Allocate a fresh root one level higher that points at the
+	// old root (now the left child) and its new right sibling, then repoint the
+	// AGI. This is the only place tree depth grows.
+	newRootAbs, err := allocAllocBlocks(rw, partOff, sb, ag, 1)
+	if err != nil {
+		return fmt.Errorf("growInobt split: alloc root: %w", err)
 	}
-	return inobtSplitRootLeaf(rw, partOff, sb, ag, agiBuf, leafRel, leaf, insertAt, rec[:])
+	newRootRel := uint32(newRootAbs % uint64(sb.agBlocks))
+
+	hdrSize := sb.agBTreeHdrSize()
+	// Re-read the old root for two things: its on-disk block-level (the new root
+	// sits exactly one above it — note this "level" field is the leaf-relative
+	// height, 0 for leaves, distinct from the AGI's 1-based depth) and its first
+	// key, which is the smallest key reachable through the whole left subtree.
+	oldRoot, err := allocReadAGBlock(rw, partOff, sb, ag, rootRel)
+	if err != nil {
+		return err
+	}
+	oldBlockLevel := int(be.Uint16(oldRoot[4:]))
+	root := newInobtBlock(sb, ag, newRootRel, oldBlockLevel+1, 2)
+	leftKey := be.Uint32(oldRoot[hdrSize:])
+	be.PutUint32(root[hdrSize+0*inobtKeySize:], leftKey)
+	be.PutUint32(root[hdrSize+1*inobtKeySize:], res.rightKey)
+	maxInternal := inobtMaxInternal(len(root), hdrSize)
+	ptrBase := hdrSize + maxInternal*inobtKeySize
+	be.PutUint32(root[ptrBase+0*inobtPtrSize:], rootRel)
+	be.PutUint32(root[ptrBase+1*inobtPtrSize:], res.rightRel)
+	if err := allocWriteAGBTree(rw, partOff, sb, ag, newRootRel, root); err != nil {
+		return err
+	}
+
+	be.PutUint32(agiBuf[agiOffRoot:], newRootRel)
+	be.PutUint32(agiBuf[agiOffLevel:], rootLevel+1)
+	return nil
 }
 
-// inobtSplitRootLeaf splits the full single-leaf-root inobt of AG ag in two and
-// writes a fresh internal root above the two halves, promoting the tree to
-// depth 2. The record set is the existing leaf records with the new record rec
-// inserted at index insertAt; it is partitioned so the left half (lower
-// ir_startino values) stays in the original root block (reused as the left
-// leaf) and the upper half moves to a newly-allocated right leaf. A third new
-// block becomes the internal root. agiBuf is updated in place with the new root
-// block number and level (=2).
-func inobtSplitRootLeaf(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, agiBuf []byte, leafRel uint32, leaf []byte, insertAt int, rec []byte) error {
+// inobtInsertInto recursively inserts rec (keyed by startIno) into the inobt
+// subtree rooted at selfRel and returns whether selfRel split. On a leaf it
+// inserts the record; on an interior node it descends into the correct child,
+// then absorbs (or splits to propagate) the child's separator key/ptr. The
+// short-form inobt packs all keys first, then all pointers, at the block's
+// maxrecs boundary, so node updates must preserve that layout.
+func inobtInsertInto(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, selfRel, startIno uint32, rec []byte) (inobtSplit, error) {
+	be := binary.BigEndian
+	hdrSize := sb.agBTreeHdrSize()
+
+	blk, err := allocReadAGBlock(rw, partOff, sb, ag, selfRel)
+	if err != nil {
+		return inobtSplit{}, err
+	}
+	lvl := int(be.Uint16(blk[4:]))
+	numrecs := int(be.Uint16(blk[6:]))
+
+	if lvl == 0 {
+		// Leaf: find the sorted insertion slot, rejecting duplicates.
+		maxRecs := (len(blk) - hdrSize) / inobtRecSize
+		insertAt := numrecs
+		for i := 0; i < numrecs; i++ {
+			existingStart := be.Uint32(blk[hdrSize+i*inobtRecSize:])
+			if startIno < existingStart {
+				insertAt = i
+				break
+			}
+			if startIno == existingStart {
+				return inobtSplit{}, fmt.Errorf("growInobt: inobt already has a record at startIno %d", startIno)
+			}
+		}
+		if numrecs < maxRecs {
+			insertOff := hdrSize + insertAt*inobtRecSize
+			copy(blk[insertOff+inobtRecSize:], blk[insertOff:hdrSize+numrecs*inobtRecSize])
+			copy(blk[insertOff:], rec)
+			be.PutUint16(blk[6:], uint16(numrecs+1))
+			return inobtSplit{}, allocWriteAGBTree(rw, partOff, sb, ag, selfRel, blk)
+		}
+		return inobtSplitLeaf(rw, partOff, sb, ag, selfRel, blk, insertAt, rec)
+	}
+
+	// Interior node: choose the child whose key range covers startIno (the last
+	// child with key <= startIno), descend, then handle any propagated split.
+	child := 0
+	for i := 0; i < numrecs; i++ {
+		k := be.Uint32(blk[hdrSize+i*inobtKeySize:])
+		if startIno >= k {
+			child = i
+		} else {
+			break
+		}
+	}
+	maxInternal := inobtMaxInternal(len(blk), hdrSize)
+	ptrBase := hdrSize + maxInternal*inobtKeySize
+	childRel := be.Uint32(blk[ptrBase+child*inobtPtrSize:])
+
+	res, err := inobtInsertInto(rw, partOff, sb, ag, childRel, startIno, rec)
+	if err != nil {
+		return inobtSplit{}, err
+	}
+	if !res.split {
+		return inobtSplit{}, nil
+	}
+
+	// Child split: insert the new (rightKey → rightRel) separator just after the
+	// pointer we followed (index child+1). Re-read in case the descent rewrote
+	// this very block (it can't — a child lives in a different block — but the
+	// child write is already durable; this block is untouched in memory).
+	insertAt := child + 1
+	if numrecs < maxInternal {
+		// Shift keys right from insertAt.
+		copy(blk[hdrSize+(insertAt+1)*inobtKeySize:], blk[hdrSize+insertAt*inobtKeySize:hdrSize+numrecs*inobtKeySize])
+		be.PutUint32(blk[hdrSize+insertAt*inobtKeySize:], res.rightKey)
+		// Shift pointers right from insertAt.
+		copy(blk[ptrBase+(insertAt+1)*inobtPtrSize:], blk[ptrBase+insertAt*inobtPtrSize:ptrBase+numrecs*inobtPtrSize])
+		be.PutUint32(blk[ptrBase+insertAt*inobtPtrSize:], res.rightRel)
+		be.PutUint16(blk[6:], uint16(numrecs+1))
+		return inobtSplit{}, allocWriteAGBTree(rw, partOff, sb, ag, selfRel, blk)
+	}
+	return inobtSplitNode(rw, partOff, sb, ag, selfRel, blk, insertAt, res.rightKey, res.rightRel)
+}
+
+// inobtSplitLeaf splits a full leaf selfRel in two. The full sorted record set
+// is the existing leaf records with rec inserted at insertAt; the lower half
+// stays in selfRel and the upper half moves to a newly-allocated right sibling,
+// with the leaf sibling chain re-stitched. Returns the right sibling's first
+// key so the parent can insert the separator.
+func inobtSplitLeaf(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, selfRel uint32, leaf []byte, insertAt int, rec []byte) (inobtSplit, error) {
 	be := binary.BigEndian
 	hdrSize := sb.agBTreeHdrSize()
 	numrecs := int(be.Uint16(leaf[6:]))
 
 	// Materialise the full, sorted record set (existing + new).
 	total := numrecs + 1
-	recs := make([][]byte, 0, total)
+	recs := make([][]byte, total)
 	for i := 0; i < numrecs; i++ {
-		off := hdrSize + i*inobtRecSize
 		r := make([]byte, inobtRecSize)
-		copy(r, leaf[off:off+inobtRecSize])
-		recs = append(recs, r)
+		copy(r, leaf[hdrSize+i*inobtRecSize:])
+		recs[i] = r
 	}
 	nr := make([]byte, inobtRecSize)
 	copy(nr, rec)
-	recs = append(recs, nil)
 	copy(recs[insertAt+1:], recs[insertAt:])
 	recs[insertAt] = nr
 
 	half := total / 2 // left keeps the lower half, right gets the upper half
 
-	// Allocate the right-leaf block and the new internal root block. They come
-	// from the AG free-space trees like the inode chunk's data blocks, so
-	// syncSuperblockCounts (AGF freeblks) keeps fdblocks accurate.
 	rightAbs, err := allocAllocBlocks(rw, partOff, sb, ag, 1)
 	if err != nil {
-		return fmt.Errorf("growInobt split: alloc right leaf: %w", err)
-	}
-	rootAbs, err := allocAllocBlocks(rw, partOff, sb, ag, 1)
-	if err != nil {
-		return fmt.Errorf("growInobt split: alloc root: %w", err)
+		return inobtSplit{}, fmt.Errorf("growInobt split: alloc right leaf: %w", err)
 	}
 	rightRel := uint32(rightAbs % uint64(sb.agBlocks))
-	rootRel := uint32(rootAbs % uint64(sb.agBlocks))
 
-	// Left leaf reuses the original root block: leftsib=none, rightsib=right.
+	oldRight := be.Uint32(leaf[12:]) // selfRel's current right sibling
+
+	// Left half stays in selfRel; rightsib now points at the new block.
 	left := leaf
-	be.PutUint32(left[8:], 0xFFFFFFFF)
 	be.PutUint32(left[12:], rightRel)
 	be.PutUint16(left[6:], uint16(half))
 	for i := 0; i < half; i++ {
 		copy(left[hdrSize+i*inobtRecSize:], recs[i])
 	}
-	// Clear any stale trailing record bytes left over from before the split.
 	for i := half; i < numrecs; i++ {
 		clear(left[hdrSize+i*inobtRecSize : hdrSize+(i+1)*inobtRecSize])
 	}
-	if err := allocWriteAGBTree(rw, partOff, sb, ag, leafRel, left); err != nil {
-		return err
+	if err := allocWriteAGBTree(rw, partOff, sb, ag, selfRel, left); err != nil {
+		return inobtSplit{}, err
 	}
 
-	// Right leaf: a fresh level-0 inobt block holding the upper half.
+	// Right half: a fresh level-0 block spliced between selfRel and oldRight.
 	right := newInobtBlock(sb, ag, rightRel, 0, total-half)
-	be.PutUint32(right[8:], leafRel)
-	be.PutUint32(right[12:], 0xFFFFFFFF)
+	be.PutUint32(right[8:], selfRel)
+	be.PutUint32(right[12:], oldRight)
 	for i := half; i < total; i++ {
 		copy(right[hdrSize+(i-half)*inobtRecSize:], recs[i])
 	}
 	if err := allocWriteAGBTree(rw, partOff, sb, ag, rightRel, right); err != nil {
-		return err
+		return inobtSplit{}, err
 	}
 
-	// Internal root: level 1 with two key/ptr pairs. The inobt is a short-form
-	// B-tree, so all keys (4 bytes each) are packed first, then all block
-	// pointers (4 bytes each), at the maxrecs boundary for an internal node.
-	root := newInobtBlock(sb, ag, rootRel, 1, 2)
-	be.PutUint32(root[hdrSize+0*inobtKeySize:], be.Uint32(recs[0][0:]))
-	be.PutUint32(root[hdrSize+1*inobtKeySize:], be.Uint32(recs[half][0:]))
-	maxInternal := (len(root) - hdrSize) / (inobtKeySize + inobtPtrSize)
+	// Fix the old right sibling's leftsib to point at the new block.
+	if oldRight != 0xFFFFFFFF {
+		sib, err := allocReadAGBlock(rw, partOff, sb, ag, oldRight)
+		if err != nil {
+			return inobtSplit{}, err
+		}
+		be.PutUint32(sib[8:], rightRel)
+		if err := allocWriteAGBTree(rw, partOff, sb, ag, oldRight, sib); err != nil {
+			return inobtSplit{}, err
+		}
+	}
+
+	return inobtSplit{split: true, rightKey: be.Uint32(recs[half][0:]), rightRel: rightRel}, nil
+}
+
+// inobtSplitNode splits a full interior node selfRel in two. The full key/ptr
+// set is the node's existing separators with (newKey → newPtr) inserted at
+// insertAt; the lower half stays in selfRel and the upper half moves to a
+// newly-allocated right sibling. Returns the right sibling's first key so the
+// parent can insert the separator.
+func inobtSplitNode(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, selfRel uint32, node []byte, insertAt int, newKey, newPtr uint32) (inobtSplit, error) {
+	be := binary.BigEndian
+	hdrSize := sb.agBTreeHdrSize()
+	numrecs := int(be.Uint16(node[6:]))
+	maxInternal := inobtMaxInternal(len(node), hdrSize)
 	ptrBase := hdrSize + maxInternal*inobtKeySize
-	be.PutUint32(root[ptrBase+0*inobtPtrSize:], leafRel)
-	be.PutUint32(root[ptrBase+1*inobtPtrSize:], rightRel)
-	if err := allocWriteAGBTree(rw, partOff, sb, ag, rootRel, root); err != nil {
-		return err
+
+	// Materialise the full, sorted key/ptr set (existing + new separator).
+	total := numrecs + 1
+	keys := make([]uint32, total)
+	ptrs := make([]uint32, total)
+	for i := 0; i < numrecs; i++ {
+		keys[i] = be.Uint32(node[hdrSize+i*inobtKeySize:])
+		ptrs[i] = be.Uint32(node[ptrBase+i*inobtPtrSize:])
+	}
+	copy(keys[insertAt+1:], keys[insertAt:])
+	copy(ptrs[insertAt+1:], ptrs[insertAt:])
+	keys[insertAt] = newKey
+	ptrs[insertAt] = newPtr
+
+	half := total / 2 // left keeps the lower half, right gets the upper half
+
+	rightAbs, err := allocAllocBlocks(rw, partOff, sb, ag, 1)
+	if err != nil {
+		return inobtSplit{}, fmt.Errorf("growInobt split: alloc right node: %w", err)
+	}
+	rightRel := uint32(rightAbs % uint64(sb.agBlocks))
+
+	oldRight := be.Uint32(node[12:])
+
+	// Left half stays in selfRel. Rewrite its keys/ptrs compactly and clear the
+	// stale tail so xfs_repair doesn't see leftover separators.
+	left := node
+	be.PutUint32(left[12:], rightRel)
+	be.PutUint16(left[6:], uint16(half))
+	for i := 0; i < half; i++ {
+		be.PutUint32(left[hdrSize+i*inobtKeySize:], keys[i])
+		be.PutUint32(left[ptrBase+i*inobtPtrSize:], ptrs[i])
+	}
+	for i := half; i < numrecs; i++ {
+		be.PutUint32(left[hdrSize+i*inobtKeySize:], 0)
+		be.PutUint32(left[ptrBase+i*inobtPtrSize:], 0)
+	}
+	if err := allocWriteAGBTree(rw, partOff, sb, ag, selfRel, left); err != nil {
+		return inobtSplit{}, err
 	}
 
-	// Point the AGI at the new internal root and bump the depth to 2.
-	be.PutUint32(agiBuf[agiOffRoot:], rootRel)
-	be.PutUint32(agiBuf[agiOffLevel:], 2)
-	return nil
+	// Right half: a fresh interior block at the same level, spliced into the
+	// sibling chain.
+	right := newInobtBlock(sb, ag, rightRel, int(be.Uint16(node[4:])), total-half)
+	be.PutUint32(right[8:], selfRel)
+	be.PutUint32(right[12:], oldRight)
+	for i := half; i < total; i++ {
+		be.PutUint32(right[hdrSize+(i-half)*inobtKeySize:], keys[i])
+		be.PutUint32(right[ptrBase+(i-half)*inobtPtrSize:], ptrs[i])
+	}
+	if err := allocWriteAGBTree(rw, partOff, sb, ag, rightRel, right); err != nil {
+		return inobtSplit{}, err
+	}
+
+	if oldRight != 0xFFFFFFFF {
+		sib, err := allocReadAGBlock(rw, partOff, sb, ag, oldRight)
+		if err != nil {
+			return inobtSplit{}, err
+		}
+		be.PutUint32(sib[8:], rightRel)
+		if err := allocWriteAGBTree(rw, partOff, sb, ag, oldRight, sib); err != nil {
+			return inobtSplit{}, err
+		}
+	}
+
+	return inobtSplit{split: true, rightKey: keys[half], rightRel: rightRel}, nil
 }
 
 // newInobtBlock returns a zeroed v5 inobt B-tree block (magic IAB3) with its
