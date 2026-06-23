@@ -37,6 +37,9 @@ var inobtDeepGz []byte
 //go:embed testdata/alloc-multilevel.img.gz
 var allocMultiLevelGz []byte
 
+//go:embed testdata/alloc-collapse.img.gz
+var allocCollapseGz []byte
+
 //go:embed testdata/node-multilevel.img.gz
 var nodeMultiLevelGz []byte
 
@@ -313,6 +316,79 @@ func TestAllocMultiLevelFixture(t *testing.T) {
 		t.Fatalf("largest free extent (count=%d) is at cnt index %d, not rightmost %d — allocator would miss it", maxCount, maxAt, len(cntRecs)-1)
 	}
 	t.Logf("alloc-multilevel: bno level=%d cnt level=%d, %d free extents in each tree, largest=%d (rightmost)", bnoLevel, cntLevel, len(bnoRecs), maxCount)
+
+	runXfsRepairClean(t, img)
+}
+
+// TestAllocCollapseFixture opens the committed alloc-collapse image: AG 0's
+// free-space bno tree was first grown MULTI-LEVEL (depth 2), then driven through
+// the full B+tree DELETE path (whole-extent consumes → record delete in both
+// trees → underfull-leaf rebalance/merge → ROOT COLLAPSE) until the bno tree
+// shrank a level (depth 2 → 1) — the boundary alloc_btree_delete.go lifts. It
+// confirms the 16 real files still read, that the bno tree is now SHALLOWER than
+// the cnt tree (the collapse landed), that both trees still hold the same free-
+// extent set (bno/cnt stayed in sync across the merges), and defers to xfs_repair
+// + the in-VM kernel mount (validated when this fixture was generated) as the
+// canonical oracle. A botched merge / collapse / sibling re-stitch would surface
+// here as a wrong record count, a looping pointer, or an xfs_repair complaint.
+func TestAllocCollapseFixture(t *testing.T) {
+	img := gunzipToTemp(t, allocCollapseGz, "alloc-collapse.img")
+
+	fsIfc, err := Open(img, -1)
+	if err != nil {
+		t.Fatalf("Open alloc-collapse fixture: %v", err)
+	}
+	fs := fsIfc.(*xfsFS)
+	defer fs.Close()
+
+	entries, err := fs.ListDir("/")
+	if err != nil {
+		t.Fatalf("ListDir(/): %v", err)
+	}
+	if len(entries) != 16 {
+		t.Fatalf("ListDir(/) = %d entries, want 16", len(entries))
+	}
+	for _, e := range entries {
+		if _, err := fs.ReadFile("/" + e.Name()); err != nil {
+			t.Fatalf("ReadFile %s: %v", e.Name(), err)
+		}
+	}
+
+	agf, err := agfBlock(fs.f, fs.partOffset, fs.sb, 0)
+	if err != nil {
+		t.Fatalf("read AGF: %v", err)
+	}
+	bnoRoot := readBE32(agf[agfOffBnoRoot:])
+	bnoLevel := int(readBE32(agf[agfOffBnoLevel:]))
+	cntRoot := readBE32(agf[agfOffCntRoot:])
+	cntLevel := int(readBE32(agf[agfOffCntLevel:]))
+
+	// The merge + root collapse drove the bno tree a level SHALLOWER than the cnt
+	// tree (which was not collapsed by this fixture's deletes).
+	if bnoLevel >= cntLevel {
+		t.Fatalf("bno tree did not collapse below cnt: bno=%d cnt=%d (want bno<cnt)", bnoLevel, cntLevel)
+	}
+	if bnoLevel != 1 {
+		t.Fatalf("bno tree level after collapse = %d, want 1 (depth 2 -> 1)", bnoLevel)
+	}
+
+	// Both trees must still hold the SAME free-extent set — the deletes/merges kept
+	// bno and cnt in sync. (bno is strictly ordered; cnt is validated per-leaf.)
+	bnoRecs := walkAllocTree(t, fs, bnoRoot, true, true)
+	cntRecs := walkAllocTree(t, fs, cntRoot, false, false)
+	if len(bnoRecs) != len(cntRecs) {
+		t.Fatalf("bno and cnt hold different record counts after collapse: %d vs %d", len(bnoRecs), len(cntRecs))
+	}
+	bnoSet := map[[2]uint32]bool{}
+	for _, r := range bnoRecs {
+		bnoSet[r] = true
+	}
+	for _, r := range cntRecs {
+		if !bnoSet[r] {
+			t.Fatalf("cnt extent %v absent from bno tree (trees desynced across merges)", r)
+		}
+	}
+	t.Logf("alloc-collapse: bno level=%d (collapsed) cnt level=%d, %d free extents in sync", bnoLevel, cntLevel, len(bnoRecs))
 
 	runXfsRepairClean(t, img)
 }

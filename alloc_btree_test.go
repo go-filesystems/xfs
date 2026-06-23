@@ -53,7 +53,9 @@ func fullAllocLeaf(sb *superblock, self, lsib, rsib uint32, n int, startBase, st
 // allocMockAGF installs a minimal AGF in rw so the root-growth path's AGF
 // read/modify/write succeeds, and returns the buffer for inspection.
 func allocMockAGF(rw *memRW, sb *superblock, bnoRoot, cntRoot, bnoLevel, cntLevel uint32) {
-	agf := makeAGFBuffer(sb, 0, bnoRoot, cntRoot, bnoLevel, cntLevel, 0, 0)
+	// longest=8 (>=2) so the delete path's fragmentation gate does not suppress
+	// merges in these structural tests (which mock the merged-block free hook).
+	agf := makeAGFBuffer(sb, 0, bnoRoot, cntRoot, bnoLevel, cntLevel, 0, 8)
 	putAGF(rw, 0, sb, 0, agf)
 }
 

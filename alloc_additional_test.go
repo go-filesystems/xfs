@@ -163,6 +163,8 @@ func restoreAllocHooks(t *testing.T) {
 	oldCntFindBlock := allocCntFindBlock
 	oldBtreeDeleteRecord := allocBtreeDeleteRecord
 	oldBnoDeleteRecord := allocBnoDeleteRecord
+	oldCntDeleteRecord := allocCntDeleteRecord
+	oldDeleteFreeBlocks := allocDeleteFreeBlocks
 	oldBnoUpdateRecord := allocBnoUpdateRecord
 	oldBnoFindRecord := allocBnoFindRecord
 	oldBnoInsertRecord := allocBnoInsertRecord
@@ -195,6 +197,8 @@ func restoreAllocHooks(t *testing.T) {
 		allocCntFindBlock = oldCntFindBlock
 		allocBtreeDeleteRecord = oldBtreeDeleteRecord
 		allocBnoDeleteRecord = oldBnoDeleteRecord
+		allocCntDeleteRecord = oldCntDeleteRecord
+		allocDeleteFreeBlocks = oldDeleteFreeBlocks
 		allocBnoUpdateRecord = oldBnoUpdateRecord
 		allocBnoFindRecord = oldBnoFindRecord
 		allocBnoInsertRecord = oldBnoInsertRecord
@@ -448,26 +452,46 @@ func TestBtreeAndBnoHelpersAdditional(t *testing.T) {
 			t.Fatalf("expected bnoFindRecord read error %v, got %v", errBoom, err)
 		}
 
+		// bnoDeleteRecord now descends the tree itself (allocDeleteRecord) rather
+		// than delegating to a find/delete hook pair. A read error from the very
+		// first block read (the root) propagates.
 		restoreAllocHooks(t)
-		allocBnoFindRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32) (uint32, []byte, int, error) {
-			return 0, nil, 0, errBoom
+		allocReadAGBlock = func(_ io.ReaderAt, _ int64, _ *superblock, _ uint32, _ uint32) ([]byte, error) {
+			return nil, errBoom
 		}
 		if err := bnoDeleteRecord(newMemRW(0), 0, sb, 0, 2, 0, 10); !errors.Is(err, errBoom) {
-			t.Fatalf("expected bnoDeleteRecord error %v, got %v", errBoom, err)
+			t.Fatalf("expected bnoDeleteRecord root-read error %v, got %v", errBoom, err)
 		}
-		calledDelete := false
-		allocBnoFindRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32) (uint32, []byte, int, error) {
-			return 5, makeAllocLeaf(sb, 0xFFFFFFFF, allocRec{start: 10, count: 1}), 0, nil
+
+		// A single-leaf-root bno tree: deleting its only record over the threshold
+		// leaves an empty root (roots are minrecs-exempt), and the AGF root/level
+		// stay put. Drives allocDeleteRecord's leaf-find + remove + no-rebalance
+		// (root) + AGF-untouched path through bnoDeleteRecord.
+		restoreAllocHooks(t)
+		allocReadAGBlock = readAGBlock
+		rwDel := newAllocRW(sb)
+		putAGF(rwDel, 0, sb, 0, makeAGFBuffer(sb, 0, 2, 3, 1, 1, 100, 50))
+		putFSBlock(rwDel, 0, sb, 0, 2, makeAllocLeaf(sb, 0xFFFFFFFF, allocRec{start: 10, count: 1}))
+		// Write the leaf magic so readAGBlock-derived numrecs/level are sane.
+		if err := bnoDeleteRecord(rwDel, 0, sb, 0, 2, 1, 10); err != nil {
+			t.Fatalf("bnoDeleteRecord single-leaf: %v", err)
 		}
-		allocBtreeDeleteRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, int, uint32, []byte, int, bool) error {
-			calledDelete = true
-			return nil
+		leafAfter, err := readAGBlock(rwDel, 0, sb, 0, 2)
+		if err != nil {
+			t.Fatalf("re-read leaf: %v", err)
 		}
-		if err := bnoDeleteRecord(newMemRW(0), 0, sb, 0, 2, 0, 10); err != nil {
-			t.Fatalf("bnoDeleteRecord: %v", err)
+		if got := binary.BigEndian.Uint16(leafAfter[6:]); got != 0 {
+			t.Fatalf("expected emptied root leaf numrecs 0, got %d", got)
 		}
-		if !calledDelete {
-			t.Fatal("expected bnoDeleteRecord to delegate to btreeDeleteRecord")
+
+		// A target start that is absent from the leaf is reported as not-found.
+		restoreAllocHooks(t)
+		allocReadAGBlock = readAGBlock
+		rwMiss := newAllocRW(sb)
+		putAGF(rwMiss, 0, sb, 0, makeAGFBuffer(sb, 0, 2, 3, 1, 1, 100, 50))
+		putFSBlock(rwMiss, 0, sb, 0, 2, makeAllocLeaf(sb, 0xFFFFFFFF, allocRec{start: 10, count: 1}))
+		if err := bnoDeleteRecord(rwMiss, 0, sb, 0, 2, 1, 999); err == nil {
+			t.Fatal("expected bnoDeleteRecord to fail on an absent startblock")
 		}
 	})
 
