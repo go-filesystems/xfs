@@ -467,6 +467,14 @@ func allocInsertWithReserve(rw readerWriterAt, partOff int64, sb *superblock, ag
 	if allocReserveDepth > 0 {
 		return insertFn()
 	}
+	// During a merged-free drain, do NOT install a reserve: the drain has already
+	// redirected allocMetaAllocBlock to hand out blocks from the merged-free queue
+	// (free metadata blocks), so a split a drained free triggers takes a queued
+	// block and never carves from the free-space trees — which a reserve's
+	// allocBlocks would do, re-entering the trees mid-rewrite (the deepest sub-case).
+	if allocDraining {
+		return insertFn()
+	}
 	reserve, rerr := allocReserveSplitBlocks(rw, partOff, sb, ag, level+1)
 	if rerr == nil {
 		prevHook := allocMetaAllocBlock
@@ -498,7 +506,13 @@ var allocReserveDepth int
 // free-space-tree insert allocInsertRecord redirects it to a pre-allocated
 // reserve (allocSplitReserve) so a split never allocates by reading a tree that
 // is mid-rewrite. Tests override the hook to hand out deterministic blocks.
-var allocMetaAllocBlock = allocMetaBlock
+//
+// Bound in init() rather than as a package-var initializer so it does not pull
+// allocMetaBlock (→ allocBlocks → allocDrainMergedFrees → this var) into a var-
+// init dependency cycle; allocDrainMergedFrees reassigns this hook while draining.
+var allocMetaAllocBlock func(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, nBlocks uint32) (uint64, error)
+
+func init() { allocMetaAllocBlock = allocMetaBlock }
 
 // allocMetaBlock carves a single block for a btree node from allocation group
 // ag's free space via allocBlocks. It is the default allocMetaAllocBlock hook,

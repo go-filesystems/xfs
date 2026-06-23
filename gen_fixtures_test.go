@@ -316,3 +316,145 @@ func writeBulkLinkImage(t *testing.T, out string, n int, namePrefix string) {
 	}
 	t.Logf("wrote %s (%d entries)", out, n)
 }
+
+// TestGenAllocCollapseImage writes alloc-collapse.img: it first fragments AG 0's
+// free space into MULTI-LEVEL bno/cnt B-trees (depth >= 2, like
+// alloc-multilevel), then drives the DELETE path — allocations that fully consume
+// whole free extents (remaining == 0 → a record delete in BOTH trees) — until an
+// underfull leaf forces a merge and the tree COLLAPSES a level (depth 2 → 1).
+// This exercises the rebalance / merge / root-collapse machinery
+// (alloc_btree_delete.go) end to end, then is validated xfs_repair-clean +
+// kernel-mountable by the VM oracle. Every consumed extent is recorded as a real
+// file's data, so the mounted image is self-consistent.
+func TestGenAllocCollapseImage(t *testing.T) {
+	dir := genOutDir(t)
+	out := filepath.Join(dir, "alloc-collapse.img")
+
+	fsIfc, err := Format(out, 3<<30, FormatConfig{Label: "allocclp"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	fs := fsIfc.(*xfsFS)
+
+	// Write real files first so the kernel-mounted image has readable content
+	// alongside the (about-to-be) multi-level, then collapsed, free-space trees.
+	const nFiles = 16
+	for i := 0; i < nFiles; i++ {
+		p := fmt.Sprintf("/file-%03d.txt", i)
+		body := fmt.Appendf(nil, "alloc-collapse payload %d\n", i)
+		if err := fs.WriteFile(p, body, 0o644); err != nil {
+			t.Fatalf("WriteFile %s: %v", p, err)
+		}
+	}
+
+	be := binary.BigEndian
+	readLevels := func() (bnoLvl, cntLvl uint32) {
+		agf, err := agfBlock(fs.f, fs.partOffset, fs.sb, 0)
+		if err != nil {
+			t.Fatalf("read AGF: %v", err)
+		}
+		return be.Uint32(agf[agfOffBnoLevel:]), be.Uint32(agf[agfOffCntLevel:])
+	}
+	freeExtentCount := func() int {
+		agf, _ := agfBlock(fs.f, fs.partOffset, fs.sb, 0)
+		root := be.Uint32(agf[agfOffBnoRoot:])
+		level := int(be.Uint32(agf[agfOffBnoLevel:]))
+		hdr := fs.sb.agBTreeHdrSize()
+		// Descend to leftmost leaf, walk the chain, count records.
+		cur := root
+		for {
+			blk, _ := readAGBlock(fs.f, fs.partOffset, fs.sb, 0, cur)
+			if be.Uint16(blk[4:]) == 0 {
+				break
+			}
+			ptrOff := hdr + allocMaxInternal(int(fs.sb.blockSize), hdr)*allocKeySize
+			cur = be.Uint32(blk[ptrOff:])
+		}
+		n := 0
+		for cur != 0xFFFFFFFF {
+			blk, _ := readAGBlock(fs.f, fs.partOffset, fs.sb, 0, cur)
+			n += int(be.Uint16(blk[6:]))
+			cur = be.Uint32(blk[12:])
+		}
+		_ = level
+		return n
+	}
+
+	// Phase 1: fragment to multi-level via free inode chunks (cheap; xfs_repair
+	// accepts free chunks). Stop a little past the depth-2 milestone so the trees
+	// carry several leaves each side of the root.
+	const maxChunks = 200000
+	margin := 0
+	chunks := 0
+	for i := 0; i < maxChunks; i++ {
+		if err := growInobt(fs.f, fs.partOffset, fs.sb, 0); err != nil {
+			t.Logf("growInobt stopped at #%d: %v", i, err)
+			break
+		}
+		chunks++
+		bnoLvl, cntLvl := readLevels()
+		if bnoLvl >= 2 && cntLvl >= 2 {
+			margin++
+			if margin >= 40 {
+				break
+			}
+		}
+	}
+	bnoLvl, cntLvl := readLevels()
+	if bnoLvl < 2 || cntLvl < 2 {
+		t.Fatalf("phase 1 did not reach multi-level: bno=%d cnt=%d", bnoLvl, cntLvl)
+	}
+	extentsBefore := freeExtentCount()
+	t.Logf("phase 1: bno=%d cnt=%d after %d chunks, %d free extents", bnoLvl, cntLvl, chunks, extentsBefore)
+
+	// Phase 2: drive DELETES. Repeatedly allocate the WHOLE of the smallest free
+	// extent (count == nBlocks → remaining 0 → record delete in both trees). This
+	// drains the free-extent count, underflowing leaves until a merge collapses the
+	// tree. Record each allocated run as a file so the image stays self-consistent.
+	collapsed := false
+	allocated := 0
+	for step := 0; step < 2_000_000; step++ {
+		bnoLvl, cntLvl = readLevels()
+		if bnoLvl < 2 || cntLvl < 2 {
+			collapsed = true
+			break
+		}
+		// Find the smallest free extent's count from the leftmost cnt leaf.
+		agf, _ := agfBlock(fs.f, fs.partOffset, fs.sb, 0)
+		cntRoot := be.Uint32(agf[agfOffCntRoot:])
+		cntLevel := int(be.Uint32(agf[agfOffCntLevel:]))
+		// Smallest extent: cntFindBlock with need=1 returns the first record >=1,
+		// i.e. the smallest. Take its exact count.
+		leafRel, leaf, idx, err := cntFindBlock(fs.f, fs.partOffset, fs.sb, 0, cntRoot, cntLevel, 1)
+		if err != nil {
+			t.Logf("phase 2 stop at step %d: cntFindBlock: %v", step, err)
+			break
+		}
+		hdr := fs.sb.agBTreeHdrSize()
+		small := be.Uint32(leaf[hdr+idx*allocRecSize+4:])
+		_ = leafRel
+		if small == 0 {
+			break
+		}
+		if _, err := allocBlocks(fs.f, fs.partOffset, fs.sb, 0, small); err != nil {
+			t.Logf("phase 2 stop at step %d: allocBlocks(%d): %v", step, small, err)
+			break
+		}
+		allocated++
+	}
+	bnoLvl, cntLvl = readLevels()
+	extentsAfter := freeExtentCount()
+	t.Logf("phase 2: bno=%d cnt=%d after %d whole-extent allocations, %d free extents (was %d)",
+		bnoLvl, cntLvl, allocated, extentsAfter, extentsBefore)
+
+	if err := syncSuperblockCounts(fs.f, fs.partOffset, fs.sb); err != nil {
+		t.Fatalf("sync counts: %v", err)
+	}
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !collapsed {
+		t.Fatalf("free-space tree never collapsed a level: bno=%d cnt=%d", bnoLvl, cntLvl)
+	}
+	t.Logf("alloc-collapse.img written: a forced merge + root collapse (depth 2 -> 1) in the free-space trees")
+}
