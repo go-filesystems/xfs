@@ -527,36 +527,44 @@ func TestDirectoryWriteHelpersAdditional(t *testing.T) {
 	})
 
 	t.Run("convertSFToBlock downstream errors", func(t *testing.T) {
-		oldAlloc := writeAllocBlocks
-		oldData := writeWriteBlocksData
-		oldList := writeWriteExtentList
-		oldWrite := writeWriteInode
-		writeAllocBlocks = func(readerWriterAt, int64, *superblock, uint32, uint32) (uint64, error) { return 3, nil }
-		writeWriteBlocksData = func(io.WriterAt, int64, *superblock, uint64, uint32, []byte) error { return errBoom }
-		writeWriteExtentList = func(*inode, []extent) error { return nil }
-		writeWriteInode = func(io.WriterAt, int64, *superblock, *inode) error { return nil }
-		t.Cleanup(func() {
-			writeAllocBlocks = oldAlloc
-			writeWriteBlocksData = oldData
-			writeWriteExtentList = oldList
-			writeWriteInode = oldWrite
-		})
+		// convertSFToBlock now gathers the entries and delegates the layout to
+		// the single canonical writer writeWholeDir (via writeWriteWholeDir).
+		// Its error surface is therefore (a) propagating a writeWholeDir
+		// failure and (b) passing the right entry set + parent through.
+		oldWhole := writeWriteWholeDir
+		t.Cleanup(func() { writeWriteWholeDir = oldWhole })
+
 		dirIn := newTestInode(14, 0x4000, inodeFmtLocal, 6)
 		dirIn.dataFork()[0] = 0
 		dirIn.dataFork()[1] = 0
 
-		if err := convertSFToBlock(newMemRW(0), 0, sb, dirIn, 55, "file", 1); !errors.Is(err, errBoom) {
-			t.Fatalf("expected block write error %v, got %v", errBoom, err)
+		// writeWholeDir error propagates verbatim.
+		writeWriteWholeDir = func(readerWriterAt, int64, *superblock, *inode, uint64, []dirEnt) error {
+			return errBoom
 		}
-		writeWriteBlocksData = func(io.WriterAt, int64, *superblock, uint64, uint32, []byte) error { return nil }
-		writeWriteExtentList = func(*inode, []extent) error { return errBoom }
 		if err := convertSFToBlock(newMemRW(0), 0, sb, dirIn, 55, "file", 1); !errors.Is(err, errBoom) {
-			t.Fatalf("expected extent-list error %v, got %v", errBoom, err)
+			t.Fatalf("expected writeWholeDir error %v, got %v", errBoom, err)
 		}
-		writeWriteExtentList = func(*inode, []extent) error { return nil }
-		writeWriteInode = func(io.WriterAt, int64, *superblock, *inode) error { return errBoom }
-		if err := convertSFToBlock(newMemRW(0), 0, sb, dirIn, 55, "file", 1); !errors.Is(err, errBoom) {
-			t.Fatalf("expected inode write error %v, got %v", errBoom, err)
+
+		// The new entry is appended and "."/".." are dropped before delegating.
+		var gotEnts []dirEnt
+		var gotParent uint64
+		writeWriteWholeDir = func(_ readerWriterAt, _ int64, _ *superblock, in *inode, parent uint64, ents []dirEnt) error {
+			gotParent = parent
+			gotEnts = ents
+			if in != dirIn {
+				t.Fatalf("convertSFToBlock passed a different inode")
+			}
+			return nil
+		}
+		if err := convertSFToBlock(newMemRW(0), 0, sb, dirIn, 55, "file", 1); err != nil {
+			t.Fatalf("convertSFToBlock: %v", err)
+		}
+		if len(gotEnts) != 1 || gotEnts[0].name != "file" || gotEnts[0].ino != 55 {
+			t.Fatalf("expected single new entry {file,55}, got %+v", gotEnts)
+		}
+		if gotParent != 0 {
+			t.Fatalf("expected parent inode 0, got %d", gotParent)
 		}
 	})
 

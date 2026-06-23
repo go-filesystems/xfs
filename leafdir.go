@@ -13,9 +13,10 @@ import (
 // separate "leaf" block (magic 0x3df1, at the logical 32 GiB offset). This file
 // implements writing that form and the unified rebuild path that chooses
 // between block, leaf and node form. Node form (~500+ entries) replaces the
-// single leaf1 block with a da3-node btree over multiple leafN blocks plus a
-// free-index block; only single-level da nodes and a single free-index block
-// are emitted (enough for directories up to ~250k entries).
+// single leaf1 block with a da3-node btree over multiple leafN blocks plus one
+// or more free-index blocks. The da-node btree and the free-index array both
+// grow to arbitrary depth/width, so node form scales to directories of any
+// size (millions of entries).
 
 // gatherDirEntries returns every real entry (excluding "." and "..") of a
 // directory plus its parent inode, working for short-form, block-form and
@@ -363,13 +364,20 @@ const (
 )
 
 // writeNodeIndex writes node form: K leafN blocks (0x3dff) holding the sorted
-// hash index, a single da3-node root (0x3ebe) above them, a free-index block
-// (XDF3) carrying the per-data-block bests array, and a 3-extent inode (data +
-// leaf region at 32 GiB + free region at 64 GiB). Multi-level da-node trees
-// and multi-block free indexes are rejected (single-block of each suffices for
-// directories up to ~250k entries).
+// hash index, a da3-node btree (0x3ebe) of one or more levels above them, and
+// F free-index blocks (XDF3) carrying the per-data-block bests array. The leaf
+// region (data-btree leaves + internal nodes) lives at the 32 GiB logical
+// offset and the free region at 64 GiB.
+//
+// The da-node btree grows in levels: when the K leaf pointers fit a single
+// node it is one level (the classic single-root case); when they do not, the
+// node level above is itself split into ceil(K/maxNodeEnts) nodes and another
+// node level is stacked on top, repeating until the top level holds one root
+// node. The bests array is likewise split across ceil(D/bestsPerFree)
+// free-index blocks, each tagged with its covering firstdb window. This lifts
+// the previous single-level / single-free-block ceilings, so directories of any
+// size (millions of entries) lay out correctly.
 func writeNodeIndex(rw readerWriterAt, partOff int64, sb *superblock, in *inode, dataStart uint64, D int, blockEnd []int, lents []leafEnt) error {
-	be := binary.BigEndian
 	blkSize := int(sb.blockSize)
 	leafLog := uint32(dirLeafByteOffset / uint64(sb.blockSize))
 	freeLog := dirFreeByteOffset / uint64(sb.blockSize)
@@ -379,28 +387,108 @@ func writeNodeIndex(rw readerWriterAt, partOff int64, sb *superblock, in *inode,
 	if K < 1 {
 		K = 1
 	}
-	if max := (blkSize - dirNodeHdrSize) / 8; K > max {
-		return fmt.Errorf("xfs: directory %d too large: %d leaf blocks exceed a single-level da node (max %d); multi-level not implemented", in.num, K, max)
+
+	// Lay out the da-node region: K leafN blocks at the bottom, then as many
+	// internal-node levels as needed. dirNodeBuild returns the per-block buffers
+	// (logical-block-ordered) and the logical block number of the root node.
+	region, rootLog, err := dirNodeBuild(sb, in, leafLog, perLeaf, K, lents)
+	if err != nil {
+		return err
 	}
-	if max := (blkSize - dirFreeHdrSize) / 2; D > max {
-		return fmt.Errorf("xfs: directory %d too large: %d data blocks exceed one free-index block (max %d); multi-block free index not implemented", in.num, D, max)
+	leafBlocks := uint32(len(region) / blkSize)
+
+	// One free-index block holds bestsPerFree be16 bests after its header.
+	bestsPerFree := (blkSize - dirFreeHdrSize) / 2
+	F := (D + bestsPerFree - 1) / bestsPerFree
+	if F < 1 {
+		F = 1
 	}
 
 	ag := inoAG(sb, in.num)
-	leafStart, err := writeAllocBlocks(rw, partOff, sb, ag, uint32(K+1)) // node root + K leafN
+	leafStart, err := writeAllocBlocks(rw, partOff, sb, ag, leafBlocks)
 	if err != nil {
-		return fmt.Errorf("xfs: node dir alloc %d leaf blocks: %w", K+1, err)
+		return fmt.Errorf("xfs: node dir alloc %d leaf/node blocks: %w", leafBlocks, err)
 	}
-	freeStart, err := writeAllocBlocks(rw, partOff, sb, ag, 1)
+	freeStart, err := writeAllocBlocks(rw, partOff, sb, ag, uint32(F))
 	if err != nil {
-		return fmt.Errorf("xfs: node dir alloc free-index block: %w", err)
+		return fmt.Errorf("xfs: node dir alloc %d free-index blocks: %w", F, err)
 	}
 
-	// Leaf region: logical leafLog = da3 node root (abs leafStart); logical
-	// leafLog+1+j = leafN block j (abs leafStart+1+j), linked in hash order.
-	region := make([]byte, (K+1)*blkSize)
-	type nodeBtree struct{ hash, before uint32 }
-	nodeEnts := make([]nodeBtree, K)
+	// Stamp each da-node block's self-blkno and CRC now that we know its
+	// absolute placement (the buffers were built logical-block-relative).
+	for b := uint32(0); b < leafBlocks; b++ {
+		buf := region[int(b)*blkSize : (int(b)+1)*blkSize]
+		abs := leafStart + uint64(b)
+		binary.BigEndian.PutUint64(buf[16:], sb.fsbToPhysBlock(abs)*fmtDaddrPerBlock)
+		if sb.hasCRC {
+			updateCRC(buf, 12, blkSize) // da3_blkinfo.crc@12
+		}
+	}
+	if err := writeWriteBlocksData(rw, partOff, sb, leafStart, leafBlocks, region); err != nil {
+		return err
+	}
+
+	// Free-index blocks (XDF3). Each covers a window [firstdb, firstdb+nvalid)
+	// of the data blocks; the be16 bests array starts at dirFreeHdrSize.
+	if err := dirWriteFreeIndex(rw, partOff, sb, in, freeStart, D, F, bestsPerFree, blockEnd); err != nil {
+		return err
+	}
+
+	// Inode: data region (logical 0) + leaf/node region (32 GiB) + free region
+	// (64 GiB).
+	exts := []extent{
+		{startOff: 0, startBlock: dataStart, count: uint32(D)},
+		{startOff: uint64(leafLog), startBlock: leafStart, count: leafBlocks},
+		{startOff: freeLog, startBlock: freeStart, count: uint32(F)},
+	}
+	setInodeFormat(in, inodeFmtExtents)
+	setInodeNBlocks(in, uint64(D)+uint64(leafBlocks)+uint64(F))
+	setInodeNExtents(in, uint32(len(exts)))
+	setInodeSize(in, uint64(D*blkSize))
+	if err := writeWriteExtentList(in, exts); err != nil {
+		return err
+	}
+	_ = rootLog // root placement is encoded via sibling/level fields, not the inode
+	return writeWriteInode(rw, partOff, sb, in)
+}
+
+// dirNodeBuild lays out the da-node hash btree for a node-form directory and
+// returns (region, rootLog). region is a logical-block-ordered byte buffer of
+// every da-node block in the leaf address space; rootLog is the logical block
+// of the top node.
+//
+// XFS requires the da-btree root to sit at the very first block of the leaf
+// address space (logical leafLog, the 32 GiB offset), so this routine assigns
+// logical block leafLog+0 to the root and places the remaining nodes (and the K
+// leafN blocks) after it. The tree is built bottom-up to learn its shape, then
+// numbered top-down so the root lands first; leaf sibling links and node
+// child-pointers are emitted in those final logical-block numbers. Each block's
+// da3_blkinfo header is filled except for bb_blkno and the CRC, which the
+// caller stamps once absolute placement is known.
+func dirNodeBuild(sb *superblock, in *inode, leafLog uint32, perLeaf, K int, lents []leafEnt) ([]byte, uint32, error) {
+	be := binary.BigEndian
+	blkSize := int(sb.blockSize)
+	maxNodeEnts := (blkSize - dirNodeHdrSize) / 8 // da3_node_entry = hashval(4)+before(4)
+
+	// A planned node records its kind, its highest hash (its parent's key), and
+	// the indices (into the flat plan) of its children. Leaves carry a slice of
+	// the sorted hash index instead.
+	type plan struct {
+		isLeaf   bool
+		hash     uint32    // highest hash covered (key in the parent)
+		children []int     // plan indices of children (internal nodes only)
+		chunk    []leafEnt // hash entries (leaves only)
+	}
+	var nodes []plan
+
+	// Each level is the hash-ordered list of node plan-indices at that height.
+	// We keep every level so the same-level sibling chain (forw/back) can be
+	// emitted for the internal-node levels as well as the leaves — xfs_repair
+	// walks those sibling links when it exhausts a node's children.
+	var levels [][]int
+
+	// Level 0: the K leafN blocks, in hash order.
+	level := make([]int, 0, K)
 	for j := 0; j < K; j++ {
 		lo := j * perLeaf
 		hi := lo + perLeaf
@@ -408,89 +496,147 @@ func writeNodeIndex(rw readerWriterAt, partOff int64, sb *superblock, in *inode,
 			hi = len(lents)
 		}
 		chunk := lents[lo:hi]
-		absBlk := leafStart + uint64(1+j)
-		logBlk := leafLog + uint32(1+j)
-		buf := region[(1+j)*blkSize : (2+j)*blkSize]
+		idx := len(nodes)
+		nodes = append(nodes, plan{isLeaf: true, hash: chunk[len(chunk)-1].hash, chunk: chunk})
+		level = append(level, idx)
+	}
+	levels = append(levels, level)
 
-		var forw, back uint32
-		if j > 0 {
-			back = leafLog + uint32(j)
+	// Internal levels: group the current level's nodes under parent nodes until
+	// a single root remains. Children are distributed as evenly as possible
+	// across ceil(len/maxNodeEnts) parents rather than greedily packing the
+	// first parents full and leaving a tiny tail: xfs_repair's verify_da_path
+	// mishandles an interior node that holds a single entry, so even splitting
+	// (every parent gets floor or ceil of the average, all >= 2 when len >= 2)
+	// keeps the tree xfs_repair-clean.
+	for len(level) > 1 {
+		m := (len(level) + maxNodeEnts - 1) / maxNodeEnts // parents needed
+		base := len(level) / m                            // min children per parent
+		extra := len(level) % m                           // first `extra` parents get one more
+		next := make([]int, 0, m)
+		pos := 0
+		for p := 0; p < m; p++ {
+			cnt := base
+			if p < extra {
+				cnt++
+			}
+			children := append([]int(nil), level[pos:pos+cnt]...)
+			pos += cnt
+			lastHash := nodes[children[len(children)-1]].hash
+			idx := len(nodes)
+			nodes = append(nodes, plan{hash: lastHash, children: children})
+			next = append(next, idx)
 		}
-		if j < K-1 {
-			forw = leafLog + uint32(2+j)
+		level = next
+		levels = append(levels, level)
+	}
+	rootIdx := level[0]
+
+	// Per-node same-level siblings (logical block numbers), filled once logical
+	// numbers are assigned below. 0 = no sibling (XFS uses 0 for "none" here).
+	siblForw := make([]uint32, len(nodes))
+	siblBack := make([]uint32, len(nodes))
+
+	// Assign final logical block numbers: root first (leafLog+0), then a
+	// breadth-first walk so every block has a stable number before we emit the
+	// pointers that reference it.
+	logOf := make([]uint32, len(nodes))
+	order := make([]int, 0, len(nodes))
+	logOf[rootIdx] = leafLog
+	order = append(order, rootIdx)
+	nextLog := leafLog + 1
+	for qi := 0; qi < len(order); qi++ {
+		p := nodes[order[qi]]
+		for _, c := range p.children {
+			logOf[c] = nextLog
+			nextLog++
+			order = append(order, c)
 		}
-		be.PutUint32(buf[0:], forw)
-		be.PutUint32(buf[4:], back)
-		be.PutUint16(buf[8:], magicDir3LeafN)
-		be.PutUint64(buf[16:], sb.fsbToPhysBlock(absBlk)*fmtDaddrPerBlock)
+	}
+
+	// Now that every node has a logical block number, derive the same-level
+	// forw/back sibling links (in hash order) for every level — leaves and
+	// internal nodes alike. xfs_repair follows these when it walks off the end
+	// of a node's children, so an unset internal-node forw would send it to
+	// "block 0".
+	for _, lv := range levels {
+		for i, idx := range lv {
+			if i > 0 {
+				siblBack[idx] = logOf[lv[i-1]]
+			}
+			if i < len(lv)-1 {
+				siblForw[idx] = logOf[lv[i+1]]
+			}
+		}
+	}
+
+	// Emit each block into its logical slot.
+	total := len(nodes)
+	region := make([]byte, total*blkSize)
+	for idx, p := range nodes {
+		buf := region[int(logOf[idx]-leafLog)*blkSize : (int(logOf[idx]-leafLog)+1)*blkSize]
+		be.PutUint32(buf[0:], siblForw[idx]) // da3_blkinfo.forw
+		be.PutUint32(buf[4:], siblBack[idx]) // da3_blkinfo.back
 		copy(buf[32:48], sb.uuid[:])
 		be.PutUint64(buf[48:], in.num)
-		be.PutUint16(buf[56:], uint16(len(chunk))) // count; stale@58=0, pad@60=0
-		o := dirLeafHdrSize
-		for _, l := range chunk {
-			be.PutUint32(buf[o:], l.hash)
-			be.PutUint32(buf[o+4:], l.addr)
+		if p.isLeaf {
+			be.PutUint16(buf[8:], magicDir3LeafN)
+			be.PutUint16(buf[56:], uint16(len(p.chunk)))
+			o := dirLeafHdrSize
+			for _, l := range p.chunk {
+				be.PutUint32(buf[o:], l.hash)
+				be.PutUint32(buf[o+4:], l.addr)
+				o += 8
+			}
+			continue
+		}
+		be.PutUint16(buf[8:], magicDa3Node)
+		be.PutUint16(buf[56:], uint16(len(p.children)))
+		// btree level: leaves are level 0, so a node's level is 1 + the level
+		// of its children. All children of a node share the same level.
+		childLevel := 1
+		if !nodes[p.children[0]].isLeaf {
+			childLevel = int(be.Uint16(region[int(logOf[p.children[0]]-leafLog)*blkSize+58:])) + 1
+		}
+		be.PutUint16(buf[58:], uint16(childLevel))
+		o := dirNodeHdrSize
+		for _, c := range p.children {
+			be.PutUint32(buf[o:], nodes[c].hash)
+			be.PutUint32(buf[o+4:], logOf[c])
 			o += 8
 		}
-		nodeEnts[j] = nodeBtree{chunk[len(chunk)-1].hash, logBlk}
 	}
+	return region, leafLog, nil
+}
 
-	// da3 node root at region block 0 (logical leafLog).
-	root := region[0:blkSize]
-	be.PutUint16(root[8:], magicDa3Node)
-	be.PutUint64(root[16:], sb.fsbToPhysBlock(leafStart)*fmtDaddrPerBlock)
-	copy(root[32:48], sb.uuid[:])
-	be.PutUint64(root[48:], in.num)
-	be.PutUint16(root[56:], uint16(K)) // count
-	be.PutUint16(root[58:], 1)         // level
-	o := dirNodeHdrSize
-	for _, ne := range nodeEnts {
-		be.PutUint32(root[o:], ne.hash)
-		be.PutUint32(root[o+4:], ne.before)
-		o += 8
-	}
-	if sb.hasCRC {
-		for b := 0; b <= K; b++ {
-			updateCRC(region[b*blkSize:(b+1)*blkSize], 12, blkSize) // da3_blkinfo.crc@12
+// dirWriteFreeIndex writes the F free-index (XDF3) blocks covering the D data
+// blocks' bests (largest free run per block). Each block covers a contiguous
+// window [firstdb, firstdb+nvalid) of data blocks; together they tile [0, D).
+func dirWriteFreeIndex(rw readerWriterAt, partOff int64, sb *superblock, in *inode, freeStart uint64, D, F, bestsPerFree int, blockEnd []int) error {
+	be := binary.BigEndian
+	blkSize := int(sb.blockSize)
+	region := make([]byte, F*blkSize)
+	for fi := 0; fi < F; fi++ {
+		first := fi * bestsPerFree
+		n := bestsPerFree
+		if first+n > D {
+			n = D - first
+		}
+		buf := region[fi*blkSize : (fi+1)*blkSize]
+		abs := freeStart + uint64(fi)
+		be.PutUint32(buf[0:], magicDir3Free)
+		be.PutUint64(buf[8:], sb.fsbToPhysBlock(abs)*fmtDaddrPerBlock)
+		copy(buf[24:40], sb.uuid[:])
+		be.PutUint64(buf[40:], in.num)
+		be.PutUint32(buf[48:], uint32(first)) // firstdb
+		be.PutUint32(buf[52:], uint32(n))     // nvalid
+		be.PutUint32(buf[56:], uint32(n))     // nused (no NULLDATAOFF entries)
+		for b := 0; b < n; b++ {
+			be.PutUint16(buf[dirFreeHdrSize+b*2:], uint16(blkSize-blockEnd[first+b]))
+		}
+		if sb.hasCRC {
+			updateCRC(buf, 4, blkSize) // xfs_dir3_blk_hdr.crc @ 4
 		}
 	}
-	if err := writeWriteBlocksData(rw, partOff, sb, leafStart, uint32(K+1), region); err != nil {
-		return err
-	}
-
-	// Free-index block (XDF3): xfs_dir3_blk_hdr (magic@0, crc@4, blkno@8,
-	// uuid@24, owner@40) + firstdb@48 + nvalid@52 + nused@56 + pad@60; the
-	// be16 bests array (one per data block) starts at 64.
-	free := make([]byte, blkSize)
-	be.PutUint32(free[0:], magicDir3Free)
-	be.PutUint64(free[8:], sb.fsbToPhysBlock(freeStart)*fmtDaddrPerBlock)
-	copy(free[24:40], sb.uuid[:])
-	be.PutUint64(free[40:], in.num)
-	be.PutUint32(free[48:], 0)         // firstdb: covers data blocks from 0
-	be.PutUint32(free[52:], uint32(D)) // nvalid
-	be.PutUint32(free[56:], uint32(D)) // nused (no NULLDATAOFF entries are written)
-	for b := 0; b < D; b++ {
-		be.PutUint16(free[dirFreeHdrSize+b*2:], uint16(blkSize-blockEnd[b]))
-	}
-	if sb.hasCRC {
-		updateCRC(free, 4, blkSize) // xfs_dir3_blk_hdr.crc @ 4
-	}
-	if err := writeWriteBlocksData(rw, partOff, sb, freeStart, 1, free); err != nil {
-		return err
-	}
-
-	// Inode: data region + leaf region (32 GiB) + free region (64 GiB).
-	exts := []extent{
-		{startOff: 0, startBlock: dataStart, count: uint32(D)},
-		{startOff: uint64(leafLog), startBlock: leafStart, count: uint32(K + 1)},
-		{startOff: freeLog, startBlock: freeStart, count: 1},
-	}
-	setInodeFormat(in, inodeFmtExtents)
-	setInodeNBlocks(in, uint64(D+K+1+1))
-	setInodeNExtents(in, uint32(len(exts)))
-	setInodeSize(in, uint64(D*blkSize))
-	if err := writeWriteExtentList(in, exts); err != nil {
-		return err
-	}
-	return writeWriteInode(rw, partOff, sb, in)
+	return writeWriteBlocksData(rw, partOff, sb, freeStart, uint32(F), region)
 }
