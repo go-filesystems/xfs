@@ -170,6 +170,11 @@ func TestAllocBlocksAdditional(t *testing.T) {
 		allocBnoUpdateRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32, uint32, uint32) error {
 			return nil
 		}
+		// allocBlocks now recomputes agf_longest from the cnt B-tree; stub the
+		// recompute to a known value and assert it lands in the AGF.
+		allocRecomputeLongest = func(readerWriterAt, int64, *superblock, uint32, uint32, int) (uint32, error) {
+			return 4, nil
+		}
 		allocWriteAGF = func(_ io.WriterAt, _ int64, _ *superblock, _ uint32, buf []byte) error {
 			if got := be.Uint32(buf[agfOffFreeBlks:]); got != 95 {
 				t.Fatalf("unexpected free block count %d", got)
@@ -182,6 +187,25 @@ func TestAllocBlocksAdditional(t *testing.T) {
 		abs, err := allocBlocks(newMemRW(0), 0, sb, 0, 5)
 		if err != nil || abs != 10 {
 			t.Fatalf("allocBlocks partial = (%d, %v), want (10, nil)", abs, err)
+		}
+
+		// A recompute error must propagate (not be silently swallowed).
+		restoreAllocHooks(t)
+		agf = makeAGFBuffer(sb, 0, 7, 5, 0, 0, 100, 50)
+		leaf = makeAllocLeaf(sb, 0xFFFFFFFF, allocRec{start: 10, count: 9})
+		allocAGFBlock = func(io.ReaderAt, int64, *superblock, uint32) ([]byte, error) { return agf, nil }
+		allocCntFindBlock = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32) (uint32, []byte, int, error) {
+			return 5, leaf, 0, nil
+		}
+		allocWriteAGBTree = func(io.WriterAt, int64, *superblock, uint32, uint32, []byte) error { return nil }
+		allocBnoUpdateRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32, uint32, uint32) error {
+			return nil
+		}
+		allocRecomputeLongest = func(readerWriterAt, int64, *superblock, uint32, uint32, int) (uint32, error) {
+			return 0, errBoom
+		}
+		if _, err := allocBlocks(newMemRW(0), 0, sb, 0, 5); !errors.Is(err, errBoom) {
+			t.Fatalf("expected allocBlocks recompute error %v, got %v", errBoom, err)
 		}
 	})
 }
@@ -235,6 +259,11 @@ func TestFreeBlocksAdditional(t *testing.T) {
 		allocAGFBlock = func(io.ReaderAt, int64, *superblock, uint32) ([]byte, error) { return agf, nil }
 		allocBnoInsertRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32, uint32) error { return nil }
 		allocCntInsertRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32, uint32) error { return nil }
+		// freeBlocks recomputes agf_longest from the cnt B-tree (a freed run can
+		// coalesce into something larger); stub it and assert it reaches the AGF.
+		allocRecomputeLongest = func(readerWriterAt, int64, *superblock, uint32, uint32, int) (uint32, error) {
+			return 7, nil
+		}
 		allocWriteAGF = func(_ io.WriterAt, _ int64, _ *superblock, _ uint32, buf []byte) error {
 			if got := be.Uint32(buf[agfOffFreeBlks:]); got != 17 {
 				t.Fatalf("unexpected free block count %d", got)
@@ -246,6 +275,19 @@ func TestFreeBlocksAdditional(t *testing.T) {
 		}
 		if err := freeBlocks(newMemRW(0), 0, sb, absStart, 7); err != nil {
 			t.Fatalf("freeBlocks success: %v", err)
+		}
+
+		// A recompute error during free must propagate.
+		restoreAllocHooks(t)
+		agf = makeAGFBuffer(sb, 1, 7, 5, 0, 0, 10, 5)
+		allocAGFBlock = func(io.ReaderAt, int64, *superblock, uint32) ([]byte, error) { return agf, nil }
+		allocBnoInsertRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32, uint32) error { return nil }
+		allocCntInsertRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32, uint32) error { return nil }
+		allocRecomputeLongest = func(readerWriterAt, int64, *superblock, uint32, uint32, int) (uint32, error) {
+			return 0, errBoom
+		}
+		if err := freeBlocks(newMemRW(0), 0, sb, absStart, 7); !errors.Is(err, errBoom) {
+			t.Fatalf("expected freeBlocks recompute error %v, got %v", errBoom, err)
 		}
 	})
 }
