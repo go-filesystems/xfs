@@ -98,6 +98,7 @@ var allocWriteAGBTree = writeAGBTree
 var allocCntFindBlock = cntFindBlock
 var allocBtreeDeleteRecord = btreeDeleteRecord
 var allocBnoDeleteRecord = bnoDeleteRecord
+var allocCntDeleteRecord = cntDeleteRecord
 var allocBnoUpdateRecord = bnoUpdateRecord
 var allocBnoFindRecord = bnoFindRecord
 var allocBnoInsertRecord = bnoInsertRecord
@@ -268,7 +269,19 @@ func inobtMaxInternal(blockLen, hdrSize int) int {
 // and take the first record with count >= nBlocks. This is a simplified
 // allocator; it handles images with ≤1 level-deep trees (typical for
 // newly formatted cloud images with a single large free extent).
-func allocBlocks(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, nBlocks uint32) (uint64, error) {
+func allocBlocks(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, nBlocks uint32) (retBlk uint64, retErr error) {
+	// Enter an alloc/free operation. Merged-away btree blocks from any delete this
+	// triggers are queued (allocFreeMergedBlocks) and drained only when the
+	// OUTERMOST operation finishes — never mid-flight, where freeing them would
+	// re-enter the trees still being rewritten. See allocDrainMergedFrees.
+	allocOpDepth++
+	defer func() {
+		allocOpDepth--
+		if allocOpDepth == 0 && retErr == nil {
+			retErr = allocDrainMergedFrees(rw, partOff, sb)
+		}
+	}()
+
 	agfBuf, err := allocAGFBlock(rw, partOff, sb, ag)
 	if err != nil {
 		return 0, err
@@ -300,22 +313,61 @@ func allocBlocks(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, nB
 	remaining := count - nBlocks
 
 	if remaining == 0 {
-		// Delete the record from both B-trees.
-		if err := allocBtreeDeleteRecord(rw, partOff, sb, ag, cntRoot, int(cntLevel), recIdx, cntLeafRel, cntLeaf, allocRecSize, false); err != nil {
-			return 0, fmt.Errorf("xfs: cnt B-tree delete: %w", err)
+		// Fully consume the extent: delete its record from BOTH free-space trees
+		// with full B+tree semantics — rebalance/merge an underfull leaf or interior
+		// node and collapse the root when it loses its last child (alloc_btree_delete
+		// .go). The cnt delete is keyed by (count,start); the bno delete by start.
+		// _ = recIdx/cntLeaf/cntLeafRel: the structural delete re-descends from the
+		// root to record the path it needs for rebalancing.
+		_ = recIdx
+		_ = cntLeaf
+		_ = cntLeafRel
+		// Use the Collect variant for BOTH trees and defer freeing the merged-away
+		// btree blocks until AFTER both deletes complete. Freeing inserts into both
+		// free-space trees; doing it between the cnt and bno deletes would mutate the
+		// not-yet-deleted bno tree (moving the very record/keys the bno delete is
+		// about to navigate), which corrupts the descent. Collecting first and
+		// freeing once keeps each delete operating on a quiescent pair of trees.
+		cntFreed, derr := allocDeleteRecordCollect(rw, partOff, sb, ag, cntRoot, int(cntLevel), allocStartRel, count, false)
+		if derr != nil {
+			return 0, fmt.Errorf("xfs: cnt B-tree delete: %w", derr)
 		}
-		if err := allocBnoDeleteRecord(rw, partOff, sb, ag, bnoRoot, int(bnoLevel), allocStartRel); err != nil {
-			return 0, fmt.Errorf("xfs: bno B-tree delete: %w", err)
+		// The cnt delete may have moved the bno root/level on disk (a collapse
+		// rewrites the cnt fields only, but agf_btreeblks is shared); re-read.
+		agfBuf, err = allocAGFBlock(rw, partOff, sb, ag)
+		if err != nil {
+			return 0, err
 		}
+		bnoRoot = be.Uint32(agfBuf[agfOffBnoRoot:])
+		bnoLevel = be.Uint32(agfBuf[agfOffBnoLevel:])
+		bnoFreed, derr := allocDeleteRecordCollect(rw, partOff, sb, ag, bnoRoot, int(bnoLevel), allocStartRel, 0, true)
+		if derr != nil {
+			return 0, fmt.Errorf("xfs: bno B-tree delete: %w", derr)
+		}
+		// Now both trees are quiescent: return the merged-away btree blocks to the
+		// free-space trees. Each free inserts a single-block extent into both trees
+		// (and updates agf_freeblks/longest/btreeblks/roots on disk).
+		freed := append(cntFreed, bnoFreed...)
+		if err := allocFreeMergedBlocks(rw, partOff, sb, ag, freed); err != nil {
+			return 0, err
+		}
+		// Re-read so the free-count and longest update below builds on the
+		// post-delete, post-free AGF instead of clobbering it. Refresh cntRoot/Level
+		// for the longest walk.
+		agfBuf, err = allocAGFBlock(rw, partOff, sb, ag)
+		if err != nil {
+			return 0, err
+		}
+		cntRoot = be.Uint32(agfBuf[agfOffCntRoot:])
+		cntLevel = be.Uint32(agfBuf[agfOffCntLevel:])
 	} else {
 		// Update cnt record: new start+count pointing to the remainder. The count
 		// SHRINKS (remaining < count), which moves the record earlier in the cnt
-		// (count,start) order, so re-sort it leftward within the leaf. The leaf's
-		// record count is unchanged, so this never underflows the node. (Ancestor
-		// separator keys can still drift if the leaf's leftmost record changes; see
-		// the bounded-sub-case note in alloc_btree.go — the resulting tree is
-		// xfs_repair-clean and the bno tree, which is authoritative for placement,
-		// stays exactly ordered.)
+		// (count,start) order, so re-sort it leftward within the leaf, then refresh
+		// any ancestor separator keys that drifted because the leaf's first record
+		// changed. The leaf's record count is unchanged, so this never underflows the
+		// node. Keeping the separators exact matters because the full-semantics
+		// delete (alloc_btree_delete.go) navigates the cnt tree by separator key.
 		newStart := allocStartRel + nBlocks
 		be.PutUint32(cntLeaf[recOff:], newStart)
 		be.PutUint32(cntLeaf[recOff+4:], remaining)
@@ -326,6 +378,15 @@ func allocBlocks(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, nB
 		allocCntBubbleLeft(cntLeaf, sb.agBTreeHdrSize(), recIdx)
 		if err := allocWriteAGBTree(rw, partOff, sb, ag, cntLeafRel, cntLeaf); err != nil {
 			return 0, err
+		}
+		// If the leaf's first record changed (the shrunk record bubbled to index 0,
+		// or the deleted/edited record WAS index 0), the cnt ancestor separator keys
+		// that point at this leaf must be refreshed to the new first key so the
+		// separator-key-navigating delete stays accurate. allocCntRefreshLeafKey
+		// re-descends to cntLeafRel and rewrites every ancestor separator that covers
+		// it. Cheap (one root→leaf descent) and only when the first record moved.
+		if err := allocCntRefreshLeafKey(rw, partOff, sb, ag, cntRoot, int(cntLevel), cntLeafRel); err != nil {
+			return 0, fmt.Errorf("xfs: cnt B-tree separator refresh: %w", err)
 		}
 		// Update bno record for the same extent.
 		if err := allocBnoUpdateRecord(rw, partOff, sb, ag, bnoRoot, int(bnoLevel), allocStartRel, newStart, remaining); err != nil {
@@ -527,14 +588,20 @@ func btreeDeleteRecord(rw readerWriterAt, partOff int64, sb *superblock, ag uint
 	return allocWriteAGBTree(rw, partOff, sb, ag, leafRel, leaf)
 }
 
-// bnoDeleteRecord walks the bno B-tree and deletes the record that starts at
-// agStartRel.
+// bnoDeleteRecord deletes the bno B-tree record that starts at agStartRel with
+// full B+tree semantics (rebalance/merge underfull blocks, collapse the root).
+// The bno tree is keyed by start alone, so count is irrelevant to the lookup;
+// passing 0 keeps allocDeleteRecord's signature uniform with the cnt path.
 func bnoDeleteRecord(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, rootRel uint32, level int, agStartRel uint32) error {
-	leafRel, leaf, recIdx, err := allocBnoFindRecord(rw, partOff, sb, ag, rootRel, level, agStartRel)
-	if err != nil {
-		return err
-	}
-	return allocBtreeDeleteRecord(rw, partOff, sb, ag, rootRel, level, recIdx, leafRel, leaf, allocRecSize, false)
+	return allocDeleteRecord(rw, partOff, sb, ag, rootRel, level, agStartRel, 0, true)
+}
+
+// cntDeleteRecord deletes the cnt B-tree record for the free extent that starts
+// at agStartRel and has length count, with full B+tree semantics. The cnt tree
+// is keyed by (count,start) so both are needed to disambiguate equal-length
+// extents.
+func cntDeleteRecord(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, rootRel uint32, level int, agStartRel, count uint32) error {
+	return allocDeleteRecord(rw, partOff, sb, ag, rootRel, level, agStartRel, count, false)
 }
 
 // bnoUpdateRecord replaces the bno B-tree record at oldStart with
@@ -613,7 +680,19 @@ func bnoFindRecord(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, 
 // freeBlocks returns a run of nBlocks blocks starting at absStartBlock back
 // to the free space B-trees. Only handles the simple case where the freed
 // range does not merge with adjacent extents.
-func freeBlocks(rw readerWriterAt, partOff int64, sb *superblock, absStartBlock uint64, nBlocks uint32) error {
+func freeBlocks(rw readerWriterAt, partOff int64, sb *superblock, absStartBlock uint64, nBlocks uint32) (retErr error) {
+	// Participate in the same op-depth bookkeeping as allocBlocks so a freeBlocks
+	// nested inside an alloc (e.g. a reserve release, or the merged-free drain
+	// itself) does not drain the merged-free queue prematurely; only the outermost
+	// operation drains it. A standalone top-level free drains any queue too.
+	allocOpDepth++
+	defer func() {
+		allocOpDepth--
+		if allocOpDepth == 0 && retErr == nil {
+			retErr = allocDrainMergedFrees(rw, partOff, sb)
+		}
+	}()
+
 	ag := uint32(absStartBlock / uint64(sb.agBlocks))
 	agStartRel := uint32(absStartBlock % uint64(sb.agBlocks))
 

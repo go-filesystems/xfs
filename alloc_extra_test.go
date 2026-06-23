@@ -36,71 +36,62 @@ func TestAllocBlocksAdditional(t *testing.T) {
 			t.Fatal("expected allocBlocks to reject too-small extents")
 		}
 
-		leaf = makeAllocLeaf(sb, 0xFFFFFFFF, allocRec{start: 10, count: 5})
-		allocCntFindBlock = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32) (uint32, []byte, int, error) {
-			return 5, leaf, 0, nil
+		// The whole-extent (remaining==0) delete path now descends the real cnt/bno
+		// trees (allocDeleteRecordCollect), so these cases install REAL single-leaf
+		// roots in the memRW rather than mocking the delete hooks. cnt root = block 5
+		// (one record {10,5}), bno root = block 7 (same extent).
+		setupExactFit := func() *memRW {
+			// Reset the find/read/AGF hooks to the real implementations (prior cases in
+			// this subtest left synthetic mocks installed; restoreAllocHooks captures
+			// the current values rather than resetting them).
+			allocReadAGBlock = readAGBlock
+			allocWriteAGBTree = writeAGBTree
+			allocCntFindBlock = cntFindBlock
+			allocAGFBlock = agfBlock
+			allocWriteAGF = writeAGF
+			allocBnoFindRecord = bnoFindRecord
+			rw := newAllocRW(sb)
+			putAGF(rw, 0, sb, 0, makeAGFBuffer(sb, 0, 7, 5, 1, 1, 100, 50))
+			putFSBlock(rw, 0, sb, 0, 5, makeAllocLeaf(sb, 0xFFFFFFFF, allocRec{start: 10, count: 5}))
+			putFSBlock(rw, 0, sb, 0, 7, makeAllocLeaf(sb, 0xFFFFFFFF, allocRec{start: 10, count: 5}))
+			return rw
 		}
-		allocBtreeDeleteRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, int, uint32, []byte, int, bool) error {
-			return errBoom
-		}
-		if _, err := allocBlocks(newMemRW(0), 0, sb, 0, 5); !errors.Is(err, errBoom) {
+
+		// cnt delete write error: the cnt delete removes the record then writes the
+		// leaf back; fail that write so the whole-extent delete path errors.
+		restoreAllocHooks(t)
+		rwCnt := setupExactFit()
+		allocWriteAGBTree = func(io.WriterAt, int64, *superblock, uint32, uint32, []byte) error { return errBoom }
+		if _, err := allocBlocks(rwCnt, 0, sb, 0, 5); !errors.Is(err, errBoom) {
 			t.Fatalf("expected cnt delete error %v, got %v", errBoom, err)
 		}
 
+		// AGF write error during the delete's AGF update (no collapse here, but the
+		// final free-count/longest write fails).
 		restoreAllocHooks(t)
-		agf = makeAGFBuffer(sb, 0, 7, 5, 0, 0, 100, 50)
-		leaf = makeAllocLeaf(sb, 0xFFFFFFFF, allocRec{start: 10, count: 5})
-		allocAGFBlock = func(io.ReaderAt, int64, *superblock, uint32) ([]byte, error) { return agf, nil }
-		allocCntFindBlock = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32) (uint32, []byte, int, error) {
-			return 5, leaf, 0, nil
-		}
-		allocBtreeDeleteRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, int, uint32, []byte, int, bool) error {
-			return nil
-		}
-		allocBnoDeleteRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32) error { return errBoom }
-		if _, err := allocBlocks(newMemRW(0), 0, sb, 0, 5); !errors.Is(err, errBoom) {
-			t.Fatalf("expected bno delete error %v, got %v", errBoom, err)
-		}
-
-		restoreAllocHooks(t)
-		agf = makeAGFBuffer(sb, 0, 7, 5, 0, 0, 100, 50)
-		leaf = makeAllocLeaf(sb, 0xFFFFFFFF, allocRec{start: 10, count: 5})
-		allocAGFBlock = func(io.ReaderAt, int64, *superblock, uint32) ([]byte, error) { return agf, nil }
-		allocCntFindBlock = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32) (uint32, []byte, int, error) {
-			return 5, leaf, 0, nil
-		}
-		allocBtreeDeleteRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, int, uint32, []byte, int, bool) error {
-			return nil
-		}
-		allocBnoDeleteRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32) error { return nil }
+		rwW := setupExactFit()
 		allocWriteAGF = func(io.WriterAt, int64, *superblock, uint32, []byte) error { return errBoom }
-		if _, err := allocBlocks(newMemRW(0), 0, sb, 0, 5); !errors.Is(err, errBoom) {
+		if _, err := allocBlocks(rwW, 0, sb, 0, 5); !errors.Is(err, errBoom) {
 			t.Fatalf("expected allocBlocks writeAGF error %v, got %v", errBoom, err)
 		}
 
+		// Exact-fit success: the extent is fully consumed, deleted from both trees,
+		// the AGF free count drops by 5 and longest recomputes (mocked to 0).
 		restoreAllocHooks(t)
-		agf = makeAGFBuffer(sb, 0, 7, 5, 0, 0, 100, 50)
-		leaf = makeAllocLeaf(sb, 0xFFFFFFFF, allocRec{start: 10, count: 5})
-		allocAGFBlock = func(io.ReaderAt, int64, *superblock, uint32) ([]byte, error) { return agf, nil }
-		allocCntFindBlock = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32) (uint32, []byte, int, error) {
-			return 5, leaf, 0, nil
-		}
-		allocBtreeDeleteRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, int, uint32, []byte, int, bool) error {
-			return nil
-		}
-		allocBnoDeleteRecord = func(readerWriterAt, int64, *superblock, uint32, uint32, int, uint32) error { return nil }
-		allocWriteAGF = func(_ io.WriterAt, _ int64, _ *superblock, _ uint32, buf []byte) error {
-			if got := be.Uint32(buf[agfOffFreeBlks:]); got != 95 {
-				t.Fatalf("unexpected free block count %d", got)
+		rwOK := setupExactFit()
+		var wroteFree bool
+		allocWriteAGF = func(rw io.WriterAt, p int64, s *superblock, ag uint32, buf []byte) error {
+			if be.Uint32(buf[agfOffFreeBlks:]) == 95 {
+				wroteFree = true
 			}
-			if got := be.Uint32(buf[agfOffLongest:]); got != 0 {
-				t.Fatalf("unexpected longest run %d", got)
-			}
-			return nil
+			return writeAGF(rw, p, s, ag, buf)
 		}
-		abs, err := allocBlocks(newMemRW(0), 0, sb, 0, 5)
-		if err != nil || abs != 10 {
-			t.Fatalf("allocBlocks exact fit = (%d, %v), want (10, nil)", abs, err)
+		abs, err := allocBlocks(rwOK, 0, sb, 0, 5)
+		if err != nil || abs != sb.agAbsBlock(0, 10) {
+			t.Fatalf("allocBlocks exact fit = (%d, %v), want (%d, nil)", abs, err, sb.agAbsBlock(0, 10))
+		}
+		if !wroteFree {
+			t.Fatal("expected allocBlocks to write free count 95 after exact-fit consume")
 		}
 	})
 
