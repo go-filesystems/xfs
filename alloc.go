@@ -108,6 +108,7 @@ var allocGrowInobt = growInobt
 var allocAllocBlocks = allocBlocks
 var allocWriteRawBlock = writeRawBlock
 var allocFreeBlocks = freeBlocks
+var allocRecomputeLongest = agfRecomputeLongest
 
 // inobtChunkInodes is the number of inodes per inobt record. The XFS spec
 // always uses 64-inode chunks (the irFree bitmap is 64 bits wide). With
@@ -305,9 +306,17 @@ func allocBlocks(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, nB
 	// Update AGF free block count.
 	freeBlks := be.Uint32(agfBuf[agfOffFreeBlks:])
 	be.PutUint32(agfBuf[agfOffFreeBlks:], freeBlks-nBlocks)
-	if remaining < be.Uint32(agfBuf[agfOffLongest:]) {
-		be.PutUint32(agfBuf[agfOffLongest:], remaining)
+	// Recompute agf_longest from the (already-updated) cnt B-tree rather than
+	// guessing from `remaining`: consuming the previously-longest extent can
+	// promote a different extent to longest, and fully consuming it (remaining
+	// == 0) must drop longest to the next-largest run. The old "shrink only when
+	// remaining < longest" heuristic let agf_longest drift to 0 after a run of
+	// allocations, which xfs_repair flags ("agf_longest N, counted M").
+	longest, err := allocRecomputeLongest(rw, partOff, sb, ag, cntRoot, int(cntLevel))
+	if err != nil {
+		return 0, err
 	}
+	be.PutUint32(agfBuf[agfOffLongest:], longest)
 	if err := allocWriteAGF(rw, partOff, sb, ag, agfBuf); err != nil {
 		return 0, err
 	}
@@ -599,10 +608,14 @@ func freeBlocks(rw readerWriterAt, partOff int64, sb *superblock, absStartBlock 
 	// Update AGF free count.
 	freeBlks := be.Uint32(agfBuf[agfOffFreeBlks:])
 	be.PutUint32(agfBuf[agfOffFreeBlks:], freeBlks+nBlocks)
-	longest := be.Uint32(agfBuf[agfOffLongest:])
-	if nBlocks > longest {
-		be.PutUint32(agfBuf[agfOffLongest:], nBlocks)
+	// Recompute agf_longest from the cnt B-tree: a freed run can coalesce with
+	// adjacent free extents into something larger than nBlocks, so the simple
+	// "nBlocks > longest" bump under-counts after a merge.
+	longest, err := allocRecomputeLongest(rw, partOff, sb, ag, cntRoot, cntLevel)
+	if err != nil {
+		return err
 	}
+	be.PutUint32(agfBuf[agfOffLongest:], longest)
 	return allocWriteAGF(rw, partOff, sb, ag, agfBuf)
 }
 
@@ -926,10 +939,11 @@ func inobtFindRecord(rw readerWriterAt, partOff int64, sb *superblock, ag uint32
 // fresh find-free pass on the now-non-empty inobt and return the first
 // inode of the new chunk.
 //
-// Limitations of this initial implementation: only single-leaf inobts are
-// supported (inobtLevel must be 1, i.e. the root is the leaf). A future
-// extension will split the leaf when it fills (~252 chunks/AG, plenty of
-// headroom before that ceiling).
+// When the single root leaf fills (~252 chunks at blockSize=4096), the record
+// insert promotes the inobt from one level to two: the full leaf is split in
+// half into two leaf blocks and a fresh internal root (level 1) is written
+// above them, with the AGI root/level updated. Deeper trees (already level >=2)
+// remain unsupported and return an explicit error.
 func growInobt(rw readerWriterAt, partOff int64, sb *superblock, ag uint32) error {
 	be := binary.BigEndian
 
@@ -1006,7 +1020,7 @@ func growInobt(rw readerWriterAt, partOff int64, sb *superblock, ag uint32) erro
 		}
 	}
 
-	// Insert the new record into the inobt leaf.
+	// Insert the new record into the inobt.
 	agiBuf, err := allocAGIBlock(rw, partOff, sb, ag)
 	if err != nil {
 		return err
@@ -1017,19 +1031,41 @@ func growInobt(rw readerWriterAt, partOff int64, sb *superblock, ag uint32) erro
 		return fmt.Errorf("growInobt: inobt level %d (>1) not supported yet", inobtLevel)
 	}
 
-	leafRel := inobtRoot
+	if err := inobtInsertChunkRecord(rw, partOff, sb, ag, agiBuf, inobtRoot, startIno); err != nil {
+		return err
+	}
+
+	// Update AGI: +64 to count + freeCount. inobtInsertChunkRecord may have
+	// already rewritten the AGI root/level (on a split); those updates live in
+	// agiBuf, so the single AGI write below persists them together with the
+	// count bump.
+	agiCount := be.Uint32(agiBuf[agiOffCount:])
+	agiFree := be.Uint32(agiBuf[agiOffFreeCount:])
+	be.PutUint32(agiBuf[agiOffCount:], agiCount+inobtChunkInodes)
+	be.PutUint32(agiBuf[agiOffFreeCount:], agiFree+inobtChunkInodes)
+	return allocWriteAGI(rw, partOff, sb, ag, agiBuf)
+}
+
+// inobtInsertChunkRecord inserts one freshly-allocated 64-inode chunk record
+// (startIno, freecount=64, ir_free=all-ones) into the inobt of AG ag, keeping
+// the leaf records sorted by ir_startino. The inobt root passed in must be a
+// single leaf root (depth 1). When the leaf still has room the record is
+// inserted in place; when it is full the leaf is split in two and a fresh
+// internal root (level 1) is written above them, promoting the tree to depth 2.
+// On a split, agiBuf's root/level fields are updated in place so the caller
+// persists them with its subsequent AGI write.
+func inobtInsertChunkRecord(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, agiBuf []byte, leafRel, startIno uint32) error {
+	be := binary.BigEndian
+	hdrSize := sb.agBTreeHdrSize()
+
 	leaf, err := allocReadAGBlock(rw, partOff, sb, ag, leafRel)
 	if err != nil {
 		return err
 	}
-	hdrSize := sb.agBTreeHdrSize()
 	numrecs := int(be.Uint16(leaf[6:]))
 	maxRecs := (len(leaf) - hdrSize) / inobtRecSize
-	if numrecs >= maxRecs {
-		return fmt.Errorf("growInobt: inobt leaf full (%d records); leaf-split not implemented", numrecs)
-	}
 
-	// Find the insertion position (sorted by startIno).
+	// Find the insertion position (sorted by startIno) and reject duplicates.
 	insertAt := numrecs
 	for i := 0; i < numrecs; i++ {
 		off := hdrSize + i*inobtRecSize
@@ -1043,24 +1079,133 @@ func growInobt(rw readerWriterAt, partOff int64, sb *superblock, ag uint32) erro
 		}
 	}
 
-	// Shift records right.
-	insertOff := hdrSize + insertAt*inobtRecSize
-	copy(leaf[insertOff+inobtRecSize:], leaf[insertOff:hdrSize+numrecs*inobtRecSize])
+	// Build the new record once: startIno, freecount=64, ir_free=all-free.
+	var rec [inobtRecSize]byte
+	be.PutUint32(rec[0:], startIno)
+	be.PutUint32(rec[4:], inobtChunkInodes)
+	be.PutUint64(rec[8:], 0xFFFFFFFFFFFFFFFF)
 
-	// Write the new record: startIno, freeCount=64, irFree=all-ones.
-	be.PutUint32(leaf[insertOff:], startIno)
-	be.PutUint32(leaf[insertOff+4:], inobtChunkInodes)
-	be.PutUint64(leaf[insertOff+8:], 0xFFFFFFFFFFFFFFFF)
-	be.PutUint16(leaf[6:], uint16(numrecs+1))
+	if numrecs < maxRecs {
+		// Room in the leaf: shift records right and drop the new one in place.
+		insertOff := hdrSize + insertAt*inobtRecSize
+		copy(leaf[insertOff+inobtRecSize:], leaf[insertOff:hdrSize+numrecs*inobtRecSize])
+		copy(leaf[insertOff:], rec[:])
+		be.PutUint16(leaf[6:], uint16(numrecs+1))
+		return allocWriteAGBTree(rw, partOff, sb, ag, leafRel, leaf)
+	}
 
-	if err := allocWriteAGBTree(rw, partOff, sb, ag, leafRel, leaf); err != nil {
+	// Leaf is full → split. Only a single-leaf-root tree (depth 1) can be split
+	// here; inserting into a tree that is already deeper is not implemented.
+	if lvl := int(be.Uint32(agiBuf[agiOffLevel:])); lvl != 1 {
+		return fmt.Errorf("growInobt: inobt leaf full at level %d; deep-tree insert not implemented", lvl)
+	}
+	return inobtSplitRootLeaf(rw, partOff, sb, ag, agiBuf, leafRel, leaf, insertAt, rec[:])
+}
+
+// inobtSplitRootLeaf splits the full single-leaf-root inobt of AG ag in two and
+// writes a fresh internal root above the two halves, promoting the tree to
+// depth 2. The record set is the existing leaf records with the new record rec
+// inserted at index insertAt; it is partitioned so the left half (lower
+// ir_startino values) stays in the original root block (reused as the left
+// leaf) and the upper half moves to a newly-allocated right leaf. A third new
+// block becomes the internal root. agiBuf is updated in place with the new root
+// block number and level (=2).
+func inobtSplitRootLeaf(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, agiBuf []byte, leafRel uint32, leaf []byte, insertAt int, rec []byte) error {
+	be := binary.BigEndian
+	hdrSize := sb.agBTreeHdrSize()
+	numrecs := int(be.Uint16(leaf[6:]))
+
+	// Materialise the full, sorted record set (existing + new).
+	total := numrecs + 1
+	recs := make([][]byte, 0, total)
+	for i := 0; i < numrecs; i++ {
+		off := hdrSize + i*inobtRecSize
+		r := make([]byte, inobtRecSize)
+		copy(r, leaf[off:off+inobtRecSize])
+		recs = append(recs, r)
+	}
+	nr := make([]byte, inobtRecSize)
+	copy(nr, rec)
+	recs = append(recs, nil)
+	copy(recs[insertAt+1:], recs[insertAt:])
+	recs[insertAt] = nr
+
+	half := total / 2 // left keeps the lower half, right gets the upper half
+
+	// Allocate the right-leaf block and the new internal root block. They come
+	// from the AG free-space trees like the inode chunk's data blocks, so
+	// syncSuperblockCounts (AGF freeblks) keeps fdblocks accurate.
+	rightAbs, err := allocAllocBlocks(rw, partOff, sb, ag, 1)
+	if err != nil {
+		return fmt.Errorf("growInobt split: alloc right leaf: %w", err)
+	}
+	rootAbs, err := allocAllocBlocks(rw, partOff, sb, ag, 1)
+	if err != nil {
+		return fmt.Errorf("growInobt split: alloc root: %w", err)
+	}
+	rightRel := uint32(rightAbs % uint64(sb.agBlocks))
+	rootRel := uint32(rootAbs % uint64(sb.agBlocks))
+
+	// Left leaf reuses the original root block: leftsib=none, rightsib=right.
+	left := leaf
+	be.PutUint32(left[8:], 0xFFFFFFFF)
+	be.PutUint32(left[12:], rightRel)
+	be.PutUint16(left[6:], uint16(half))
+	for i := 0; i < half; i++ {
+		copy(left[hdrSize+i*inobtRecSize:], recs[i])
+	}
+	// Clear any stale trailing record bytes left over from before the split.
+	for i := half; i < numrecs; i++ {
+		clear(left[hdrSize+i*inobtRecSize : hdrSize+(i+1)*inobtRecSize])
+	}
+	if err := allocWriteAGBTree(rw, partOff, sb, ag, leafRel, left); err != nil {
 		return err
 	}
 
-	// Update AGI: +64 to count + freeCount.
-	agiCount := be.Uint32(agiBuf[agiOffCount:])
-	agiFree := be.Uint32(agiBuf[agiOffFreeCount:])
-	be.PutUint32(agiBuf[agiOffCount:], agiCount+inobtChunkInodes)
-	be.PutUint32(agiBuf[agiOffFreeCount:], agiFree+inobtChunkInodes)
-	return allocWriteAGI(rw, partOff, sb, ag, agiBuf)
+	// Right leaf: a fresh level-0 inobt block holding the upper half.
+	right := newInobtBlock(sb, ag, rightRel, 0, total-half)
+	be.PutUint32(right[8:], leafRel)
+	be.PutUint32(right[12:], 0xFFFFFFFF)
+	for i := half; i < total; i++ {
+		copy(right[hdrSize+(i-half)*inobtRecSize:], recs[i])
+	}
+	if err := allocWriteAGBTree(rw, partOff, sb, ag, rightRel, right); err != nil {
+		return err
+	}
+
+	// Internal root: level 1 with two key/ptr pairs. The inobt is a short-form
+	// B-tree, so all keys (4 bytes each) are packed first, then all block
+	// pointers (4 bytes each), at the maxrecs boundary for an internal node.
+	root := newInobtBlock(sb, ag, rootRel, 1, 2)
+	be.PutUint32(root[hdrSize+0*inobtKeySize:], be.Uint32(recs[0][0:]))
+	be.PutUint32(root[hdrSize+1*inobtKeySize:], be.Uint32(recs[half][0:]))
+	maxInternal := (len(root) - hdrSize) / (inobtKeySize + inobtPtrSize)
+	ptrBase := hdrSize + maxInternal*inobtKeySize
+	be.PutUint32(root[ptrBase+0*inobtPtrSize:], leafRel)
+	be.PutUint32(root[ptrBase+1*inobtPtrSize:], rightRel)
+	if err := allocWriteAGBTree(rw, partOff, sb, ag, rootRel, root); err != nil {
+		return err
+	}
+
+	// Point the AGI at the new internal root and bump the depth to 2.
+	be.PutUint32(agiBuf[agiOffRoot:], rootRel)
+	be.PutUint32(agiBuf[agiOffLevel:], 2)
+	return nil
+}
+
+// newInobtBlock returns a zeroed v5 inobt B-tree block (magic IAB3) with its
+// header filled in: level, numrecs, null siblings, self blkno, uuid and owner.
+// Callers that chain leaf blocks overwrite the sibling fields at blk[8:]/blk[12:].
+func newInobtBlock(sb *superblock, ag, agRel uint32, level, numrecs int) []byte {
+	be := binary.BigEndian
+	blk := make([]byte, sb.blockSize)
+	be.PutUint32(blk[0:], magicIAB3)
+	be.PutUint16(blk[4:], uint16(level))
+	be.PutUint16(blk[6:], uint16(numrecs))
+	be.PutUint32(blk[8:], 0xFFFFFFFF)
+	be.PutUint32(blk[12:], 0xFFFFFFFF)
+	be.PutUint64(blk[16:], sb.fsbToPhysBlock(sb.agAbsBlock(ag, agRel))*fmtDaddrPerBlock)
+	copy(blk[32:48], sb.uuid[:])
+	be.PutUint32(blk[48:], ag)
+	return blk
 }

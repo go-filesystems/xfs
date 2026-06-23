@@ -166,10 +166,17 @@ func restoreAllocHooks(t *testing.T) {
 	oldAllocBlocks := allocAllocBlocks
 	oldWriteRawBlock := allocWriteRawBlock
 	oldFreeBlocks := allocFreeBlocks
+	oldRecomputeLongest := allocRecomputeLongest
 	// Default the slack-free hook to a success no-op so growInobt mocks that
 	// don't set up a real AGF still exercise their target branch. Tests that
 	// care about the free path override this explicitly.
 	allocFreeBlocks = func(readerWriterAt, int64, *superblock, uint64, uint32) error { return nil }
+	// Default agf_longest recomputation to a deterministic 0 so alloc/free mocks
+	// that don't back a real cnt B-tree don't hit EOF before their target write.
+	// Tests that assert a specific longest value override this explicitly.
+	allocRecomputeLongest = func(readerWriterAt, int64, *superblock, uint32, uint32, int) (uint32, error) {
+		return 0, nil
+	}
 	t.Cleanup(func() {
 		allocAGFBlock = oldAGFBlock
 		allocWriteAGF = oldWriteAGF
@@ -190,6 +197,7 @@ func restoreAllocHooks(t *testing.T) {
 		allocAllocBlocks = oldAllocBlocks
 		allocWriteRawBlock = oldWriteRawBlock
 		allocFreeBlocks = oldFreeBlocks
+		allocRecomputeLongest = oldRecomputeLongest
 	})
 }
 

@@ -426,9 +426,12 @@ type dirEnt struct {
 // single-block ("block form") directory: the dir3/dir2 header, "." and ".."
 // (always directories), the supplied entries, one free region recorded in
 // bestfree, and the trailing leaf-entry array + xfs_dir2_block_tail. It is the
-// single source of truth for the on-disk block layout, shared by short-form
-// conversion and by subsequent adds. Returns an error if the entries don't fit
-// one block (leaf form, not yet implemented).
+// single source of truth for the block-form on-disk layout, used only by
+// writeWholeDir after that function has confirmed the entries fit one block
+// (see fitsOneBlock). Callers that may overflow a block must route through
+// writeWholeDir, which promotes to leaf or node form via buildLeafDir; the
+// overflow error below therefore guards an internal invariant rather than an
+// unimplemented feature.
 func buildBlockDirBlock(sb *superblock, blk []byte, absBlock, ownerIno, parentIno uint64, entries []dirEnt) error {
 	be := binary.BigEndian
 	for i := range blk {
@@ -463,7 +466,7 @@ func buildBlockDirBlock(sb *superblock, blk []byte, absBlock, ownerIno, parentIn
 	for _, e := range all {
 		sz := dirEntrySize(len(e.name), sb.hasFType)
 		if off+sz > leafStart {
-			return fmt.Errorf("xfs: directory %d too large for single-block form (%d entries); leaf form not implemented", ownerIno, count)
+			return fmt.Errorf("xfs: internal error: directory %d (%d entries) overflowed block form; writeWholeDir must route to leaf/node form before calling buildBlockDirBlock", ownerIno, count)
 		}
 		writeDirEntry(blk, off, e.ino, e.name, e.ftype, sb.hasFType)
 		leaves = append(leaves, leafEnt{xfsDirHash([]byte(e.name)), uint32(off) >> 3})
@@ -562,8 +565,12 @@ func blockDirParent(blk []byte, hasFType, hasCRC bool) uint64 {
 	return 0
 }
 
-// convertSFToBlock promotes a short-form directory to block form: it allocates
-// a directory block and lays down all existing entries plus the new one.
+// convertSFToBlock promotes a short-form directory to an on-disk
+// (extents-format) directory by gathering its existing entries plus the new
+// one and handing the complete set to writeWholeDir, the single canonical
+// directory writer. writeWholeDir then chooses block, leaf or node form by
+// footprint, so SF→block→leaf→node growth all flows through one code path
+// rather than this function reimplementing the single-block layout.
 func convertSFToBlock(rw readerWriterAt, partOff int64, sb *superblock, dirIn *inode, newIno uint64, newName string, newFtype uint8) error {
 	be := binary.BigEndian
 
@@ -581,13 +588,6 @@ func convertSFToBlock(rw readerWriterAt, partOff int64, sb *superblock, dirIn *i
 		return err
 	}
 
-	dirBlocks := sb.dirFSBlocks()
-	ag := inoAG(sb, dirIn.num)
-	absBlock, err := writeAllocBlocks(rw, partOff, sb, ag, dirBlocks)
-	if err != nil {
-		return fmt.Errorf("xfs: convertSFToBlock: %w", err)
-	}
-
 	entries := make([]dirEnt, 0, len(existing)+1)
 	for _, e := range existing {
 		if e.Name == "." || e.Name == ".." {
@@ -597,25 +597,7 @@ func convertSFToBlock(rw readerWriterAt, partOff int64, sb *superblock, dirIn *i
 	}
 	entries = append(entries, dirEnt{newName, newIno, newFtype})
 
-	blkSize := int(sb.blockSize) * int(dirBlocks)
-	blk := make([]byte, blkSize)
-	if err := buildBlockDirBlock(sb, blk, absBlock, dirIn.num, parentIno, entries); err != nil {
-		return err
-	}
-	if err := writeWriteBlocksData(rw, partOff, sb, absBlock, dirBlocks, blk); err != nil {
-		return err
-	}
-
-	// Point the inode at the new block via a single extent.
-	exts := []extent{{startOff: 0, startBlock: absBlock, count: dirBlocks}}
-	setInodeFormat(dirIn, inodeFmtExtents)
-	setInodeNBlocks(dirIn, uint64(dirBlocks))
-	setInodeNExtents(dirIn, 1)
-	setInodeSize(dirIn, uint64(blkSize))
-	if err := writeWriteExtentList(dirIn, exts); err != nil {
-		return err
-	}
-	return writeWriteInode(rw, partOff, sb, dirIn)
+	return writeWriteWholeDir(rw, partOff, sb, dirIn, parentIno, entries)
 }
 
 // addEntryToBlockDir adds an entry to an existing block/leaf/node-form
