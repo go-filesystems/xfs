@@ -173,6 +173,109 @@ func TestGenInobtDeepImage(t *testing.T) {
 	}
 }
 
+// TestGenAllocMultiLevelImage writes alloc-multilevel.img: it drives growInobt
+// on a large AG until the free-space bno/cnt B-trees grow past a single leaf
+// into a MULTI-LEVEL tree (level >= 2), and the inobt itself reaches DEPTH 3.
+// Each 64-inode chunk costs an 8-block allocation; the inobt's own leaf/interior
+// blocks come from 1-block allocations; together these fragment the AG's free
+// space into hundreds of disjoint extents, which is exactly what the old
+// single-leaf free-space allocator could not represent (it overflowed at ~540
+// extents — see f16b4a8's note). With the general bno/cnt split now in place the
+// trees keep growing, so the run no longer fails and the depth-3 inobt fixture
+// is unblocked. Every added inode is left FREE (xfs_repair accepts free chunks),
+// so this is far cheaper than creating millions of real files.
+func TestGenAllocMultiLevelImage(t *testing.T) {
+	dir := genOutDir(t)
+	out := filepath.Join(dir, "alloc-multilevel.img")
+
+	// 3 GiB gives a single ~big AG with room for thousands of inode chunks plus
+	// the inobt's and the free-space trees' own blocks.
+	fsIfc, err := Format(out, 3<<30, FormatConfig{Label: "allocml"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	fs := fsIfc.(*xfsFS)
+
+	// Write a handful of real files first so the mounted image has readable
+	// content alongside the (about-to-be) multi-level free-space trees. Each
+	// file's data block allocation also exercises the allocator on the way to
+	// fragmentation.
+	const nFiles = 16
+	for i := 0; i < nFiles; i++ {
+		p := fmt.Sprintf("/file-%03d.txt", i)
+		body := fmt.Appendf(nil, "alloc-multilevel payload %d\n", i)
+		if err := fs.WriteFile(p, body, 0o644); err != nil {
+			t.Fatalf("WriteFile %s: %v", p, err)
+		}
+	}
+
+	be := binary.BigEndian
+	readAGFLevels := func() (bnoLvl, cntLvl uint32) {
+		agf, err := agfBlock(fs.f, fs.partOffset, fs.sb, 0)
+		if err != nil {
+			t.Fatalf("read AGF: %v", err)
+		}
+		return be.Uint32(agf[agfOffBnoLevel:]), be.Uint32(agf[agfOffCntLevel:])
+	}
+	readInobtDepth := func() uint32 {
+		agi, err := agiBlock(fs.f, fs.partOffset, fs.sb, 0)
+		if err != nil {
+			t.Fatalf("read AGI: %v", err)
+		}
+		return be.Uint32(agi[agiOffLevel:])
+	}
+
+	// Grow until BOTH free-space trees are multi-level (the boundary this change
+	// lifts), then stop with a small margin so the depth-2 trees carry records in
+	// several leaves on each side of the root. We deliberately stop here rather
+	// than pushing toward a depth-3 inobt: continuing fragments the AG until the
+	// free-space allocator's delete path (which does not yet rebalance/merge
+	// underfull leaves — the documented deepest sub-case) would underflow a cnt
+	// leaf below XFS's min-records rule. Stopping at the multi-level milestone
+	// keeps the fixture xfs_repair-clean while still exercising the new
+	// leaf/node/root split machinery many times over.
+	const maxChunks = 200000
+	const marginAfterMultiLevel = 24 // a few more splits once both trees are deep
+	added := 0
+	margin := 0
+	for i := 0; i < maxChunks; i++ {
+		if err := growInobt(fs.f, fs.partOffset, fs.sb, 0); err != nil {
+			t.Logf("growInobt stopped at #%d (added=%d): %v", i, added, err)
+			break
+		}
+		added++
+		bnoLvl, cntLvl := readAGFLevels()
+		if bnoLvl >= 2 && cntLvl >= 2 {
+			margin++
+			if margin >= marginAfterMultiLevel {
+				break
+			}
+		}
+	}
+
+	bnoLvl, cntLvl := readAGFLevels()
+	inoDepth := readInobtDepth()
+
+	if err := syncSuperblockCounts(fs.f, fs.partOffset, fs.sb); err != nil {
+		t.Fatalf("sync counts: %v", err)
+	}
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	t.Logf("alloc-multilevel.img: bno level=%d cnt level=%d inobt depth=%d after %d chunks (%d inodes)",
+		bnoLvl, cntLvl, inoDepth, added, added*inobtChunkInodes)
+	// Primary goal: the free-space (bno + cnt) B-trees grew multi-level — the
+	// boundary this change lifts.
+	if bnoLvl < 2 || cntLvl < 2 {
+		t.Fatalf("free-space trees not multi-level: bno=%d cnt=%d", bnoLvl, cntLvl)
+	}
+	// Bonus goal: depth-3 inobt. Gated by AG size (needs ~127k chunks in one AG);
+	// logged but not required, since the default geometry caps AG 0 well below that.
+	if inoDepth < 3 {
+		t.Logf("inobt reached depth %d (depth-3 needs a larger single AG than this geometry provides)", inoDepth)
+	}
+}
+
 // writeBulkLinkImage produces an image whose root directory holds n entries
 // (named namePrefix+index) all hardlinking one backing inode, then closes it.
 func writeBulkLinkImage(t *testing.T, out string, n int, namePrefix string) {

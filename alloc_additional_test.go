@@ -107,7 +107,11 @@ func makeAllocInternal(sb *superblock, keys []allocRec, ptrs []uint32) []byte {
 		be.PutUint32(blk[off:], key.start)
 		be.PutUint32(blk[off+4:], key.count)
 	}
-	ptrOff := hdr + len(keys)*allocKeySize
+	// XFS short-form btree blocks size the key/ptr arrays to maxrecs, so the
+	// pointer array begins at the maxrecs boundary (matching the on-disk format
+	// xfs_repair expects and the multi-level alloc insert/read path uses), not
+	// packed right after numrecs keys.
+	ptrOff := hdr + allocMaxInternal(int(sb.blockSize), hdr)*allocKeySize
 	for i, ptr := range ptrs {
 		be.PutUint32(blk[ptrOff+i*allocPtrSize:], ptr)
 	}
@@ -170,6 +174,7 @@ func restoreAllocHooks(t *testing.T) {
 	oldWriteRawBlock := allocWriteRawBlock
 	oldFreeBlocks := allocFreeBlocks
 	oldRecomputeLongest := allocRecomputeLongest
+	oldMetaAllocBlock := allocMetaAllocBlock
 	// Default the slack-free hook to a success no-op so growInobt mocks that
 	// don't set up a real AGF still exercise their target branch. Tests that
 	// care about the free path override this explicitly.
@@ -201,6 +206,7 @@ func restoreAllocHooks(t *testing.T) {
 		allocWriteRawBlock = oldWriteRawBlock
 		allocFreeBlocks = oldFreeBlocks
 		allocRecomputeLongest = oldRecomputeLongest
+		allocMetaAllocBlock = oldMetaAllocBlock
 	})
 }
 
