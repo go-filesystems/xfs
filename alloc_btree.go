@@ -104,7 +104,11 @@ func allocInsertRecord(rw readerWriterAt, partOff int64, sb *superblock, ag uint
 	if err != nil {
 		return fmt.Errorf("xfs: alloc btree split: alloc root: %w", err)
 	}
-	newRootRel := uint32(newRootAbs % uint64(sb.agBlocks))
+	// allocMetaAllocBlock returns a packed fsbno; decode it with the agblklog
+	// shift/mask (fsbToAgAgbno), NOT a /sb_agblocks division — the two agree only
+	// on a power-of-two sb_agblocks (our Format), so division mis-derives the
+	// AG-relative block on a real mkfs.xfs image. See superblock.fsbToAgAgbno.
+	_, newRootRel := sb.fsbToAgAgbno(newRootAbs)
 
 	hdrSize := sb.agBTreeHdrSize()
 	oldRoot, err := allocReadAGBlock(rw, partOff, sb, ag, rootRel)
@@ -249,7 +253,9 @@ func allocSplitLeaf(rw readerWriterAt, partOff int64, sb *superblock, ag uint32,
 	if err != nil {
 		return allocSplit{}, fmt.Errorf("xfs: alloc btree split: alloc right leaf: %w", err)
 	}
-	rightRel := uint32(rightAbs % uint64(sb.agBlocks))
+	// Packed fsbno -> AG-relative via agblklog shift/mask, not /sb_agblocks
+	// (only equal on a power-of-two sb_agblocks). See superblock.fsbToAgAgbno.
+	_, rightRel := sb.fsbToAgAgbno(rightAbs)
 
 	// Re-read selfRel after the carve, then rebuild the sorted record set.
 	leaf, err := allocReadAGBlock(rw, partOff, sb, ag, selfRel)
@@ -365,7 +371,9 @@ func allocSplitNode(rw readerWriterAt, partOff int64, sb *superblock, ag uint32,
 	if err != nil {
 		return allocSplit{}, fmt.Errorf("xfs: alloc btree split: alloc right node: %w", err)
 	}
-	rightRel := uint32(rightAbs % uint64(sb.agBlocks))
+	// Packed fsbno -> AG-relative via agblklog shift/mask, not /sb_agblocks
+	// (only equal on a power-of-two sb_agblocks). See superblock.fsbToAgAgbno.
+	_, rightRel := sb.fsbToAgAgbno(rightAbs)
 	magic := be.Uint32(node[0:])
 	blockLevel := int(be.Uint16(node[4:]))
 

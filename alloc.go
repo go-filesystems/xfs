@@ -693,8 +693,13 @@ func freeBlocks(rw readerWriterAt, partOff int64, sb *superblock, absStartBlock 
 		}
 	}()
 
-	ag := uint32(absStartBlock / uint64(sb.agBlocks))
-	agStartRel := uint32(absStartBlock % uint64(sb.agBlocks))
+	// absStartBlock is a packed fsbno (every caller derives it from agAbsBlock or
+	// from a decoded bmbt extent's startBlock — both packed). Decode it with the
+	// packing inverse, NOT a /sb_agblocks division: division only matches on a
+	// power-of-two sb_agblocks (our own Format), and would mis-compute ag/agbno on
+	// a real mkfs.xfs image (non-power-of-two sb_agblocks) — corrupting free-space
+	// accounting on a read-modify-write. See superblock.fsbToAgAgbno / agAbsBlock.
+	ag, agStartRel := sb.fsbToAgAgbno(absStartBlock)
 
 	agfBuf, err := allocAGFBlock(rw, partOff, sb, ag)
 	if err != nil {
@@ -1115,7 +1120,11 @@ func growInobt(rw readerWriterAt, partOff int64, sb *superblock, ag uint32) erro
 	if err != nil {
 		return fmt.Errorf("growInobt: alloc %d blocks: %w", blocksPerChunk, err)
 	}
-	probeBase := uint32(probeStart % uint64(sb.agBlocks))
+	// probeStart is a packed fsbno (allocAllocBlocks returns agAbsBlock). Decode
+	// it with the agblklog shift/mask, NOT /sb_agblocks: the two agree only on a
+	// power-of-two sb_agblocks (our Format), so division would mis-derive the
+	// AG-relative base — and thus the chunk alignment — on a real mkfs.xfs image.
+	_, probeBase := sb.fsbToAgAgbno(probeStart)
 
 	var absStart uint64
 	var agBlockBase uint32
@@ -1134,7 +1143,8 @@ func growInobt(rw readerWriterAt, partOff int64, sb *superblock, ag uint32) erro
 		if err != nil {
 			return fmt.Errorf("growInobt: alloc %d blocks: %w", wantBlocks, err)
 		}
-		rawBase := uint32(rawStart % uint64(sb.agBlocks))
+		// Packed fsbno -> AG-relative via agblklog shift/mask, not /sb_agblocks.
+		_, rawBase := sb.fsbToAgAgbno(rawStart)
 		alignedBase := (rawBase + blocksPerChunk - 1) / blocksPerChunk * blocksPerChunk
 		headSlack := alignedBase - rawBase
 		absStart = rawStart + uint64(headSlack)
@@ -1249,7 +1259,8 @@ func inobtInsertChunkRecord(rw readerWriterAt, partOff int64, sb *superblock, ag
 	if err != nil {
 		return fmt.Errorf("growInobt split: alloc root: %w", err)
 	}
-	newRootRel := uint32(newRootAbs % uint64(sb.agBlocks))
+	// Packed fsbno -> AG-relative via agblklog shift/mask, not /sb_agblocks.
+	_, newRootRel := sb.fsbToAgAgbno(newRootAbs)
 
 	hdrSize := sb.agBTreeHdrSize()
 	// Re-read the old root for two things: its on-disk block-level (the new root
@@ -1389,7 +1400,8 @@ func inobtSplitLeaf(rw readerWriterAt, partOff int64, sb *superblock, ag uint32,
 	if err != nil {
 		return inobtSplit{}, fmt.Errorf("growInobt split: alloc right leaf: %w", err)
 	}
-	rightRel := uint32(rightAbs % uint64(sb.agBlocks))
+	// Packed fsbno -> AG-relative via agblklog shift/mask, not /sb_agblocks.
+	_, rightRel := sb.fsbToAgAgbno(rightAbs)
 
 	oldRight := be.Uint32(leaf[12:]) // selfRel's current right sibling
 
@@ -1464,7 +1476,8 @@ func inobtSplitNode(rw readerWriterAt, partOff int64, sb *superblock, ag uint32,
 	if err != nil {
 		return inobtSplit{}, fmt.Errorf("growInobt split: alloc right node: %w", err)
 	}
-	rightRel := uint32(rightAbs % uint64(sb.agBlocks))
+	// Packed fsbno -> AG-relative via agblklog shift/mask, not /sb_agblocks.
+	_, rightRel := sb.fsbToAgAgbno(rightAbs)
 
 	oldRight := be.Uint32(node[12:])
 

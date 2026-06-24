@@ -248,9 +248,15 @@ func writeExtentList(in *inode, exts []extent) error {
 }
 
 // writeBlocksData writes data into nBlocks contiguous filesystem blocks
-// starting at absStartBlock.
+// starting at absStartBlock (a packed fsbno). The byte offset must come from
+// fsbToPhysBlock, NOT from treating the packed fsbno as a flat block index:
+// the two agree only when sb_agblocks is a power of two (our own Format), so a
+// flat offset would write to the wrong location on a real mkfs.xfs image
+// (non-power-of-two sb_agblocks). The run is contiguous within one AG, so the
+// per-block step (+b) is applied to the physical base.
 func writeBlocksData(rw io.WriterAt, partOff int64, sb *superblock, absStartBlock uint64, nBlocks uint32, data []byte) error {
 	bs := int64(sb.blockSize)
+	physBase := int64(sb.fsbToPhysBlock(absStartBlock))
 	for b := uint32(0); b < nBlocks; b++ {
 		blk := make([]byte, bs)
 		start := int64(b) * bs
@@ -261,7 +267,7 @@ func writeBlocksData(rw io.WriterAt, partOff int64, sb *superblock, absStartBloc
 		if start < int64(len(data)) {
 			copy(blk, data[start:end])
 		}
-		off := partOff + int64(absStartBlock+uint64(b))*bs
+		off := partOff + (physBase+int64(b))*bs
 		if _, err := rw.WriteAt(blk, off); err != nil {
 			return fmt.Errorf("xfs: write data block %d: %w", absStartBlock+uint64(b), err)
 		}
