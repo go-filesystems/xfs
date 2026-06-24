@@ -251,3 +251,56 @@ func TestReadSuperblock_ReadError(t *testing.T) {
 		t.Fatalf("expected readSuperblock read error %v, got %v", errBoom, err)
 	}
 }
+
+// TestFsbToAgAgbnoRoundTrip asserts that the packed-fsbno decode (fsbToAgAgbno,
+// the decoder freeBlocks uses) is the exact inverse of agAbsBlock for a
+// NON-power-of-two sb_agblocks — the real mkfs.xfs geometry. A flat
+// /sb_agblocks decode (the prior freeBlocks bug) would mis-split these and was
+// masked because our own Format always emits a power-of-two sb_agblocks.
+func TestFsbToAgAgbnoRoundTrip(t *testing.T) {
+	// agblocks = 20480 (the committed multi-AG fixture's geometry): NOT a power
+	// of two, agblklog = ceil(log2(20480)) = 15.
+	sb := &superblock{agBlocks: 20480, agBlkLog: 15, agCount: 4}
+	if sb.agBlocks&(sb.agBlocks-1) == 0 {
+		t.Fatalf("test geometry agblocks=%d must be non-power-of-two", sb.agBlocks)
+	}
+	for _, ag := range []uint32{0, 1, 2, 3} {
+		for _, agbno := range []uint32{0, 1, 24, 100, 20479} {
+			packed := sb.agAbsBlock(ag, agbno)
+			gotAg, gotAgbno := sb.fsbToAgAgbno(packed)
+			if gotAg != ag || gotAgbno != agbno {
+				t.Errorf("fsbToAgAgbno(agAbsBlock(%d,%d)=%d) = (%d,%d), want (%d,%d)",
+					ag, agbno, packed, gotAg, gotAgbno, ag, agbno)
+			}
+			// The buggy flat decode would disagree for ag>=1 on this geometry,
+			// proving the round-trip actually exercises the packing.
+			flatAg := uint32(packed / uint64(sb.agBlocks))
+			flatAgbno := uint32(packed % uint64(sb.agBlocks))
+			if ag >= 1 && flatAg == gotAg && flatAgbno == gotAgbno {
+				t.Errorf("flat decode coincides with packed for ag=%d agbno=%d on non-pow2 geometry; "+
+					"test no longer distinguishes the bug", ag, agbno)
+			}
+		}
+	}
+}
+
+// TestFsbToAgAgbnoPowerOfTwo confirms the power-of-two path (our Format's
+// geometry) still round-trips — the bug fix must not regress it.
+func TestFsbToAgAgbnoPowerOfTwo(t *testing.T) {
+	sb := &superblock{agBlocks: 16384, agBlkLog: 14, agCount: 4} // 16384 = 2^14
+	for _, ag := range []uint32{0, 1, 3} {
+		for _, agbno := range []uint32{0, 7, 16383} {
+			packed := sb.agAbsBlock(ag, agbno)
+			gotAg, gotAgbno := sb.fsbToAgAgbno(packed)
+			if gotAg != ag || gotAgbno != agbno {
+				t.Errorf("pow2 fsbToAgAgbno round-trip ag=%d agbno=%d: got (%d,%d)",
+					ag, agbno, gotAg, gotAgbno)
+			}
+			// On a power-of-two geometry, packed == flat, so the prior decode
+			// agreed — which is exactly why the bug was masked.
+			if uint32(packed/uint64(sb.agBlocks)) != gotAg {
+				t.Errorf("pow2: flat and packed decode should agree for ag=%d", ag)
+			}
+		}
+	}
+}

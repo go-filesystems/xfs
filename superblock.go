@@ -223,6 +223,23 @@ func (sb *superblock) fsbToPhysBlock(fsbno uint64) uint64 {
 	return agno*uint64(sb.agBlocks) + agbno
 }
 
+// fsbToAgAgbno splits a packed on-disk XFS filesystem block number (fsbno) back
+// into its allocation-group number and AG-relative block. It is the exact
+// inverse of superblock.agAbsBlock (fsbno = (agno<<sb_agblklog)|agbno): the
+// agblklog shift/mask, NOT a /sb_agblocks /%sb_agblocks division.
+//
+// Those two only agree when sb_agblocks is a power of two (sb_agblocks ==
+// 1<<agblklog), as our own Format produces. A real mkfs.xfs image has a
+// non-power-of-two sb_agblocks, so decoding a packed fsbno with division
+// mis-computes the AG and AG-relative block — corrupting per-AG free-space
+// accounting on a read-modify-write of such an image. Always pair agAbsBlock
+// with this decoder (and pair the flat physical index with fsbToPhysBlock).
+func (sb *superblock) fsbToAgAgbno(fsbno uint64) (ag, agbno uint32) {
+	ag = uint32(fsbno >> uint64(sb.agBlkLog))
+	agbno = uint32(fsbno & ((uint64(1) << uint64(sb.agBlkLog)) - 1))
+	return ag, agbno
+}
+
 // sectSize returns the on-disk sector size, defaulting to 512 for an
 // in-memory superblock built before the field was populated.
 func (sb *superblock) sectSize() int64 {
