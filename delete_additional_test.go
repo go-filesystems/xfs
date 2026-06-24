@@ -148,6 +148,14 @@ func TestDeleteFileAdditional(t *testing.T) {
 }
 
 func TestRemoveDirEntryAdditional(t *testing.T) {
+	// The "short form success" subtest overrides the deleteWriteInode hook;
+	// restore it after the test so the no-op writer never leaks into a later
+	// test that performs a real DeleteFile (a leaked no-op silently drops the
+	// inode write, leaving stale dir entries on disk). t.Cleanup runs after all
+	// subtests complete.
+	oldWriteInode := deleteWriteInode
+	t.Cleanup(func() { deleteWriteInode = oldWriteInode })
+
 	sb := defaultSB()
 	rw := newMemRW(0)
 
