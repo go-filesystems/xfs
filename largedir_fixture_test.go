@@ -74,6 +74,24 @@ func gunzipToTemp(t *testing.T, gz []byte, name string) string {
 // fails the test if it reports any problem. It is a no-op (with a log) when
 // xfsprogs is not installed, so the test still does useful structural work on
 // arches/runners without it.
+//
+// The authoritative judge of image health is xfs_repair's *findings* — the
+// corruption markers in its phase output — NOT its exit code. `xfs_repair -n`
+// also probes the HOST filesystem's geometry (of the directory holding the
+// image) to compare its sector size against the image's, and on hosts where
+// that probe fails it prints
+//
+//	Cannot get host filesystem geometry.
+//	Repair may fail if there is a sector size mismatch between
+//	the image and the host filesystem.
+//
+// and then exits non-zero even on a perfectly clean image. This happens on
+// POWER hosts running a 64 KiB-page kernel over a tmpfs $TMPDIR (e.g. the
+// ppc64le cfarm node) against our 512-byte-sector fixtures: a host page/sector
+// assumption leaking from the oracle into a format check that must be
+// host-independent. We therefore treat a non-zero exit as corruption only when
+// it is NOT solely explained by that host-geometry probe warning; the marker
+// scan below remains the real correctness gate in every case.
 func runXfsRepairClean(t *testing.T, img string) {
 	t.Helper()
 	repair := findSbinTool("xfs_repair")
@@ -83,14 +101,27 @@ func runXfsRepairClean(t *testing.T, img string) {
 	}
 	out, err := exec.Command(repair, "-n", img).CombinedOutput()
 	t.Logf("xfs_repair -n %s:\n%s", filepath.Base(img), out)
-	if err != nil {
-		t.Fatalf("xfs_repair -n %s exited non-zero: %v", filepath.Base(img), err)
-	}
+
+	// First, the authoritative check: any real corruption marker fails the test
+	// regardless of exit code.
 	upper := strings.ToUpper(string(out))
 	for _, marker := range []string{"BAD ", "CORRUPT", "WOULD ", "REBUILD", "INCONSISTEN"} {
 		if strings.Contains(upper, marker) {
 			t.Fatalf("xfs_repair -n %s reported %q:\n%s", filepath.Base(img), marker, out)
 		}
+	}
+
+	// A non-zero exit with no corruption markers is only acceptable when it is
+	// attributable to the host-geometry probe failure described above (a host
+	// limitation, not an image defect). Anything else is a genuine error.
+	if err != nil {
+		if strings.Contains(upper, "CANNOT GET HOST FILESYSTEM GEOMETRY") {
+			t.Logf("xfs_repair -n %s could not read the host's geometry (host limitation, "+
+				"not an image defect); image is clean per the marker scan — %v",
+				filepath.Base(img), err)
+			return
+		}
+		t.Fatalf("xfs_repair -n %s exited non-zero: %v", filepath.Base(img), err)
 	}
 }
 
