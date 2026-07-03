@@ -163,7 +163,6 @@ func restoreAllocHooks(t *testing.T) {
 	oldCntFindBlock := allocCntFindBlock
 	oldBtreeDeleteRecord := allocBtreeDeleteRecord
 	oldBnoDeleteRecord := allocBnoDeleteRecord
-	oldCntDeleteRecord := allocCntDeleteRecord
 	oldDeleteFreeBlocks := allocDeleteFreeBlocks
 	oldBnoUpdateRecord := allocBnoUpdateRecord
 	oldBnoFindRecord := allocBnoFindRecord
@@ -197,7 +196,6 @@ func restoreAllocHooks(t *testing.T) {
 		allocCntFindBlock = oldCntFindBlock
 		allocBtreeDeleteRecord = oldBtreeDeleteRecord
 		allocBnoDeleteRecord = oldBnoDeleteRecord
-		allocCntDeleteRecord = oldCntDeleteRecord
 		allocDeleteFreeBlocks = oldDeleteFreeBlocks
 		allocBnoUpdateRecord = oldBnoUpdateRecord
 		allocBnoFindRecord = oldBnoFindRecord
