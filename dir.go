@@ -467,24 +467,6 @@ func findFreeSlot(blk []byte, need int, hasFType, hasCRC bool) int {
 	return -1
 }
 
-// insertIntoSlot writes a new directory entry into the free slot at offset.
-// If the slot is larger than needed, the remainder becomes a new free chunk.
-func insertIntoSlot(blk []byte, offset, need int, ino uint64, name string, ftype uint8, hasFType, hasCRC bool, absBlock uint64) error {
-	totalFree := int(binary.BigEndian.Uint16(blk[offset+2:]))
-	writeDirEntry(blk, offset, ino, name, ftype, hasFType)
-	remain := totalFree - need
-	if remain >= 8 { // minimum unused-entry size
-		markSlotFree(blk, offset+need, remain)
-	}
-	// Update directory data header CRC if v5.
-	if hasCRC {
-		if len(blk) >= dir3DataHdrSize {
-			updateCRC(blk, 4, len(blk)) // CRC field is at offset 4 in dir3_blk_hdr
-		}
-	}
-	return nil
-}
-
 // addEntryToSFDir appends a new entry to a short-form directory inode.
 // Returns false when the inode's data fork has no room and a format upgrade
 // (sf → block) would be needed.

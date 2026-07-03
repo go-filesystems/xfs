@@ -18,63 +18,6 @@ import (
 // grow to arbitrary depth/width, so node form scales to directories of any
 // size (millions of entries).
 
-// gatherDirEntries returns every real entry (excluding "." and "..") of a
-// directory plus its parent inode, working for short-form, block-form and
-// leaf-form directories.
-func gatherDirEntries(rw readerWriterAt, partOff int64, sb *superblock, in *inode) ([]dirEnt, uint64, error) {
-	be := binary.BigEndian
-	var ents []dirEnt
-	var parent uint64
-
-	if in.format == inodeFmtLocal {
-		fork := in.dataFork()
-		if len(fork) < 6 {
-			return nil, 0, nil
-		}
-		if fork[1] > 0 {
-			parent = be.Uint64(fork[2:])
-		} else {
-			parent = uint64(be.Uint32(fork[2:]))
-		}
-		des, err := writeSFReadDir(fork, sb.hasFType)
-		if err != nil {
-			return nil, 0, err
-		}
-		for _, d := range des {
-			if d.Name != "." && d.Name != ".." {
-				ents = append(ents, dirEnt{d.Name, d.Inode, d.FileType})
-			}
-		}
-		return ents, parent, nil
-	}
-
-	exts, err := writeDirExtents(rw, partOff, sb, in)
-	if err != nil {
-		return nil, 0, err
-	}
-	leafLog := dirLeafByteOffset / uint64(sb.blockSize)
-	firstData := true
-	for _, e := range exts {
-		if e.startOff >= leafLog {
-			continue // leaf / free-index blocks, not data
-		}
-		for b := uint32(0); b < e.count; b++ {
-			blk, err := writeReadRawBlock(rw, partOff, sb, e.startBlock+uint64(b))
-			if err != nil {
-				return nil, 0, err
-			}
-			if firstData {
-				parent = blockDirParent(blk, sb.hasFType, sb.hasCRC)
-				firstData = false
-			}
-			for _, d := range parseDirBlock(blk, sb.hasFType, sb.hasCRC) {
-				ents = append(ents, dirEnt{d.Name, d.Inode, d.FileType})
-			}
-		}
-	}
-	return ents, parent, nil
-}
-
 // dirBlockLayout returns the directory's current data-block list and whether it
 // has a leaf/index block, from its extent map.
 func dirBlockLayout(rw readerWriterAt, partOff int64, sb *superblock, in *inode) (dataBlocks []uint64, hasLeaf bool, err error) {

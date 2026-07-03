@@ -98,7 +98,6 @@ var allocWriteAGBTree = writeAGBTree
 var allocCntFindBlock = cntFindBlock
 var allocBtreeDeleteRecord = btreeDeleteRecord
 var allocBnoDeleteRecord = bnoDeleteRecord
-var allocCntDeleteRecord = cntDeleteRecord
 var allocBnoUpdateRecord = bnoUpdateRecord
 var allocBnoFindRecord = bnoFindRecord
 var allocBnoInsertRecord = bnoInsertRecord
@@ -594,14 +593,6 @@ func btreeDeleteRecord(rw readerWriterAt, partOff int64, sb *superblock, ag uint
 // passing 0 keeps allocDeleteRecord's signature uniform with the cnt path.
 func bnoDeleteRecord(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, rootRel uint32, level int, agStartRel uint32) error {
 	return allocDeleteRecord(rw, partOff, sb, ag, rootRel, level, agStartRel, 0, true)
-}
-
-// cntDeleteRecord deletes the cnt B-tree record for the free extent that starts
-// at agStartRel and has length count, with full B+tree semantics. The cnt tree
-// is keyed by (count,start) so both are needed to disambiguate equal-length
-// extents.
-func cntDeleteRecord(rw readerWriterAt, partOff int64, sb *superblock, ag uint32, rootRel uint32, level int, agStartRel, count uint32) error {
-	return allocDeleteRecord(rw, partOff, sb, ag, rootRel, level, agStartRel, count, false)
 }
 
 // bnoUpdateRecord replaces the bno B-tree record at oldStart with

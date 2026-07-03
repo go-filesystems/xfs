@@ -28,7 +28,6 @@ var writeReadRawBlock = readRawBlock
 var writeWriteRawBlock = writeRawBlock
 var writeConvertSFToBlock = convertSFToBlock
 var writeSFReadDir = sfReadDir
-var writeInsertIntoSlot = insertIntoSlot
 var writeReadDir = readDir
 var writeWriteWholeDir = writeWholeDir
 
