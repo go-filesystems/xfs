@@ -211,7 +211,11 @@ func repairClean(t *testing.T, xfsRepair, img string) {
 		t.Fatalf("xfs_repair -n exited non-zero: %v", runErr)
 	}
 	upper := strings.ToUpper(string(out))
-	for _, marker := range []string{"ERROR", "CORRUPT", "WOULD ", "BAD ", "DISCONNECTED INODE"} {
+	// Note: xfs_repair always prints the benign phase header "moving disconnected
+	// inodes to lost+found ..."; a *real* disconnection additionally prints
+	// "... would move to lost+found", which the "WOULD " marker catches — so we
+	// do not match on "disconnected" itself.
+	for _, marker := range []string{"ERROR", "CORRUPT", "WOULD ", "BAD "} {
 		if strings.Contains(upper, marker) {
 			t.Fatalf("xfs_repair -n reported %q in output:\n%s", marker, out)
 		}
