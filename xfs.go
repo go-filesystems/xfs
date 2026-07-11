@@ -49,6 +49,9 @@ const (
 	magicIAB3   uint32 = 0x49414233 // "IAB3" — v5 inobt
 	magicIABTv4 uint32 = 0x54494142 // "TIAB" — v4 inobt
 
+	// Reference-count B-tree magic (reflink). v5 only; there is no v4 form.
+	magicRefcnt uint32 = 0x52334643 // "R3FC" — XFS_REFC_CRC_MAGIC
+
 	// Inode data-fork formats (di_format).
 	inodeFmtLocal   = 1 // inline data / short-form directory
 	inodeFmtExtents = 2 // flat extent array in data fork

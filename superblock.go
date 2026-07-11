@@ -12,8 +12,9 @@ import (
 type superblock struct {
 	blockSize  uint32
 	sectorSize uint32 // sb_sectsize; AG headers (SB/AGF/AGI/AGFL) are sector-aligned
-	agBlocks   uint32 // blocks per allocation group
+	agBlocks   uint32 // blocks per allocation group (size of a full AG)
 	agCount    uint32
+	dBlocks    uint64 // sb_dblocks: total data blocks (last AG may be partial)
 	rootIno    uint64 // root directory inode number
 	inodeSize  uint16
 	inopBlock  uint16 // inodes per block
@@ -22,7 +23,15 @@ type superblock struct {
 	dirBlkLog  uint8  // log2(dir block size in FS blocks)
 	hasCRC     bool   // v5 CRC-enabled superblock
 	hasFType   bool   // directory entries carry ftype byte
+	hasReflink bool   // XFS_SB_FEAT_RO_COMPAT_REFLINK: shared-extent (COW) support
 	features2  uint32 // v4 sb_features2 (v5 rarely needed)
+	// Quota state, mirrored from the on-disk superblock. quotaFlags is
+	// sb_qflags (XFS_*QUOTA_ACCT/ENFD/CHKD); the three inode numbers point at
+	// the user/group/project quota inodes (0 = feature not enabled).
+	quotaFlags uint16
+	uQuotino   uint64
+	gQuotino   uint64
+	pQuotino   uint64
 	// UUID and Label are stored in the on-disk superblock but were not
 	// previously retained in the in-memory representation. Grow operations
 	// need the UUID to initialize new AG structures and the label when
@@ -59,10 +68,21 @@ const (
 	sbOffDirBlkLog    = 192
 	sbOffImaxPct      = 127
 	sbOffInoAlignmt   = 180
+	sbOffFRExtents    = 152 // sb_frextents (__be64)
+	sbOffUQuotino     = 160 // sb_uquotino  (__be64) user quota inode
+	sbOffGQuotino     = 168 // sb_gquotino  (__be64) group quota inode
+	sbOffQFlags       = 176 // sb_qflags    (__be16) quota accounting/enforcement
 	sbOffFeatures2    = 200
 	sbOffBadFeatures2 = 204
+	sbOffFeatCompat   = 208 // v5 sb_features_compat
+	sbOffFeatRoCompat = 212 // v5 sb_features_ro_compat (finobt/rmapbt/REFLINK/inobtcnt)
 	sbOffFeatIncompat = 216
+	sbOffFeatLogInc   = 220 // v5 sb_features_log_incompat
 	sbOffCRC          = 224 // v5 only, __le32
+	sbOffSpinoAlign   = 228 // v5 sb_spino_align (__be32)
+	sbOffPQuotino     = 232 // v5 sb_pquotino (__be64) project quota inode
+	sbOffLSN          = 240 // v5 sb_lsn (__be64)
+	sbOffMetaUUID     = 248 // v5 sb_meta_uuid (16 bytes)
 	sbCRCLen          = 512 // CRC covers the whole superblock sector (sectsize)
 )
 
@@ -72,10 +92,46 @@ const (
 	xfsSBVersion5    = 5
 	// xfsSBVersionV5 is the canonical v5 sb_versionnum: version 5 plus
 	// MOREBITS|DIRV2|EXTFLG|LOGV2|ALIGN|NLINK — what mkfs.xfs writes (0xb4a5).
-	xfsSBVersionV5   = 0xb4a5
-	xfsSBFeatures2   = 0x0000018a // sb_features2 (LAZYSBCOUNT|ATTR2|PROJID32|FTYPE)
-	xfsSBFeatFType   = 0x00000001 // v5 sb_features_incompat ftype (XFS_SB_FEAT_INCOMPAT_FTYPE)
-	xfsSBv4FeatFType = 0x00000200 // v4 sb_features2 ftype (XFS_SB_VERSION2_FTYPE)
+	xfsSBVersionV5 = 0xb4a5
+	// xfsSBVersionQuotaBit (XFS_SB_VERSION_QUOTABIT, 0x0040) must be set in
+	// sb_versionnum whenever the classic quota inodes (sb_uquotino etc.) are in
+	// use. xfs_repair's xfs_has_quota() keys off this bit; without it the quota
+	// inodes are never marked reached and get reported as disconnected. Value
+	// verified against libxfs/xfs_format.h and a kernel-created classic-quota
+	// image (versionnum 0xb4a5 -> 0xb4e5).
+	xfsSBVersionQuotaBit = 0x0040
+	xfsSBFeatures2       = 0x0000018a // sb_features2 (LAZYSBCOUNT|ATTR2|PROJID32|FTYPE)
+	xfsSBFeatFType       = 0x00000001 // v5 sb_features_incompat ftype (XFS_SB_FEAT_INCOMPAT_FTYPE)
+	xfsSBv4FeatFType     = 0x00000200 // v4 sb_features2 ftype (XFS_SB_VERSION2_FTYPE)
+
+	// v5 sb_features_ro_compat bits. We only ever set/require REFLINK; the
+	// finobt/rmapbt/inobtcnt bits are recognised on read but not produced.
+	xfsSBFeatRoFinobt   = 0x00000001 // XFS_SB_FEAT_RO_COMPAT_FINOBT
+	xfsSBFeatRoRmapbt   = 0x00000002 // XFS_SB_FEAT_RO_COMPAT_RMAPBT
+	xfsSBFeatRoReflink  = 0x00000004 // XFS_SB_FEAT_RO_COMPAT_REFLINK
+	xfsSBFeatRoInobtcnt = 0x00000008 // XFS_SB_FEAT_RO_COMPAT_INOBTCNT
+	// Mask of ro_compat bits this implementation understands. A superblock
+	// carrying an unknown ro_compat bit is still readable (ro_compat = "safe
+	// to mount read-only"), so we do not reject it — we simply do not act on it.
+	xfsSBFeatRoKnown = xfsSBFeatRoFinobt | xfsSBFeatRoRmapbt | xfsSBFeatRoReflink | xfsSBFeatRoInobtcnt
+)
+
+// quota flag bits (sb_qflags, __be16). Layout mirrors XFS_*QUOTA_* in
+// fs/xfs/libxfs/xfs_quota_defs.h. Verified against a mkfs.xfs -m
+// uquota,gquota,pquota reference image (sb_qflags = 0x2cb = ACCT|ENFD for
+// all three quota types).
+const (
+	xfsUQuotaAcct = 0x0001 // XFS_UQUOTA_ACCT: user quota accounting on
+	xfsUQuotaEnfd = 0x0002 // XFS_UQUOTA_ENFD: user quota limits enforced
+	xfsUQuotaChkd = 0x0004 // XFS_UQUOTA_CHKD: user quotacheck run
+	xfsPQuotaAcct = 0x0008 // XFS_PQUOTA_ACCT: project quota accounting on
+	xfsOQuotaEnfd = 0x0010 // XFS_OQUOTA_ENFD: legacy other (grp/prj) enforce
+	xfsOQuotaChkd = 0x0020 // XFS_OQUOTA_CHKD: legacy other quotacheck
+	xfsGQuotaAcct = 0x0040 // XFS_GQUOTA_ACCT: group quota accounting on
+	xfsGQuotaEnfd = 0x0080 // XFS_GQUOTA_ENFD: group quota limits enforced
+	xfsGQuotaChkd = 0x0100 // XFS_GQUOTA_CHKD: group quotacheck run
+	xfsPQuotaEnfd = 0x0200 // XFS_PQUOTA_ENFD: project quota limits enforced
+	xfsPQuotaChkd = 0x0400 // XFS_PQUOTA_CHKD: project quotacheck run
 )
 
 // readSuperblock reads and parses the XFS superblock from offset partOff.
@@ -95,10 +151,11 @@ func readSuperblock(r io.ReaderAt, partOff int64) (*superblock, error) {
 	version := versionNum & xfsSBVersionBits
 	hasCRC := version == xfsSBVersion5
 
-	var hasFType bool
+	var hasFType, hasReflink bool
 	if hasCRC {
 		featIncompat := be.Uint32(buf[sbOffFeatIncompat:])
 		hasFType = (featIncompat & xfsSBFeatFType) != 0
+		hasReflink = (be.Uint32(buf[sbOffFeatRoCompat:]) & xfsSBFeatRoReflink) != 0
 	} else {
 		feat2 := be.Uint32(buf[sbOffFeatures2:])
 		hasFType = (feat2 & xfsSBv4FeatFType) != 0
@@ -113,6 +170,7 @@ func readSuperblock(r io.ReaderAt, partOff int64) (*superblock, error) {
 		sectorSize: sectorSize,
 		agBlocks:   be.Uint32(buf[sbOffAgBlocks:]),
 		agCount:    be.Uint32(buf[sbOffAgCount:]),
+		dBlocks:    be.Uint64(buf[sbOffDBlocks:]),
 		rootIno:    be.Uint64(buf[sbOffRootIno:]),
 		inodeSize:  be.Uint16(buf[sbOffInodeSize:]),
 		inopBlock:  be.Uint16(buf[sbOffInopBlock:]),
@@ -121,7 +179,14 @@ func readSuperblock(r io.ReaderAt, partOff int64) (*superblock, error) {
 		dirBlkLog:  buf[sbOffDirBlkLog],
 		hasCRC:     hasCRC,
 		hasFType:   hasFType,
+		hasReflink: hasReflink,
 		features2:  be.Uint32(buf[sbOffFeatures2:]),
+	}
+	if hasCRC {
+		sb.quotaFlags = be.Uint16(buf[sbOffQFlags:])
+		sb.uQuotino = be.Uint64(buf[sbOffUQuotino:])
+		sb.gQuotino = be.Uint64(buf[sbOffGQuotino:])
+		sb.pQuotino = be.Uint64(buf[sbOffPQuotino:])
 	}
 	// Extract UUID (16 bytes at offset 32) and label (12 bytes at offset 108).
 	copy(sb.uuid[:], buf[32:48])
@@ -206,6 +271,22 @@ func validateGeometry(sb *superblock) error {
 // agByteOffset returns the byte offset of the first block of allocation group ag.
 func (sb *superblock) agByteOffset(ag uint32) int64 {
 	return int64(ag) * int64(sb.agBlocks) * int64(sb.blockSize)
+}
+
+// agLength returns the number of blocks in allocation group ag. Every AG is
+// sb_agblocks blocks except possibly the final one, which is shorter when
+// sb_dblocks is not a whole multiple of sb_agblocks (a partial last AG, as
+// xfs_growfs can produce). Falls back to sb_agblocks when dBlocks is unset
+// (e.g. a superblock built before the field was populated).
+func (sb *superblock) agLength(ag uint32) uint32 {
+	if sb.dBlocks == 0 {
+		return sb.agBlocks
+	}
+	full := sb.dBlocks / uint64(sb.agBlocks)
+	if uint64(ag) < full {
+		return sb.agBlocks
+	}
+	return uint32(sb.dBlocks - full*uint64(sb.agBlocks))
 }
 
 // fsbToPhysBlock converts a packed on-disk XFS filesystem block number (fsbno)
