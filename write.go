@@ -74,6 +74,15 @@ func overwriteFile(rw readerWriterAt, partOff int64, sb *superblock, ino uint64,
 		return fmt.Errorf("xfs: inode %d is not a regular file", ino)
 	}
 
+	// A reflinked file shares its blocks with another inode, so rewriting it in
+	// place (or freeing its extents outright) would corrupt the peer. Break the
+	// share copy-on-write: decrement the shared extents' reference counts,
+	// allocate fresh private blocks for the new content, and drop the reflink
+	// flag. WriteFile replaces the whole file, so nothing stays shared.
+	if inodeIsReflinked(in) {
+		return reflinkBreakAndWrite(rw, partOff, sb, in, data)
+	}
+
 	newSize := uint64(len(data))
 	blockSize := uint64(sb.blockSize)
 	newBlocks := (newSize + blockSize - 1) / blockSize

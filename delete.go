@@ -21,6 +21,7 @@ var deleteReadDir = readDir
 var deleteWriteWholeDir = writeWholeDir
 var deleteDirDeleteDir func(readerWriterAt, int64, *superblock, string) error
 var deleteDirDeleteFile func(readerWriterAt, int64, *superblock, string) error
+var deleteFreeExtentCOW = refcountFreeExtent
 
 func init() {
 	deleteDirDeleteDir = deleteDir
@@ -78,10 +79,27 @@ func deleteFile(rw readerWriterAt, partOff int64, sb *superblock, p string) erro
 		if err != nil {
 			return fmt.Errorf("xfs: get extents for inode %d: %w", childIno, err)
 		}
+		reflinked := inodeIsReflinked(in)
 		for _, e := range exts {
+			if reflinked {
+				// Copy-on-write: decrement the shared reference count and free
+				// only the sub-ranges no longer referenced by any other inode.
+				if err := deleteFreeExtentCOW(rw, partOff, sb, e.startBlock, e.count); err != nil {
+					return fmt.Errorf("xfs: cow-free blocks for inode %d: %w", childIno, err)
+				}
+				continue
+			}
 			if err := deleteFreeBlocks(rw, partOff, sb, e.startBlock, e.count); err != nil {
 				return fmt.Errorf("xfs: free blocks for inode %d: %w", childIno, err)
 			}
+		}
+		if reflinked {
+			// A reflinked inode's extents may still be referenced by other
+			// inodes after the COW decrement, so its stale bmap must not survive
+			// on the freed inode or xfs_repair reports "free inode contains
+			// errors" (a free inode whose extents point at in-use blocks). Reset
+			// the fork to an empty extents inode and drop the reflink flag.
+			resetFreedInodeFork(in)
 		}
 	}
 

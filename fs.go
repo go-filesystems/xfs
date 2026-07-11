@@ -27,6 +27,8 @@ var fsRenameEntry = renameEntry
 var fsSymlinkInode = symlinkInode
 var fsTruncateInode = truncateInode
 var fsLinkInode = linkInode
+var fsReflinkFile = reflinkFile
+var fsQuotaRecompute = quotaRecompute
 
 // readerWriterAt combines io.ReaderAt and io.WriterAt.
 type readerWriterAt interface {
@@ -122,6 +124,13 @@ type FS interface {
 	Symlink(target, linkPath string) error
 	Truncate(path string, newSize int64) error
 	Link(oldPath, newPath string) error
+	// Reflink clones srcPath into a new file dstPath that shares srcPath's
+	// data extents copy-on-write (the equivalent of `cp --reflink`). It
+	// requires the filesystem to have been formatted with reflink support
+	// (FormatConfig.Reflink); dstPath must not already exist.
+	Reflink(srcPath, dstPath string) error
+	// HasReflink reports whether the filesystem carries the reflink feature.
+	HasReflink() bool
 	Label() string
 	SetLabel(label string) error
 }
@@ -190,29 +199,53 @@ func (fs *xfsFS) Grow(newSizeBytes int64) error {
 	if newSizeBytes%blockSize != 0 {
 		return fmt.Errorf("xfs: grow: size %d is not a multiple of block size %d", newSizeBytes, fs.sb.blockSize)
 	}
+	agBlocks := int64(fs.sb.agBlocks)
 
-	curSize := int64(fs.sb.agCount) * int64(fs.sb.agBlocks) * blockSize
-	if newSizeBytes == curSize {
+	curDBlocks := int64(fs.sb.dBlocks)
+	if curDBlocks == 0 {
+		curDBlocks = int64(fs.sb.agCount) * agBlocks
+	}
+	newDBlocks := newSizeBytes / blockSize
+	curSize := curDBlocks * blockSize
+	if newDBlocks == curDBlocks {
 		return nil
 	}
-	if newSizeBytes < curSize {
+	if newDBlocks < curDBlocks {
 		return fmt.Errorf("xfs: grow: size %d < current size %d (shrink not supported)", newSizeBytes, curSize)
 	}
 
-	agSize := int64(fs.sb.agBlocks) * blockSize
-	if newSizeBytes%agSize != 0 {
-		return fmt.Errorf("xfs: grow: size %d is not a multiple of AG size %d (XFS only adds whole AGs)", newSizeBytes, agSize)
+	// Growing a filesystem whose current last AG is already partial would
+	// require rewriting that AG's AGF/AGI/free-space B-trees in place (extending
+	// the final AG). That in-place extension is not implemented; the last AG
+	// must currently be full before growing.
+	if curDBlocks%agBlocks != 0 {
+		return fmt.Errorf("xfs: grow: current filesystem ends in a partial AG (%d blocks); in-place extension of a partial last AG is not supported", curDBlocks)
 	}
-	newAgCount := uint32(newSizeBytes / agSize)
 
-	// Extend backing file to include the new AGs.
+	// New AG count: ceil(newDBlocks / agBlocks). The final AG may be partial.
+	newAgCount := uint32((newDBlocks + agBlocks - 1) / agBlocks)
+	// Reject a partial last AG too small to hold its own metadata plus a free
+	// extent — xfs_repair rejects an undersized AG.
+	if lastLen := newDBlocks - int64(newAgCount-1)*agBlocks; lastLen < growMinAGBlocks {
+		return fmt.Errorf("xfs: grow: final partial AG of %d blocks is smaller than the minimum %d", lastLen, growMinAGBlocks)
+	}
+
+	// Extend backing file to the new size.
 	if err := fs.f.Truncate(fs.partOffset + newSizeBytes); err != nil {
 		return fmt.Errorf("xfs: grow: truncate: %w", err)
 	}
 
-	// Initialize each newly appended AG (per-AG metadata at blocks 1..5
-	// + secondary SB at block 0).
-	for ag := fs.sb.agCount; ag < newAgCount; ag++ {
+	// Publish the new geometry before writing the AGs so agLength() and the
+	// superblock buffers reflect the final block count (and the partial last AG).
+	fs.sb.dBlocks = uint64(newDBlocks)
+	fs.sb.agCount = newAgCount
+
+	// Initialize each newly appended AG (full, except possibly the last) and its
+	// secondary superblock.
+	for ag := uint32(0); ag < newAgCount; ag++ {
+		if int64(ag)*agBlocks < curDBlocks {
+			continue // pre-existing AG
+		}
 		if err := fmtWriteAG(fs.f, fs.sb, ag, fs.sb.uuid); err != nil {
 			return fmt.Errorf("xfs: grow: write AG %d: %w", ag, err)
 		}
@@ -221,16 +254,21 @@ func (fs *xfsFS) Grow(newSizeBytes int64) error {
 		}
 	}
 
-	// Rewrite primary superblock with the updated AG count and re-CRC.
+	// Rewrite primary superblock with the updated geometry and re-CRC.
 	if err := fmtWriteSuperblock(fs.f, fs.sb, newAgCount, fs.sb.uuid, fs.sb.label); err != nil {
 		return fmt.Errorf("xfs: grow: write superblock: %w", err)
 	}
 	if err := fs.f.Sync(); err != nil {
 		return fmt.Errorf("xfs: grow: sync: %w", err)
 	}
-	fs.sb.agCount = newAgCount
 	return nil
 }
+
+// growMinAGBlocks is the smallest number of blocks a (partial) final AG may
+// have. It must comfortably exceed the fixed per-AG metadata footprint (B-tree
+// roots + AGFL + optional refcount root) so the AG still carries a usable free
+// extent; XFS itself rejects tiny allocation groups.
+const growMinAGBlocks = 256
 
 // GrowTo is the historical name for Grow and is kept for callers that
 // target the filesystem.Grower interface. New code should call Grow.
@@ -245,7 +283,11 @@ func (fs *xfsFS) GrowTo(newSizeBytes int64) error {
 // sizes route to Grow.
 func (fs *xfsFS) Resize(newSizeBytes int64) error {
 	fs.mu.RLock()
-	curSize := int64(fs.sb.agCount) * int64(fs.sb.agBlocks) * int64(fs.sb.blockSize)
+	curDBlocks := int64(fs.sb.dBlocks)
+	if curDBlocks == 0 {
+		curDBlocks = int64(fs.sb.agCount) * int64(fs.sb.agBlocks)
+	}
+	curSize := curDBlocks * int64(fs.sb.blockSize)
 	fs.mu.RUnlock()
 	if newSizeBytes < curSize {
 		return filesystem.ErrShrinkUnsupported
@@ -308,7 +350,12 @@ func (fs *xfsFS) afterMutation(err error) error {
 	if err != nil {
 		return err
 	}
-	return syncSuperblockCounts(fs.f, fs.partOffset, fs.sb)
+	if err := syncSuperblockCounts(fs.f, fs.partOffset, fs.sb); err != nil {
+		return err
+	}
+	// Keep the quota accounting consistent when quotas are enabled (a full
+	// quotacheck; a no-op otherwise).
+	return fsQuotaRecompute(fs.f, fs.partOffset, fs.sb)
 }
 
 // WriteFile creates or overwrites the regular file at path with the given data
@@ -325,6 +372,23 @@ func (fs *xfsFS) DeleteFile(path string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	return fs.afterMutation(fsDeleteFile(fs.f, fs.partOffset, fs.sb, path))
+}
+
+// Reflink clones srcPath into a new file dstPath that shares srcPath's data
+// extents copy-on-write, maintaining the per-AG refcount B-tree. Requires the
+// filesystem to have been formatted with reflink support; dstPath must not
+// already exist.
+func (fs *xfsFS) Reflink(srcPath, dstPath string) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.afterMutation(fsReflinkFile(fs.f, fs.partOffset, fs.sb, srcPath, dstPath))
+}
+
+// HasReflink reports whether the filesystem carries the reflink feature bit.
+func (fs *xfsFS) HasReflink() bool {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	return fs.sb.hasReflink
 }
 
 // Link creates a hardlink at newPath pointing at the inode at oldPath. The
@@ -434,7 +498,9 @@ func (fs *xfsFS) Rename(oldPath, newPath string) error {
 func (fs *xfsFS) Chown(path string, uid, gid uint32) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	return chownInode(fs.f, fs.partOffset, fs.sb, path, uid, gid)
+	// Ownership changes reassign the inode's quota charge, so run the quota
+	// reconciliation (a no-op when quotas are disabled).
+	return fs.afterMutation(chownInode(fs.f, fs.partOffset, fs.sb, path, uid, gid))
 }
 
 // Chmod replaces the permission bits of the inode at path; the file-type

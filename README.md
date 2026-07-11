@@ -20,7 +20,9 @@ https://docs.kernel.org/filesystems/xfs/index.html
 |---|---:|---|
 | Open / Close | ✅ | Supports v5 XFS images (ftype, CRC32c) |
 | Format | ✅ | Creates XFS images |
-| Grow / Resize | ✅ | Grow supported; shrink returns `ErrShrinkUnsupported` |
+| Grow / Resize | ✅ | Whole-AG **and partial last-AG** growth (`xfs_growfs`-style); shrink returns `ErrShrinkUnsupported` |
+| Reflink (shared extents / COW) | ✅ | `FormatConfig.Reflink`; per-AG refcount B-tree, `FS.Reflink` clone, COW-aware delete/overwrite |
+| Quotas (user / group / project) | ✅ | `FormatConfig.Quota`; classic quota inodes + dquots, kept consistent by an inode-scan quotacheck |
 | ReadFile | ✅ | Full file reads supported, incl. `NREXT64` (64-bit extent counts) images from modern `mkfs.xfs` |
 | WriteFile | ✅ | Full file writes supported |
 | MkDir / Delete / Rename | ✅ | Directory and rename operations supported |
@@ -28,9 +30,38 @@ https://docs.kernel.org/filesystems/xfs/index.html
 | ReadLink / Symlinks | ✅ | Inline and remote (extent-based) targets, incl. the v5 `xfs_dsymlink_hdr` written by the kernel |
 | Partitioned images | ✅ | MBR/GPT auto-detected |
 
+All three advanced features above produce `xfs_repair -n`-clean images (validated
+against `xfsprogs` 6.13 in CI on native amd64/arm64 runners).
+
+## Advanced features
+
+### Reflink (shared extents, copy-on-write)
+
+Format with `FormatConfig{Reflink: true}` to enable the
+`XFS_SB_FEAT_RO_COMPAT_REFLINK` feature bit and a per-AG reference-count B-tree
+(`refcountbt`, matching `mkfs.xfs -m reflink=1,rmapbt=0`). `FS.Reflink(src, dst)`
+then clones a file so it shares physical extents; deleting or overwriting a
+reflinked file is copy-on-write (the shared extents' reference counts are
+decremented and blocks are freed only when no longer shared).
+
+### Quotas
+
+Format with `FormatConfig{Quota: QuotaConfig{User, Group, Project, Enforce}}` to
+create the classic (non-metadir) quota inodes (`sb_uquotino`/`sb_gquotino`/
+`sb_pquotino`), seed their dquot clusters, and set `sb_qflags` + the
+`XFS_SB_VERSION_QUOTABIT`. Block/inode accounting is kept consistent after every
+mutating operation by a full inode-scan quotacheck.
+
 ## Limitations
 
-- Advanced XFS features (online resizing, quotas, reflink, snapshots) are not implemented.
+- Snapshots are an LVM/device-mapper concern, not an XFS on-disk feature, and are
+  out of scope for this filesystem-format library.
+- Residuals in the advanced features: the reference-count B-tree is single-level
+  (a share touching more distinct extents than fit one root block returns an
+  error rather than growing the tree); growing a filesystem whose current last AG
+  is already partial (in-place extension of that AG) is not supported — the last
+  AG must be full before the next grow; quota files are a single dquot block, so
+  identities beyond ~30 (one block of dquots) are not tracked.
 - Intended for testing and tooling; not recommended for production workloads.
 
 ## Module
@@ -54,6 +85,8 @@ github.com/go-filesystems/xfs
 | DeleteDir    | ✅ implemented |
 | Rename       | ✅ implemented |
 | ReadLink     | ✅ implemented |
+| Reflink      | ✅ implemented |
+| Grow / Resize | ✅ implemented |
 
 ## API
 
@@ -61,11 +94,23 @@ github.com/go-filesystems/xfs
 
 ```go
 type FormatConfig struct {
-    UUID  [16]byte // zero = randomly generated
-    Label string
+    UUID    [16]byte // zero = randomly generated
+    Label   string
+    Reflink bool        // enable shared-extent (COW) support
+    Quota   QuotaConfig // enable user/group/project quota accounting
+}
+
+type QuotaConfig struct {
+    User, Group, Project bool // which quota types to account
+    Enforce              bool // also set the *_ENFD (limit enforcement) flags
 }
 
 func Format(path string, sizeBytes int64, cfg FormatConfig) (*FS, error)
+
+// Reflink clones srcPath into a new file dstPath sharing srcPath's extents
+// (requires FormatConfig.Reflink); HasReflink reports the feature bit.
+func (fs *FS) Reflink(srcPath, dstPath string) error
+func (fs *FS) HasReflink() bool
 ```
 
 ### Open
