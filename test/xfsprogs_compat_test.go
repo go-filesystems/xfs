@@ -199,6 +199,124 @@ func TestResizeShrinkErrSentinel(t *testing.T) {
 	}
 }
 
+// repairClean runs `xfs_repair -n` on img and fails the test if it exits
+// non-zero or prints any of the corruption markers. Shared by the advanced
+// feature interop tests below.
+func repairClean(t *testing.T, xfsRepair, img string) {
+	t.Helper()
+	cmd := exec.Command(xfsRepair, "-n", img)
+	out, runErr := cmd.CombinedOutput()
+	t.Logf("xfs_repair -n output:\n%s", out)
+	if runErr != nil {
+		t.Fatalf("xfs_repair -n exited non-zero: %v", runErr)
+	}
+	upper := strings.ToUpper(string(out))
+	// Note: xfs_repair always prints the benign phase header "moving disconnected
+	// inodes to lost+found ..."; a *real* disconnection additionally prints
+	// "... would move to lost+found", which the "WOULD " marker catches — so we
+	// do not match on "disconnected" itself.
+	for _, marker := range []string{"ERROR", "CORRUPT", "WOULD ", "BAD "} {
+		if strings.Contains(upper, marker) {
+			t.Fatalf("xfs_repair -n reported %q in output:\n%s", marker, out)
+		}
+	}
+}
+
+// TestReflinkXfsRepair formats a reflink-enabled image, clones a multi-block
+// file (sharing extents), makes a second clone, deletes one clone (COW
+// decrement) and overwrites another (COW break), then asserts xfs_repair -n is
+// clean — validating the refcount B-tree and reflink feature bit against the
+// canonical tools.
+func TestReflinkXfsRepair(t *testing.T) {
+	xfsRepair, err := exec.LookPath("xfs_repair")
+	if err != nil {
+		t.Skip("xfs_repair not found on PATH; install xfsprogs to run this test")
+	}
+	const oneAG = int64(16384 * 4096)
+	path := filepath.Join(t.TempDir(), "reflink.xfs")
+	fs, err := filesystem_xfs.Format(path, 3*oneAG, filesystem_xfs.FormatConfig{Label: "reflink", Reflink: true})
+	if err != nil {
+		t.Fatalf("Format(reflink): %v", err)
+	}
+	orig := make([]byte, 60000)
+	for i := range orig {
+		orig[i] = byte(i)
+	}
+	must := func(e error) {
+		if e != nil {
+			fs.Close()
+			t.Fatal(e)
+		}
+	}
+	must(fs.WriteFile("/orig.dat", orig, 0o644))
+	must(fs.Reflink("/orig.dat", "/clone.dat"))
+	must(fs.Reflink("/orig.dat", "/clone2.dat"))
+	must(fs.DeleteFile("/clone2.dat"))                           // COW decrement
+	must(fs.WriteFile("/clone.dat", make([]byte, 40000), 0o644)) // COW break
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	repairClean(t, xfsRepair, path)
+}
+
+// TestQuotaXfsRepair formats an image with user/group/project quotas, writes a
+// file (which the quotacheck accounts for), and asserts xfs_repair -n accepts
+// the classic quota inodes + dquots.
+func TestQuotaXfsRepair(t *testing.T) {
+	xfsRepair, err := exec.LookPath("xfs_repair")
+	if err != nil {
+		t.Skip("xfs_repair not found on PATH; install xfsprogs to run this test")
+	}
+	const oneAG = int64(16384 * 4096)
+	path := filepath.Join(t.TempDir(), "quota.xfs")
+	fs, err := filesystem_xfs.Format(path, 3*oneAG, filesystem_xfs.FormatConfig{
+		Label: "quota",
+		Quota: filesystem_xfs.QuotaConfig{User: true, Group: true, Project: true, Enforce: true},
+	})
+	if err != nil {
+		t.Fatalf("Format(quota): %v", err)
+	}
+	if err := fs.WriteFile("/hello.txt", []byte("quota\n"), 0o644); err != nil {
+		fs.Close()
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	repairClean(t, xfsRepair, path)
+}
+
+// TestGrowPartialAGXfsRepair grows a 1-AG filesystem into a partial final AG
+// (1.5 AGs total), writes files into the extended region, and checks the result
+// is xfs_repair -n clean.
+func TestGrowPartialAGXfsRepair(t *testing.T) {
+	xfsRepair, err := exec.LookPath("xfs_repair")
+	if err != nil {
+		t.Skip("xfs_repair not found on PATH; install xfsprogs to run this test")
+	}
+	const oneAG = int64(16384 * 4096)
+	path := filepath.Join(t.TempDir(), "grow.xfs")
+	fs, err := filesystem_xfs.Format(path, oneAG, filesystem_xfs.FormatConfig{Label: "grow"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	must := func(e error) {
+		if e != nil {
+			fs.Close()
+			t.Fatal(e)
+		}
+	}
+	must(fs.WriteFile("/before.txt", []byte("pre\n"), 0o644))
+	must(fs.Grow(oneAG + oneAG/2)) // partial last AG
+	for i := 0; i < 20; i++ {
+		must(fs.WriteFile(fmt.Sprintf("/post-%02d.txt", i), []byte("x\n"), 0o644))
+	}
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	repairClean(t, xfsRepair, path)
+}
+
 // TestWriteThenXfsDb runs `xfs_db -r -c 'sb 0' -c 'p' <img>` on an image
 // produced by our writer and asserts the canonical xfsprogs debugger can
 // parse our superblock (exit 0, no error indicators in output).

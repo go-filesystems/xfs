@@ -45,7 +45,7 @@ const (
 	fmtBnoRoot   = 1
 	fmtCntRoot   = 2
 	fmtInobtRoot = 3
-	fmtFirstData = 4 // first block past the B-tree roots
+	fmtFirstData = 4 // first block past the fixed B-tree roots
 
 	// The free list reserves four blocks per AG, exactly as mkfs.xfs does.
 	fmtAGFLCount = 4
@@ -76,6 +76,23 @@ type agLayout struct {
 	logStartRel     uint32 // AG-relative first log block
 	hasInodeChunk   bool
 	inodeChunkBlock uint32 // AG-relative first block of the inode chunk
+	hasRefcount     bool   // reflink: an empty refcount B-tree root is present
+	refcountRoot    uint32 // AG-relative refcount B-tree root block (reflink only)
+}
+
+// fmtLogBlocksFor returns sb_logblocks. With reflink the empty refcount B-tree
+// root sits immediately before the AG 0 inode chunk (as mkfs.xfs lays it out —
+// the refcountbt root precedes the first inode chunk), and the inode chunk must
+// stay aligned to sb_inoalignmt. The internal log is grown from fmtLogBlocks to
+// fmtLogBlocks+3 so that logStart(8)+logBlocks(2563)+1(refcount root) = 2572 is
+// a multiple of fmtInoAlignmt(4); the extra (zeroed) log blocks avoid leaving a
+// free-space gap. The value is chosen once here and reused by the layout, the
+// log writer, and the superblock so all three agree.
+func fmtLogBlocksFor(reflink bool) uint32 {
+	if reflink {
+		return fmtLogBlocks + fmtInoAlignmt - 1
+	}
+	return fmtLogBlocks
 }
 
 // fmtLogAG returns the allocation group that hosts the internal log.
@@ -89,8 +106,13 @@ type agLayout struct {
 // root inode to follow the log, which is exactly where we put it.
 func fmtLogAG(uint32) uint32 { return 0 }
 
-// fmtAGLayoutFor computes the layout of allocation group ag.
-func fmtAGLayoutFor(ag, agCount uint32) agLayout {
+// fmtAGLayoutFor computes the layout of allocation group ag. When reflink is
+// set, an empty refcount B-tree root occupies one extra block, taken from the
+// front of the free extent (so the inode chunk keeps its inode-alignment and
+// the root-inode number is unchanged from the non-reflink geometry — shifting
+// the whole layout by one block would misalign the inode chunk and make
+// xfs_repair relocate it).
+func fmtAGLayoutFor(ag, agCount uint32, reflink bool) agLayout {
 	var l agLayout
 	logAG := fmtLogAG(agCount)
 	setAGFL := func(first uint32) {
@@ -99,55 +121,94 @@ func fmtAGLayoutFor(ag, agCount uint32) agLayout {
 		}
 	}
 
+	logBlocks := fmtLogBlocksFor(reflink)
+	// reserveRefcount carves the empty refcount B-tree root out of the front of
+	// an AG's free extent (used for AGs that have no inode chunk).
+	reserveRefcount := func() {
+		if reflink {
+			l.hasRefcount = true
+			l.refcountRoot = l.freeStart
+			l.freeStart++
+		}
+	}
+
 	switch {
 	case ag == 0 && logAG == 0:
-		// Single AG: B-tree roots, AGFL blocks, the log, then the inode chunk.
+		// Single AG: B-tree roots, AGFL blocks, the log, then (with reflink) the
+		// refcount root immediately before the inode chunk, then the inode chunk.
 		setAGFL(fmtFirstData)
 		l.hasLog = true
 		l.logStartRel = fmtFirstData + fmtAGFLCount // 8
 		l.hasInodeChunk = true
-		l.inodeChunkBlock = l.logStartRel + fmtLogBlocks
+		if reflink {
+			l.hasRefcount = true
+			l.refcountRoot = l.logStartRel + logBlocks // 2571
+			l.inodeChunkBlock = l.refcountRoot + 1     // 2572 (fmtInoAlignmt-aligned)
+		} else {
+			l.inodeChunkBlock = l.logStartRel + logBlocks // 2568
+		}
 		l.freeStart = l.inodeChunkBlock + fmtChunkBlocks
 	case ag == 0:
-		// AG 0 with the log elsewhere: AGFL blocks then the inode chunk.
+		// AG 0 with the log elsewhere: AGFL blocks, (reflink) refcount root, then
+		// the inode chunk. (Unreachable today: fmtLogAG always pins the log to
+		// AG 0, but kept consistent for a future middle-AG log.)
 		setAGFL(fmtFirstData)
 		l.hasInodeChunk = true
-		l.inodeChunkBlock = fmtFirstData + fmtAGFLCount // 8
+		base := uint32(fmtFirstData + fmtAGFLCount) // 8
+		if reflink {
+			l.hasRefcount = true
+			l.refcountRoot = base
+			l.inodeChunkBlock = base + 1
+		} else {
+			l.inodeChunkBlock = base
+		}
 		l.freeStart = l.inodeChunkBlock + fmtChunkBlocks
 	case ag == logAG:
-		// Log AG: the log sits right after the B-tree roots; the AGFL blocks
-		// and free space follow the log.
+		// Log AG (not AG 0): the log sits right after the B-tree roots; the AGFL
+		// blocks and free space follow. Unreachable today (see above).
 		l.hasLog = true
 		l.logStartRel = fmtFirstData // 4
-		setAGFL(fmtFirstData + fmtLogBlocks)
-		l.freeStart = fmtFirstData + fmtLogBlocks + fmtAGFLCount
+		setAGFL(fmtFirstData + logBlocks)
+		l.freeStart = fmtFirstData + logBlocks + fmtAGFLCount
+		reserveRefcount()
 	default:
-		// Plain AG: B-tree roots then AGFL blocks.
+		// Plain AG: B-tree roots then AGFL blocks, then (reflink) refcount root.
 		setAGFL(fmtFirstData)
 		l.freeStart = fmtFirstData + fmtAGFLCount // 8
+		reserveRefcount()
 	}
 	l.freeCount = fmtAgBlocks - l.freeStart
 	return l
 }
 
 // fmtRootIno returns the absolute root-inode number for the given AG count.
-func fmtRootIno(agCount uint32) uint64 {
-	return uint64(fmtAGLayoutFor(0, agCount).inodeChunkBlock) * fmtInopBlock
+func fmtRootIno(agCount uint32, reflink bool) uint64 {
+	return uint64(fmtAGLayoutFor(0, agCount, reflink).inodeChunkBlock) * fmtInopBlock
 }
 
 // fmtLogStartAbs returns the absolute (filesystem-block) start of the log.
-func fmtLogStartAbs(agCount uint32) uint64 {
+func fmtLogStartAbs(agCount uint32, reflink bool) uint64 {
 	logAG := fmtLogAG(agCount)
-	return uint64(logAG)*fmtAgBlocks + uint64(fmtAGLayoutFor(logAG, agCount).logStartRel)
+	return uint64(logAG)*fmtAgBlocks + uint64(fmtAGLayoutFor(logAG, agCount, reflink).logStartRel)
 }
 
 // fmtTotalFreeBlocks returns sb_fdblocks: the sum over every AG of its
 // free-extent blocks plus the four blocks held in its free list (which XFS
-// counts as free/available space).
-func fmtTotalFreeBlocks(agCount uint32) uint64 {
+// counts as free/available space). dblocks is the filesystem's total data-block
+// count; the final AG's free extent shrinks when it is a partial AG.
+func fmtTotalFreeBlocks(agCount uint32, reflink bool, dblocks uint64) uint64 {
+	if dblocks == 0 {
+		dblocks = uint64(agCount) * fmtAgBlocks
+	}
+	full := dblocks / fmtAgBlocks
 	var total uint64
 	for ag := uint32(0); ag < agCount; ag++ {
-		total += uint64(fmtAGLayoutFor(ag, agCount).freeCount) + fmtAGFLCount
+		l := fmtAGLayoutFor(ag, agCount, reflink)
+		agLen := uint64(fmtAgBlocks)
+		if uint64(ag) >= full {
+			agLen = dblocks - full*fmtAgBlocks
+		}
+		total += (agLen - uint64(l.freeStart)) + fmtAGFLCount
 	}
 	return total
 }
@@ -160,6 +221,15 @@ type FormatConfig struct {
 	UUID [16]byte
 	// Label is the volume label (up to 12 bytes; silently truncated).
 	Label string
+	// Reflink enables shared-extent (copy-on-write) support: the
+	// XFS_SB_FEAT_RO_COMPAT_REFLINK feature bit plus an empty per-AG refcount
+	// B-tree, matching mkfs.xfs -m reflink=1,rmapbt=0. Files can then be cloned
+	// with FS.Reflink so they share physical blocks.
+	Reflink bool
+	// Quota, when non-zero, enables on-disk quota accounting: the requested
+	// quota inodes (user/group/project) are created and sb_qflags is set.
+	// See QuotaConfig. The zero value leaves quotas disabled.
+	Quota QuotaConfig
 }
 
 type fmtFile interface {
@@ -222,7 +292,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 		sectorSize: fmtSectorSize,
 		agBlocks:   fmtAgBlocks,
 		agCount:    agCount,
-		rootIno:    fmtRootIno(agCount),
+		rootIno:    fmtRootIno(agCount, cfg.Reflink),
 		inodeSize:  fmtInodeSize,
 		inopBlock:  fmtInopBlock,
 		inopBLog:   fmtInopBLog,
@@ -230,6 +300,8 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 		dirBlkLog:  0,
 		hasCRC:     true,
 		hasFType:   true,
+		hasReflink: cfg.Reflink,
+		dBlocks:    uint64(agCount) * fmtAgBlocks,
 		uuid:       uuid,
 		label:      label,
 	}
@@ -265,23 +337,55 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	if err := f.Close(); err != nil {
 		return nil, fmt.Errorf("xfs: format: close: %w", err)
 	}
-	return fmtOpenFS(path, -1)
+
+	fsAny, err := fmtOpenFS(path, -1)
+	if err != nil {
+		return nil, err
+	}
+
+	// Quota setup runs on the opened filesystem so it can reuse the same inode
+	// and block allocators (and syncSuperblockCounts) as the normal write path,
+	// keeping every AG header and the primary superblock consistent.
+	if !cfg.Quota.isZero() {
+		xfs, ok := fsAny.(*xfsFS)
+		if !ok {
+			fsAny.Close()
+			return nil, fmt.Errorf("xfs: format quota: unexpected FS type %T", fsAny)
+		}
+		if err := xfs.setupQuota(cfg.Quota); err != nil {
+			fsAny.Close()
+			return nil, fmt.Errorf("xfs: format quota: %w", err)
+		}
+	}
+	return fsAny, nil
 }
 
 // ──────────────────── Per-AG writer ────────────────────────────────────────
 
 func fmtWriteAG(f fmtFile, sb *superblock, ag uint32, uuid [16]byte) error {
+	return fmtWriteAGLen(f, sb, ag, sb.agLength(ag), uuid)
+}
+
+// fmtWriteAGLen writes allocation group ag with an explicit length agLen. Full
+// AGs use sb_agblocks; the final AG of a filesystem whose block count is not a
+// whole multiple of sb_agblocks is written shorter (a partial last AG). All
+// fixed metadata (B-tree roots, AGFL, optional log/inode chunk) sits at the low
+// end of the AG, so only the single free extent shrinks.
+func fmtWriteAGLen(f fmtFile, sb *superblock, ag uint32, agLen uint32, uuid [16]byte) error {
 	be := binary.BigEndian
 	agBase := int64(ag) * int64(sb.agBlocks) * int64(sb.blockSize)
-	l := fmtAGLayoutFor(ag, sb.agCount)
+	l := fmtAGLayoutFor(ag, sb.agCount, sb.hasReflink)
 	absBase := uint64(ag) * uint64(sb.agBlocks)
+	// The free extent runs from freeStart to the end of this AG; for a partial
+	// last AG that is agLen (< sb_agblocks) blocks.
+	freeCount := agLen - l.freeStart
 
 	// ── AGF (sector 1) ─────────────────────────────────────────────────────
 	agf := make([]byte, fmtSectorSize)
 	be.PutUint32(agf[agfOffMagic:], magicAGF)
 	be.PutUint32(agf[agfOffVersion:], 1)
 	be.PutUint32(agf[agfOffSeqNo:], ag)
-	be.PutUint32(agf[agfOffLength:], sb.agBlocks)
+	be.PutUint32(agf[agfOffLength:], agLen)
 	be.PutUint32(agf[agfOffBnoRoot:], fmtBnoRoot)
 	be.PutUint32(agf[agfOffCntRoot:], fmtCntRoot)
 	be.PutUint32(agf[agfOffBnoLevel:], 1)
@@ -289,10 +393,16 @@ func fmtWriteAG(f fmtFile, sb *superblock, ag uint32, uuid [16]byte) error {
 	be.PutUint32(agf[agfOffFLFirst:], 1)
 	be.PutUint32(agf[agfOffFLLast:], fmtAGFLCount)
 	be.PutUint32(agf[agfOffFLCount:], fmtAGFLCount)
-	be.PutUint32(agf[agfOffFreeBlks:], l.freeCount)
-	be.PutUint32(agf[agfOffLongest:], l.freeCount)
+	be.PutUint32(agf[agfOffFreeBlks:], freeCount)
+	be.PutUint32(agf[agfOffLongest:], freeCount)
 	be.PutUint32(agf[agfOffBtreeBlks:], 0)
 	copy(agf[agfOffUUID:agfOffUUID+16], uuid[:])
+	if l.hasRefcount {
+		// Empty refcount B-tree: one block (the root), level 1, no records.
+		be.PutUint32(agf[agfOffRefcntRoot:], l.refcountRoot)
+		be.PutUint32(agf[agfOffRefcntLevel:], 1)
+		be.PutUint32(agf[agfOffRefcntBlks:], 1)
+	}
 	updateCRC(agf, agfOffCRC, fmtSectorSize)
 	if _, err := f.WriteAt(agf, sb.agFByteOffset(0, ag)); err != nil {
 		return fmt.Errorf("write AGF: %w", err)
@@ -303,7 +413,7 @@ func fmtWriteAG(f fmtFile, sb *superblock, ag uint32, uuid [16]byte) error {
 	be.PutUint32(agi[agiOffMagic:], magicAGI)
 	be.PutUint32(agi[agiOffVersion:], 1)
 	be.PutUint32(agi[agiOffSeqNo:], ag)
-	be.PutUint32(agi[agiOffLength:], sb.agBlocks)
+	be.PutUint32(agi[agiOffLength:], agLen)
 	be.PutUint32(agi[agiOffRoot:], fmtInobtRoot)
 	be.PutUint32(agi[agiOffLevel:], 1)
 	be.PutUint32(agi[agiOffDirIno:], 0xFFFFFFFF) // null
@@ -314,7 +424,7 @@ func fmtWriteAG(f fmtFile, sb *superblock, ag uint32, uuid [16]byte) error {
 	if l.hasInodeChunk {
 		be.PutUint32(agi[agiOffCount:], fmtInodesPerChunk)
 		be.PutUint32(agi[agiOffFreeCount:], fmtInodesPerChunk-3)
-		be.PutUint32(agi[agiOffNewIno:], uint32(fmtRootIno(sb.agCount)))
+		be.PutUint32(agi[agiOffNewIno:], uint32(fmtRootIno(sb.agCount, sb.hasReflink)))
 	} else {
 		be.PutUint32(agi[agiOffNewIno:], 0xFFFFFFFF) // null
 	}
@@ -344,10 +454,10 @@ func fmtWriteAG(f fmtFile, sb *superblock, ag uint32, uuid [16]byte) error {
 
 	// ── B-tree roots (blocks 1/2/3) ────────────────────────────────────────
 	// bno and cnt each hold a single record covering the whole free extent.
-	if err := fmtWriteFreeBtree(f, agBase, absBase, uuid, ag, magicABTB, fmtBnoRoot, l.freeStart, l.freeCount); err != nil {
+	if err := fmtWriteFreeBtree(f, agBase, absBase, uuid, ag, magicABTB, fmtBnoRoot, l.freeStart, freeCount); err != nil {
 		return err
 	}
-	if err := fmtWriteFreeBtree(f, agBase, absBase, uuid, ag, magicABTC, fmtCntRoot, l.freeStart, l.freeCount); err != nil {
+	if err := fmtWriteFreeBtree(f, agBase, absBase, uuid, ag, magicABTC, fmtCntRoot, l.freeStart, freeCount); err != nil {
 		return err
 	}
 
@@ -355,14 +465,26 @@ func fmtWriteAG(f fmtFile, sb *superblock, ag uint32, uuid [16]byte) error {
 	inobt := fmtBtreeHeader(absBase, uuid, ag, magicIAB3, fmtInobtRoot)
 	if l.hasInodeChunk {
 		hdr := btreeHdrSizeV5
-		be.PutUint16(inobt[6:], 1)                                // numrecs
-		be.PutUint32(inobt[hdr:], uint32(fmtRootIno(sb.agCount))) // ir_startino (AG-relative in AG 0)
-		be.PutUint32(inobt[hdr+4:], fmtInodesPerChunk-3)          // ir_freecount
-		be.PutUint64(inobt[hdr+8:], 0xFFFFFFFFFFFFFFF8)           // ir_free: inodes 0,1,2 in use
+		be.PutUint16(inobt[6:], 1)                                               // numrecs
+		be.PutUint32(inobt[hdr:], uint32(fmtRootIno(sb.agCount, sb.hasReflink))) // ir_startino (AG-relative in AG 0)
+		be.PutUint32(inobt[hdr+4:], fmtInodesPerChunk-3)                         // ir_freecount
+		be.PutUint64(inobt[hdr+8:], 0xFFFFFFFFFFFFFFF8)                          // ir_free: inodes 0,1,2 in use
 	}
 	updateCRC(inobt, btreeCRCOff, fmtBlockSize)
 	if _, err := f.WriteAt(inobt, agBase+int64(fmtInobtRoot)*int64(sb.blockSize)); err != nil {
 		return fmt.Errorf("write inobt: %w", err)
+	}
+
+	// refcountbt: an empty leaf root (reflink only).
+	if l.hasRefcount {
+		refc := fmtBtreeHeader(absBase, uuid, ag, magicRefcnt, l.refcountRoot)
+		// The refcountbt owner is the AG number, and (unlike the free-space and
+		// inode btrees) its bb_owner is written as a 32-bit AG number in the
+		// short-form header just like the others; numrecs stays 0.
+		updateCRC(refc, btreeCRCOff, fmtBlockSize)
+		if _, err := f.WriteAt(refc, agBase+int64(l.refcountRoot)*int64(sb.blockSize)); err != nil {
+			return fmt.Errorf("write refcountbt: %w", err)
+		}
 	}
 
 	return nil
@@ -470,7 +592,7 @@ const (
 // log").
 func fmtWriteLog(f fmtFile, sb *superblock, agCount uint32) error {
 	be := binary.BigEndian
-	logByte := int64(fmtLogStartAbs(agCount)) * int64(sb.blockSize)
+	logByte := int64(fmtLogStartAbs(agCount, sb.hasReflink)) * int64(sb.blockSize)
 
 	// Basic block 0: the log record header.
 	hdr := make([]byte, fmtSectorSize)
@@ -527,7 +649,7 @@ func buildSuperblockBuffer(sb *superblock, agCount uint32, uuid [16]byte, label 
 	buf := make([]byte, 512)
 	be := binary.BigEndian
 
-	rootIno := fmtRootIno(agCount)
+	rootIno := fmtRootIno(agCount, sb.hasReflink)
 
 	be.PutUint32(buf[sbOffMagic:], magicSB)
 	be.PutUint32(buf[sbOffBlockSize:], sb.blockSize)
@@ -536,7 +658,11 @@ func buildSuperblockBuffer(sb *superblock, agCount uint32, uuid [16]byte, label 
 	be.PutUint64(buf[sbOffRsumino:], rootIno+2)
 	be.PutUint32(buf[sbOffAgBlocks:], sb.agBlocks)
 	be.PutUint32(buf[sbOffAgCount:], agCount)
-	be.PutUint16(buf[sbOffVersionNum:], uint16(xfsSBVersionV5))
+	versionNum := uint16(xfsSBVersionV5)
+	if sb.quotaFlags != 0 {
+		versionNum |= xfsSBVersionQuotaBit
+	}
+	be.PutUint16(buf[sbOffVersionNum:], versionNum)
 	be.PutUint16(buf[sbOffSectSize:], fmtSectorSize)
 	be.PutUint16(buf[sbOffInodeSize:], sb.inodeSize)
 	be.PutUint16(buf[sbOffInopBlock:], sb.inopBlock)
@@ -549,19 +675,35 @@ func buildSuperblockBuffer(sb *superblock, agCount uint32, uuid [16]byte, label 
 	be.PutUint32(buf[sbOffFeatIncompat:], xfsSBFeatFType)
 	be.PutUint32(buf[sbOffFeatures2:], xfsSBFeatures2)
 	be.PutUint32(buf[sbOffBadFeatures2:], xfsSBFeatures2) // historical duplicate
+	if sb.hasReflink {
+		be.PutUint32(buf[sbOffFeatRoCompat:], xfsSBFeatRoReflink)
+	}
 	be.PutUint32(buf[sbOffInoAlignmt:], fmtInoAlignmt)
 	buf[sbOffImaxPct] = 25
 
+	// Quota accounting: sb_qflags plus the three quota inode numbers. Zero when
+	// quotas are disabled (the default), which mkfs.xfs also writes.
+	be.PutUint16(buf[sbOffQFlags:], sb.quotaFlags)
+	be.PutUint64(buf[sbOffUQuotino:], sb.uQuotino)
+	be.PutUint64(buf[sbOffGQuotino:], sb.gQuotino)
+	be.PutUint64(buf[sbOffPQuotino:], sb.pQuotino)
+
 	// Filesystem-wide totals that xfs_repair cross-checks against AG metadata.
-	dblocks := uint64(agCount) * uint64(sb.agBlocks)
+	// These are the base (empty-filesystem) counts; any post-layout allocation
+	// (quota inodes, files) is reconciled by syncSuperblockCounts, which derives
+	// the authoritative counters from the per-AG AGI/AGF headers.
+	dblocks := sb.dBlocks
+	if dblocks == 0 {
+		dblocks = uint64(agCount) * uint64(sb.agBlocks)
+	}
 	be.PutUint64(buf[sbOffDBlocks:], dblocks)
 	be.PutUint64(buf[sbOffIcount:], fmtInodesPerChunk)
 	be.PutUint64(buf[sbOffIfree:], fmtInodesPerChunk-3)
-	be.PutUint64(buf[sbOffFdblocks:], fmtTotalFreeBlocks(agCount))
+	be.PutUint64(buf[sbOffFdblocks:], fmtTotalFreeBlocks(agCount, sb.hasReflink, dblocks))
 
 	// Internal log (zeroed region; the kernel formats it on first mount).
-	be.PutUint64(buf[sbOffLogStart:], fmtLogStartAbs(agCount))
-	be.PutUint32(buf[sbOffLogBlocks:], fmtLogBlocks)
+	be.PutUint64(buf[sbOffLogStart:], fmtLogStartAbs(agCount, sb.hasReflink))
+	be.PutUint32(buf[sbOffLogBlocks:], fmtLogBlocksFor(sb.hasReflink))
 
 	// No realtime device: rblocks/rextents stay 0, but rextsize must be a
 	// valid non-zero extent size (1 block) or xfs_repair flags "inconsistent
