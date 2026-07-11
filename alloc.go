@@ -25,23 +25,29 @@ var errInobtFull = errors.New("xfs: inobt has no free inodes")
 // AGF v5 field offsets (big-endian unless noted). Layout mirrors
 // struct xfs_agf from fs/xfs/libxfs/xfs_format.h.
 const (
-	agfOffMagic     = 0
-	agfOffVersion   = 4 // agf_versionnum (= 1)
-	agfOffSeqNo     = 8
-	agfOffLength    = 12  // AG size in blocks
-	agfOffBnoRoot   = 16  // agf_roots[0]: bno B-tree root (AG-relative block)
-	agfOffCntRoot   = 20  // agf_roots[1]: cnt B-tree root
-	agfOffBnoLevel  = 28  // agf_levels[0]: bno B-tree depth
-	agfOffCntLevel  = 32  // agf_levels[1]: cnt B-tree depth
-	agfOffFLFirst   = 40  // first valid AGFL index
-	agfOffFLLast    = 44  // last valid AGFL index
-	agfOffFLCount   = 48  // number of blocks in the free list
-	agfOffFreeBlks  = 52  // free block count
-	agfOffLongest   = 56  // longest free run
-	agfOffBtreeBlks = 60  // blocks held by the free-space btrees
-	agfOffUUID      = 64  // sb_uuid (16 bytes)
-	agfOffCRC       = 216 // __le32 v5 CRC (covers the sector); agf_crc field after agf_lsn@208
-	agfStructSize   = 224
+	agfOffMagic       = 0
+	agfOffVersion     = 4 // agf_versionnum (= 1)
+	agfOffSeqNo       = 8
+	agfOffLength      = 12  // AG size in blocks
+	agfOffBnoRoot     = 16  // agf_roots[0]: bno B-tree root (AG-relative block)
+	agfOffCntRoot     = 20  // agf_roots[1]: cnt B-tree root
+	agfOffRmapRoot    = 24  // agf_roots[2]: rmapbt root (unused; reflink w/o rmapbt = 0)
+	agfOffBnoLevel    = 28  // agf_levels[0]: bno B-tree depth
+	agfOffCntLevel    = 32  // agf_levels[1]: cnt B-tree depth
+	agfOffRmapLevel   = 36  // agf_levels[2]: rmapbt depth (0 when rmapbt disabled)
+	agfOffFLFirst     = 40  // first valid AGFL index
+	agfOffFLLast      = 44  // last valid AGFL index
+	agfOffFLCount     = 48  // number of blocks in the free list
+	agfOffFreeBlks    = 52  // free block count
+	agfOffLongest     = 56  // longest free run
+	agfOffBtreeBlks   = 60  // blocks held by the free-space btrees
+	agfOffUUID        = 64  // sb_uuid (16 bytes)
+	agfOffRmapBlks    = 80  // agf_rmap_blocks (0 when rmapbt disabled)
+	agfOffRefcntBlks  = 84  // agf_refcount_blocks: blocks in the refcountbt
+	agfOffRefcntRoot  = 88  // agf_refcount_root: refcountbt root (AG-relative block)
+	agfOffRefcntLevel = 92  // agf_refcount_level: refcountbt depth
+	agfOffCRC         = 216 // __le32 v5 CRC (covers the sector); agf_crc field after agf_lsn@208
+	agfStructSize     = 224
 )
 
 // AGI v5 field offsets. Layout mirrors struct xfs_agi.

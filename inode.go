@@ -62,6 +62,12 @@ const (
 	// after di_projid_hi, NOT the di_nextents slot at offset 76.
 	inoOffBigNExtents = 24
 
+	// xfsDiflag2Reflink (XFS_DIFLAG2_REFLINK) marks an inode whose data-fork
+	// extents may be shared with other inodes (copy-on-write). Every inode that
+	// participates in a reflink share carries this flag; xfs_repair uses it to
+	// decide whether an extent is allowed to appear in the refcount B-tree.
+	xfsDiflag2Reflink = 0x02
+
 	// xfsDiflag2Nrext64 (XFS_DIFLAG2_NREXT64) marks an inode that stores its
 	// data-fork extent count in di_big_nextents. Set by modern mkfs.xfs.
 	xfsDiflag2Nrext64 = 0x10
