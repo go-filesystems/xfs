@@ -29,6 +29,9 @@ https://docs.kernel.org/filesystems/xfs/index.html
 | Stat / timestamps | ✅ | Legacy and `BIGTIME` (64-bit) timestamps, as written by modern `mkfs.xfs` |
 | ReadLink / Symlinks | ✅ | Inline and remote (extent-based) targets, incl. the v5 `xfs_dsymlink_hdr` written by the kernel |
 | Partitioned images | ✅ | MBR/GPT auto-detected |
+| Extended metadata | ✅ | `ExtendedStat` (uid/gid, timestamps, link count, generation); `Chown` / `Chmod` / `Chtimes` / `Truncate` / `Link` (hardlinks) |
+| Volume label | ✅ | `Label` / `SetLabel` |
+| Layered backends | ✅ | `OpenFromDevice(BlockBackend, partIndex)` for LUKS/qcow2/in-memory callers that don't hand over an `*os.File`-backed image |
 
 All three advanced features above produce `xfs_repair -n`-clean images (validated
 against `xfsprogs` 6.13 in CI on native amd64/arm64 runners).
@@ -90,7 +93,11 @@ github.com/go-filesystems/xfs
 
 ## API
 
-### Format
+`FS` is an interface (not a struct) — `Format`, `Open`, and `OpenFromDevice`
+all return `FS`, and every method below is called through that interface
+value (`fs.Reflink(...)`, not `(*FS).Reflink`).
+
+### Format / Open
 
 ```go
 type FormatConfig struct {
@@ -105,38 +112,38 @@ type QuotaConfig struct {
     Enforce              bool // also set the *_ENFD (limit enforcement) flags
 }
 
-func Format(path string, sizeBytes int64, cfg FormatConfig) (*FS, error)
-
-// Reflink clones srcPath into a new file dstPath sharing srcPath's extents
-// (requires FormatConfig.Reflink); HasReflink reports the feature bit.
-func (fs *FS) Reflink(srcPath, dstPath string) error
-func (fs *FS) HasReflink() bool
+func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error)
+func Open(imagePath string, partIndex int) (FS, error)
+func OpenFromDevice(dev BlockBackend, partIndex int) (FS, error) // layered backends (LUKS/qcow2/in-memory)
 ```
 
-### Open
+### FS interface
 
 ```go
-func Open(imagePath string, partIndex int) (*FS, error)
-func (fs *FS) Close() error
-```
+type FS interface {
+    filesystem.Filesystem // Close, ReadFile, ListDir, Stat, WriteFile, ReadLink,
+                           // MkDir, DeleteFile, DeleteDir, Rename
 
-### Read
+    Grow(newSizeBytes int64) error   // extend to newSizeBytes, whole-AG-aligned
+    Resize(newSizeBytes int64) error // routes to Grow; shrink returns filesystem.ErrShrinkUnsupported
+    GrowTo(newSizeBytes int64) error // alias of Grow (filesystem.Grower)
 
-```go
-func (fs *FS) Stat(path string) (filesystem.Stat, error)
-func (fs *FS) ListDir(path string) ([]filesystem.DirEntry, error)
-func (fs *FS) ReadFile(path string) ([]byte, error)
-func (fs *FS) ReadLink(path string) (string, error)
-```
+    ExtendedStat(path string) (*InodeStat, error) // uid/gid, timestamps, link count, generation
+    Chown(path string, uid, gid uint32) error
+    Chmod(path string, perm os.FileMode) error
+    Chtimes(path string, atime, mtime time.Time) error
+    Symlink(target, linkPath string) error
+    Truncate(path string, newSize int64) error
+    Link(oldPath, newPath string) error
 
-### Write
+    // Reflink clones srcPath into a new file dstPath sharing srcPath's extents
+    // (requires FormatConfig.Reflink); HasReflink reports the feature bit.
+    Reflink(srcPath, dstPath string) error
+    HasReflink() bool
 
-```go
-func (fs *FS) WriteFile(path string, data []byte, perm os.FileMode) error
-func (fs *FS) MkDir(path string, perm os.FileMode) error
-func (fs *FS) DeleteFile(path string) error
-func (fs *FS) DeleteDir(path string) error
-func (fs *FS) Rename(oldPath, newPath string) error
+    Label() string
+    SetLabel(label string) error
+}
 ```
 
 ## Implements
