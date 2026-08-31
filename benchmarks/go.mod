@@ -6,13 +6,13 @@ module github.com/go-filesystems/xfs/benchmarks
 go 1.26.4
 
 require (
-	github.com/go-filesystems/interface v0.2.0
+	github.com/go-filesystems/interface v0.3.0
 	github.com/go-filesystems/xfs v0.1.0
 )
 
 require (
-	github.com/go-volumes/gpt v0.0.0-20260622072431-e1d6ba3b531c // indirect
-	github.com/go-volumes/safeio v0.0.0-20260622072324-7f8eb19f6f8c // indirect
+	github.com/go-volumes/gpt v0.0.0-20260830080217-f939ebaffdf6 // indirect
+	github.com/go-volumes/safeio v0.0.0-20260830080216-c99e29c86f27 // indirect
 )
 
 replace github.com/go-filesystems/xfs => ..
