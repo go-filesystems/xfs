@@ -190,6 +190,32 @@ jobs:
           if [ ${#bins[@]} -eq 0 ]; then
             echo "no test binaries to run"; exit 0
           fi
+          # ⛔ Pull ONCE, before the loop, and retry.
+          #
+          # `docker run` pulls on demand, so the image was fetched inside the
+          # loop -- once per test binary. A transient ghcr.io timeout on the
+          # FIRST binary therefore failed the whole lane while the very next
+          # pull succeeded and its tests passed, which is exactly what took
+          # main red on 2026-09-24:
+          #
+          #   docker: Get "https://ghcr.io/v2/loong64/debian/manifests/...":
+          #   dial tcp 140.82.112.34:443: i/o timeout
+          #
+          # Nothing about the code was involved and no test failed. Three
+          # attempts, because one attempt is a flake detector rather than a
+          # fetch, and a lane that goes red at random is a lane people learn
+          # to re-run without reading.
+          for attempt in 1 2 3; do
+            if docker pull --platform linux/${{ matrix.arch }} ${{ matrix.image }}; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::could not pull ${{ matrix.image }} after 3 attempts"
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+
           rc=0
           for bin in "${bins[@]}"; do
             echo "::group::$(basename "$bin")"
