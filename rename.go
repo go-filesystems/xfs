@@ -57,7 +57,7 @@ func renameEntry(rw readerWriterAt, partOff int64, sb *superblock, oldPath, newP
 	// Locate source inode number (without following the last component as a symlink).
 	srcInoNum, err := renameLookupInDir(rw, partOff, sb, oldParIn, oldName)
 	if err != nil {
-		return fmt.Errorf("xfs: rename: source %q: %w", oldPath, err)
+		return fmt.Errorf("xfs: rename: source %q: %w", oldPath, notExistIfMissing(err))
 	}
 	srcIn, err := renameReadInode(rw, partOff, sb, srcInoNum)
 	if err != nil {
