@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"math/bits"
 	"path"
 	"strings"
@@ -49,6 +50,28 @@ const maxSymlinkDepth = 40
 // ErrSymlinkLoop is returned when symlink resolution exceeds maxSymlinkDepth.
 var ErrSymlinkLoop = errors.New("xfs: too many levels of symbolic links")
 
+// notExistIfMissing marks a failed directory lookup as [io/fs.ErrNotExist],
+// which is the error contract every driver in this family owes: a path that is
+// not there must satisfy errors.Is(err, fs.ErrNotExist).
+//
+// ⛔ It marks the ERROR, never the call site, and that distinction is the
+// whole point. lookupInDir returns ErrNotFound when a name is not in a
+// directory -- a 404 -- and a plain error when an inode claims a directory
+// format this driver cannot read, which means the image is broken. Marking
+// every failure of a lookup would make a server answer 404 for corruption and
+// hide a real fault behind a routine one.
+//
+// One definition, because three paths resolve a last component by hand:
+// pathLookupResolve, ReadLink (which must not follow the final symlink) and
+// rename's source. The same three-line test written out three times is three
+// places for it to drift apart.
+func notExistIfMissing(err error) error {
+	if err != nil && errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("%w: %w", err, iofs.ErrNotExist)
+	}
+	return err
+}
+
 // pathLookup resolves a slash-separated path and returns the inode. It begins a
 // fresh symlink-resolution chain (depth 0).
 func pathLookup(r io.ReaderAt, partOff int64, sb *superblock, p string) (*inode, error) {
@@ -77,7 +100,7 @@ func pathLookupResolve(r io.ReaderAt, partOff int64, sb *superblock, p string, d
 	for _, name := range parts {
 		childIno, err := dirLookupInDirHook(r, partOff, sb, cur, name)
 		if err != nil {
-			return nil, fmt.Errorf("xfs: %q in path %q: %w", name, p, err)
+			return nil, fmt.Errorf("xfs: %q in path %q: %w", name, p, notExistIfMissing(err))
 		}
 		child, err := dirReadInode(r, partOff, sb, childIno)
 		if err != nil {

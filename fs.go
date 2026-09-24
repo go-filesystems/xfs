@@ -450,7 +450,7 @@ func (fs *xfsFS) ReadLink(path string) (string, error) {
 	}
 	inoNum, err := fsLookupInDir(fs.f, fs.partOffset, fs.sb, parentIn, name)
 	if err != nil {
-		return "", err
+		return "", notExistIfMissing(err)
 	}
 	in, err := fsReadInode(fs.f, fs.partOffset, fs.sb, inoNum)
 	if err != nil {
