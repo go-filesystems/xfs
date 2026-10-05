@@ -3,16 +3,16 @@
 // affects the coverage floor. See BENCHMARKS.md.
 module github.com/go-filesystems/xfs/benchmarks
 
-go 1.26.4
+go 1.27.1
 
 require (
-	github.com/go-filesystems/interface v0.3.0
-	github.com/go-filesystems/xfs v0.1.0
+	github.com/go-filesystems/interface v0.4.0
+	github.com/go-filesystems/xfs v0.3.0
 )
 
 require (
-	github.com/go-volumes/gpt v0.0.0-20260830080217-f939ebaffdf6 // indirect
-	github.com/go-volumes/safeio v0.0.0-20260830080216-c99e29c86f27 // indirect
+	github.com/go-volumes/gpt v0.2.0 // indirect
+	github.com/go-volumes/safeio v0.0.0-20260831125406-d8f54b2890d4 // indirect
 )
 
 replace github.com/go-filesystems/xfs => ..
