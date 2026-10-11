@@ -6,5 +6,5 @@ require (
 	github.com/go-diskimages/qcow2 v0.3.0
 	github.com/go-filesystems/interface v0.5.0
 	github.com/go-volumes/gpt v0.3.0
-	github.com/go-volumes/safeio v0.0.0-20261005011856-0ebc4afd6b14
+	github.com/go-volumes/safeio v0.0.0-20261011024942-5635ea21db3b
 )
