@@ -87,6 +87,24 @@ jobs:
           CGO_ENABLED: "0"
         run: go test -coverpkg=./... -coverprofile=cover.out -count=1 -timeout=20m ./...
 
+      # ⛔ THE BENCHMARKS MODULE IS NOT IN `./...`. That is deliberate — its
+      # own go.mod comment says it is nested so the harness never affects the
+      # coverage floor — and the cost is that nothing compiled it. Measured on
+      # 2026-10-18 across this fleet: of seventeen repositories with a nested
+      # `benchmarks` module that no lane builds, TEN did not compile at
+      # origin/main, this one among them, almost all with a stale go.sum that
+      # `go mod tidy` fixes. Renovate updates the parent module and leaves the
+      # nested one behind, and nothing was watching the result.
+      #
+      # `go vet` only: a benchmark harness is a main package, and running it
+      # on a shared runner would measure the runner. Whether it COMPILES is
+      # the question this lane answers.
+      - name: Vet the benchmarks module
+        working-directory: go-filesystems/xfs/benchmarks
+        env:
+          CGO_ENABLED: "0"
+        run: go vet ./...
+
       - name: Enforce coverage floor
         working-directory: go-filesystems/xfs
         run: |
