@@ -25,6 +25,8 @@ import (
 	"path"
 	"sort"
 	"strings"
+
+	"github.com/go-volumes/safeio"
 )
 
 const (
@@ -494,7 +496,13 @@ func reflinkBreakAndWrite(rw readerWriterAt, partOff int64, sb *superblock, in *
 // source: there are no shared blocks, so the destination is an ordinary copy of
 // the inline bytes.
 func reflinkCopyLocal(rw readerWriterAt, partOff int64, sb *superblock, srcIn, dirIn *inode, name string) error {
+	// di_size is read from the image: it must fit the fork before a buffer is
+	// sized from it (readFileData makes the same check).
+	fork := srcIn.dataFork()
+	if srcIn.size > uint64(len(fork)) {
+		return fmt.Errorf("xfs: inline inode %d size %d exceeds fork space %d: %w", srcIn.num, srcIn.size, len(fork), safeio.ErrOutOfBounds)
+	}
 	data := make([]byte, srcIn.size)
-	copy(data, srcIn.dataFork()[:srcIn.size])
+	copy(data, fork[:srcIn.size])
 	return createFile(rw, partOff, sb, dirIn, name, data, os.FileMode(srcIn.mode&0o777))
 }

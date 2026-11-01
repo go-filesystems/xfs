@@ -166,6 +166,10 @@ func OpenFromDevice(dev BlockBackend, partIndex int) (FS, error) {
 		dev.Close()
 		return nil, err
 	}
+	if err := checkGeometryFitsDevice(sb, devSize-off); err != nil {
+		dev.Close()
+		return nil, err
+	}
 	return &xfsFS{f: dev, partOffset: off, sb: sb}, nil
 }
 
