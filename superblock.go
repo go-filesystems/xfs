@@ -38,6 +38,10 @@ type superblock struct {
 	// rewriting the superblock.
 	uuid  [16]byte
 	label string
+
+	// maxRead is the ceiling on a materialised file (0 = DefaultMaxReadSize);
+	// accessed atomically. Not on disk.
+	maxRead int64
 }
 
 // Superblock field offsets (big-endian except CRC at 224 which is LE).

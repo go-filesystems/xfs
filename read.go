@@ -104,7 +104,7 @@ func readSymlinkTarget(r io.ReaderAt, partOff int64, sb *superblock, in *inode) 
 
 	// C3: bound the target buffer by the inode's allocated blocks, not by the
 	// attacker-controlled di_size, so a 2^60 di_size cannot OOM.
-	buf, err := safeio.MakeBytes(int64(in.size), inodeMaxBytes(sb, in))
+	buf, err := safeio.MakeBytes(int64(in.size), fileCeiling(sb, in))
 	if err != nil {
 		return nil, fmt.Errorf("xfs: symlink inode %d size %d: %w", in.num, in.size, err)
 	}
@@ -146,6 +146,9 @@ func inlineExtents(in *inode) ([]extent, error) {
 	for i := range exts {
 		exts[i] = decodeExtent(fork[i*16:])
 	}
+	if err := validateExtents(exts, in.num); err != nil {
+		return nil, err
+	}
 	return exts, nil
 }
 
@@ -160,6 +163,17 @@ func inlineExtents(in *inode) ([]extent, error) {
 // For an internal root (level>0), numrecs keys (16 bytes each) are followed
 // by numrecs pointers (8 bytes each, absolute FS block numbers).
 func btreeExtents(r io.ReaderAt, partOff int64, sb *superblock, in *inode) ([]extent, error) {
+	exts, err := btreeExtentsUnchecked(r, partOff, sb, in)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateExtents(exts, in.num); err != nil {
+		return nil, err
+	}
+	return exts, nil
+}
+
+func btreeExtentsUnchecked(r io.ReaderAt, partOff int64, sb *superblock, in *inode) ([]extent, error) {
 	fork := in.dataFork()
 	if len(fork) < 4 {
 		return nil, fmt.Errorf("inode %d btree fork too short", in.num)
@@ -244,6 +258,11 @@ func btreeExtents(r io.ReaderAt, partOff int64, sb *superblock, in *inode) ([]ex
 }
 
 func btreeLeafExtents(data []byte, n int) []extent {
+	// n is numrecs from the block header (up to 65535); the block holds
+	// len(data)/16 records whatever the header says.
+	if fit := len(data) / 16; n > fit {
+		n = fit
+	}
 	exts := make([]extent, 0, n)
 	for i := 0; i < n && (i+1)*16 <= len(data); i++ {
 		exts = append(exts, decodeExtent(data[i*16:]))
@@ -264,7 +283,7 @@ func btreeHdrSize(hasCRC bool) int {
 func readExtents(r io.ReaderAt, partOff int64, sb *superblock, exts []extent, size uint64, in *inode) ([]byte, error) {
 	// C3: di_size is attacker-controlled; bound the output buffer by the
 	// inode's allocated blocks so a forged 2^60 size cannot OOM the host.
-	out, err := safeio.MakeBytes(int64(size), inodeMaxBytes(sb, in))
+	out, err := safeio.MakeBytes(int64(size), fileCeiling(sb, in))
 	if err != nil {
 		return nil, fmt.Errorf("xfs: inode %d size %d: %w", in.num, size, err)
 	}

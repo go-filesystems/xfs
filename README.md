@@ -67,6 +67,27 @@ mutating operation by a full inode-scan quotacheck.
   identities beyond ~30 (one block of dquots) are not tracked.
 - Intended for testing and tooling; not recommended for production workloads.
 
+## Untrusted input
+
+An image is attacker-controlled bytes. Every allocation and walk the driver sizes
+from a value read off the image is checked against what the image can hold
+**before** it happens (tests assert the allocation or the device-read count for
+each refused road):
+
+| Input | Bound |
+|---|---|
+| `di_size` for `ReadFile` / remote symlinks | the smallest of `di_nblocks` (+1 block), the superblock's `sb_dblocks`, and `DefaultMaxReadSize` (1 GiB; `fs.(interface{ SetMaxReadSize(int64) })` changes it). `di_nblocks` and `sb_dblocks` are themselves read from the image, so the read limit is what finally bounds the buffer; refused with `ErrTooLarge` |
+| bmbt extent records (in-inode and B-tree) | records that overlap, in file offset or in physical blocks, are refused: each would make a reader read the same blocks again (8 overlapping records read the file 8 times) |
+| B-tree leaf `numrecs` | capped by the records the block actually holds |
+| allocation groups | the last AG must start inside the device; per-AG loops (free-space scans, superblock copies, inode allocation) run once per `agcount`, a 32-bit field of the image |
+| inline source of a reflink | `di_size` must fit the data fork |
+| B-tree descent and sibling walks | depth = `level`, 65536 leaves, no block visited twice (unchanged) |
+
+Fuzz targets: `FuzzReadFileBomb`, `FuzzValidateExtents` (allocation and device reads
+stay proportional to the input; accepted extent lists never overlap), plus the
+existing `FuzzReadSuperblock`, `FuzzReadExtents`, `FuzzBtreeExtents`,
+`FuzzCntFindBlock`, `FuzzReadSymlink`, `FuzzPartitionOffset`.
+
 ## Module
 
 ```
