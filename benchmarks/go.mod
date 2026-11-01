@@ -7,7 +7,7 @@ go 1.27.1
 
 require (
 	github.com/go-filesystems/interface v0.5.0
-	github.com/go-filesystems/xfs v0.3.0
+	github.com/go-filesystems/xfs v0.4.0
 )
 
 require (
