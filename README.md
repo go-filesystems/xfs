@@ -24,6 +24,7 @@ https://docs.kernel.org/filesystems/xfs/index.html
 | Reflink (shared extents / COW) | ✅ | `FormatConfig.Reflink`; per-AG refcount B-tree, `FS.Reflink` clone, COW-aware delete/overwrite |
 | Quotas (user / group / project) | ✅ | `FormatConfig.Quota`; classic quota inodes + dquots, kept consistent by an inode-scan quotacheck |
 | ReadFile | ✅ | Full file reads supported, incl. `NREXT64` (64-bit extent counts) images from modern `mkfs.xfs` |
+| OpenFile (`filesystem.Opener`) | ✅ | Positional reads: the extent list is read at open, each `ReadAt` reads only the blocks of its window (holes and unwritten extents as zeros). A 1 MiB read at 50 MiB of a 56 MiB file allocates nothing through it and 58.7 MB through `ReadFile` |
 | WriteFile | ✅ | Full file writes supported |
 | MkDir / Delete / Rename | ✅ | Directory and rename operations supported |
 | Stat / timestamps | ✅ | Legacy and `BIGTIME` (64-bit) timestamps, as written by modern `mkfs.xfs` |
