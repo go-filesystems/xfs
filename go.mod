@@ -1,6 +1,6 @@
 module github.com/go-filesystems/xfs
 
-go 1.27.1
+go 1.27.4
 
 require (
 	github.com/go-diskimages/qcow2 v0.3.0
