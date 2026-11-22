@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"path"
 	"strings"
+
+	"github.com/go-volumes/safeio"
 )
 
 var deletePathLookup = pathLookup
@@ -242,8 +244,72 @@ func findEntryInBlock(blk []byte, name string, hasFType, hasCRC bool) (int, int)
 	return -1, 0
 }
 
+// xfsTreeNode is a directory-tree node identified by inode number, never by
+// path: a path grows at every level of a directory cycle, an inode does not.
+type xfsTreeNode struct {
+	ino uint64
+	dir bool
+}
+
+// checkDirTree walks the tree under the directory at p WITHOUT recursion,
+// before deleteDir changes anything, and refuses a hostile image whose
+// directories form a cycle (a directory entry that names an ancestor: a
+// directory hard link is legal in an image, never created by this driver), a
+// directory reachable twice, or a nesting deeper than safeio.MaxTreeDepth.
+// Without it deleteDir recurses by path for ever while holding the fs lock.
+// A missing p is left to deleteDir (idempotent delete).
+func checkDirTree(rw readerWriterAt, partOff int64, sb *superblock, p string) error {
+	p = path.Clean(p)
+	parentPath, name := path.Split(p)
+	parentPath = strings.TrimSuffix(parentPath, "/")
+	if parentPath == "" {
+		parentPath = "/"
+	}
+	dirIn, err := deletePathLookup(rw, partOff, sb, parentPath)
+	if err != nil {
+		return nil
+	}
+	ino, err := deleteLookupInDir(rw, partOff, sb, dirIn, name)
+	if err != nil {
+		return nil
+	}
+	return safeio.PostOrder(xfsTreeNode{ino, true},
+		func(n xfsTreeNode) (uint64, bool) { return n.ino, n.dir },
+		func(n xfsTreeNode) ([]xfsTreeNode, error) {
+			in, err := deleteReadInode(rw, partOff, sb, n.ino)
+			if err != nil {
+				return nil, err
+			}
+			if !in.isDir() {
+				return nil, nil
+			}
+			ents, err := deleteReadDir(rw, partOff, sb, in)
+			if err != nil {
+				return nil, err
+			}
+			kids := make([]xfsTreeNode, 0, len(ents))
+			for _, e := range ents {
+				if e.Name == "." || e.Name == ".." {
+					continue
+				}
+				kids = append(kids, xfsTreeNode{e.Inode, e.FileType == 2})
+			}
+			return kids, nil
+		},
+		func(xfsTreeNode) error { return nil }, 0)
+}
+
+// deleteDirChecked is what DeleteDir runs: the tree check, then deleteDir.
+func deleteDirChecked(rw readerWriterAt, partOff int64, sb *superblock, p string) error {
+	if err := checkDirTree(rw, partOff, sb, p); err != nil {
+		return fmt.Errorf("xfs: DeleteDir %q: %w", p, err)
+	}
+	return deleteDir(rw, partOff, sb, p)
+}
+
 // deleteDir removes the directory at p and all of its contents recursively.
-// Returns nil if p does not exist (idempotent).
+// Returns nil if p does not exist (idempotent). The recursion is bounded by
+// checkDirTree, which DeleteDir runs first.
 func deleteDir(rw readerWriterAt, partOff int64, sb *superblock, p string) error {
 	p = path.Clean(p)
 	parentPath, name := path.Split(p)
