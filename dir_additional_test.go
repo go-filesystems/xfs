@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"testing"
+
+	"github.com/go-volumes/safeio"
 )
 
 func restoreDirHooks(t *testing.T) {
@@ -123,14 +125,14 @@ func TestPathLookupAdditional(t *testing.T) {
 		dirReadSymlinkTarget = func(_ io.ReaderAt, _ int64, _ *superblock, _ *inode) ([]byte, error) {
 			return []byte("/target"), nil
 		}
-		dirPathLookup = func(_ io.ReaderAt, _ int64, _ *superblock, _ string, _ int) (*inode, error) {
+		dirPathLookup = func(_ io.ReaderAt, _ int64, _ *superblock, _ string, _ *safeio.SymlinkBudget) (*inode, error) {
 			return nil, errBoom
 		}
 		if _, err := pathLookup(rw, 0, sb, "/link"); !errors.Is(err, errBoom) {
 			t.Fatalf("expected recursive path lookup error %v, got %v", errBoom, err)
 		}
 
-		dirPathLookup = func(_ io.ReaderAt, _ int64, _ *superblock, p string, _ int) (*inode, error) {
+		dirPathLookup = func(_ io.ReaderAt, _ int64, _ *superblock, p string, _ *safeio.SymlinkBudget) (*inode, error) {
 			if p != "/target" {
 				t.Fatalf("unexpected symlink target path %q", p)
 			}

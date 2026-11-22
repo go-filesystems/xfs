@@ -9,6 +9,8 @@ import (
 	"math/bits"
 	"path"
 	"strings"
+
+	"github.com/go-volumes/safeio"
 )
 
 var dirReadInode = readInode
@@ -21,10 +23,10 @@ var dirReadRawBlock = readRawBlock
 var dirBlockReadDir = blockReadDir
 
 // dirPathLookup is the recursive symlink-resolution seam. It carries the
-// running symlink depth so the C4 loop bound holds across hops without a
-// shared global (which would race under the FS read lock). Tests may replace
-// it to intercept recursive resolution.
-var dirPathLookup func(r io.ReaderAt, partOff int64, sb *superblock, p string, depth int) (*inode, error)
+// per-lookup symlink budget (shared by every recursive hop of ONE lookup, never
+// a global, which would race under the FS read lock). Tests may replace it to
+// intercept recursive resolution.
+var dirPathLookup func(r io.ReaderAt, partOff int64, sb *superblock, p string, budget *safeio.SymlinkBudget) (*inode, error)
 
 func init() {
 	dirPathLookup = pathLookupResolve
@@ -41,13 +43,10 @@ const (
 // ErrNotFound is returned when a path component is not found.
 var ErrNotFound = errors.New("not found")
 
-// maxSymlinkDepth bounds the chain of symlinks pathLookup will follow before
-// giving up, matching the Linux MAXSYMLINKS limit. C4: a symlink that points
-// at itself (or a cycle of symlinks) would otherwise recurse without bound and
-// overflow the stack on a hostile image.
-const maxSymlinkDepth = 40
-
-// ErrSymlinkLoop is returned when symlink resolution exceeds maxSymlinkDepth.
+// ErrSymlinkLoop is returned when one path resolution follows more than
+// safeio.MaxSymlinks symbolic links in total (the Linux MAXSYMLINKS limit). The
+// budget is TOTAL, not depth: a link that resolves two further links, 40 levels
+// deep, would otherwise cost 2^38 lookups from a tiny image.
 var ErrSymlinkLoop = errors.New("xfs: too many levels of symbolic links")
 
 // notExistIfMissing marks a failed directory lookup as [io/fs.ErrNotExist],
@@ -73,20 +72,17 @@ func notExistIfMissing(err error) error {
 }
 
 // pathLookup resolves a slash-separated path and returns the inode. It begins a
-// fresh symlink-resolution chain (depth 0).
+// fresh symlink budget.
 func pathLookup(r io.ReaderAt, partOff int64, sb *superblock, p string) (*inode, error) {
-	return pathLookupResolve(r, partOff, sb, p, 0)
+	return pathLookupResolve(r, partOff, sb, p, safeio.NewSymlinkBudget(0))
 }
 
 // pathLookupResolve is the production symlink-following resolver bound to the
-// dirPathLookup hook. depth is the number of symlinks already followed to reach
-// this call; once it reaches maxSymlinkDepth the lookup fails with
-// ErrSymlinkLoop instead of recursing into a stack overflow (C4). depth is a
-// plain parameter, so concurrent lookups under the FS read lock do not race.
-func pathLookupResolve(r io.ReaderAt, partOff int64, sb *superblock, p string, depth int) (*inode, error) {
-	if depth >= maxSymlinkDepth {
-		return nil, ErrSymlinkLoop
-	}
+// dirPathLookup hook. budget counts every symlink followed by the whole lookup;
+// once it is spent the lookup fails with ErrSymlinkLoop (C4, and the fan-out
+// found by the 2026-11-22 audit). It is a per-lookup value, so concurrent
+// lookups under the FS read lock do not race.
+func pathLookupResolve(r io.ReaderAt, partOff int64, sb *superblock, p string, budget *safeio.SymlinkBudget) (*inode, error) {
 	p = path.Clean(p)
 	root, err := dirReadInode(r, partOff, sb, sb.rootIno)
 	if err != nil {
@@ -106,13 +102,16 @@ func pathLookupResolve(r io.ReaderAt, partOff int64, sb *superblock, p string, d
 		if err != nil {
 			return nil, fmt.Errorf("xfs: inode %d: %w", childIno, err)
 		}
-		// Follow symlinks, bounding the chain depth (C4).
+		// Follow symlinks, charging the shared budget (C4).
 		if child.isSymlink() {
+			if err := budget.Follow(); err != nil {
+				return nil, fmt.Errorf("%w: %w", ErrSymlinkLoop, err)
+			}
 			target, err := dirReadSymlinkTarget(r, partOff, sb, child)
 			if err != nil {
 				return nil, err
 			}
-			cur, err = dirPathLookup(r, partOff, sb, string(target), depth+1)
+			cur, err = dirPathLookup(r, partOff, sb, string(target), budget)
 			if err != nil {
 				return nil, err
 			}

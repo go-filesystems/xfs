@@ -78,6 +78,8 @@ each refused road):
 | Input | Bound |
 |---|---|
 | `di_size` for `ReadFile` / remote symlinks | the smallest of `di_nblocks` (+1 block), the superblock's `sb_dblocks`, and `DefaultMaxReadSize` (1 GiB; `fs.(interface{ SetMaxReadSize(int64) })` changes it). `di_nblocks` and `sb_dblocks` are themselves read from the image, so the read limit is what finally bounds the buffer; refused with `ErrTooLarge` |
+| symlinks followed in ONE path lookup | at most `safeio.MaxSymlinks` (40) in total, not only in depth: a chain `l0 -> l1/l1 -> ...` costs 2^n lookups otherwise; refused with `ErrSymlinkLoop` (`go-volumes/safeio` `SymlinkBudget`) |
+| directory tree walked by `DeleteDir` | checked without recursion before anything is changed: a directory entry naming an ancestor (cycle), a directory reachable twice, or nesting deeper than `safeio.MaxTreeDepth` is refused (`safeio.ErrCycle` / `ErrTooDeep`) instead of recursing for ever under the fs lock |
 | bmbt extent records (in-inode and B-tree) | records that overlap, in file offset or in physical blocks, are refused: each would make a reader read the same blocks again (8 overlapping records read the file 8 times) |
 | B-tree leaf `numrecs` | capped by the records the block actually holds |
 | allocation groups | the last AG must start inside the device; per-AG loops (free-space scans, superblock copies, inode allocation) run once per `agcount`, a 32-bit field of the image |
