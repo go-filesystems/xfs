@@ -91,9 +91,21 @@ func TestCheckDirTreeReportsReadErrors(t *testing.T) {
 	}
 }
 
-// Only directories are listed: the symlink /d/f must not be read as one.
+// Only directories are listed: an entry LABELLED a directory (ftype 2) whose
+// inode is the symlink /d/f must not be read as one.
 func TestCheckDirTreeListsOnlyDirectories(t *testing.T) {
 	w := checkTreeFS(t)
+	dIn, err := pathLookup(w.f, w.partOffset, w.sb, "/d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fIno, err := lookupInDir(w.f, w.partOffset, w.sb, dIn, "f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := addDirEntry(w.f, w.partOffset, w.sb, dIn, fIno, "bad", 2); err != nil {
+		t.Fatal(err)
+	}
 	oldD := deleteReadDir
 	t.Cleanup(func() { deleteReadDir = oldD })
 	calls := 0
