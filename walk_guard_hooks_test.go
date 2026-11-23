@@ -35,7 +35,7 @@ func TestCheckDirTreeStopsOnMissingParent(t *testing.T) {
 	oldP, oldL := deletePathLookup, deleteLookupInDir
 	t.Cleanup(func() { deletePathLookup, deleteLookupInDir = oldP, oldL })
 	deletePathLookup = func(io.ReaderAt, int64, *superblock, string) (*inode, error) {
-		return nil, errInjected
+		return stubInode(), errInjected
 	}
 	calls := 0
 	deleteLookupInDir = func(r io.ReaderAt, off int64, sb *superblock, in *inode, name string) (uint64, error) {
@@ -76,7 +76,7 @@ func TestCheckDirTreeReportsReadErrors(t *testing.T) {
 	t.Cleanup(func() { deleteReadInode, deleteReadDir = oldI, oldD })
 
 	deleteReadInode = func(io.ReaderAt, int64, *superblock, uint64) (*inode, error) {
-		return nil, errInjected
+		return stubInode(), errInjected
 	}
 	if err := checkDirTree(w.f, w.partOffset, w.sb, "/d"); !errors.Is(err, errInjected) {
 		t.Fatalf("inode read error: checkDirTree = %v, want the injected error", err)
