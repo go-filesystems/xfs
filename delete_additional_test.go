@@ -7,6 +7,25 @@ import (
 	"testing"
 )
 
+// removeSFEntryNoPanic calls removeSFEntry on a malformed inode and reports a
+// panic (an unchecked fork index) as a failed assertion, not as the end of the
+// test binary.
+func removeSFEntryNoPanic(t *testing.T, sb *superblock, in *inode, name string) (err error) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("removeSFEntry on a malformed fork panicked: %v", r)
+			err = errors.New("panicked")
+		}
+	}()
+	return removeSFEntry(newMemRW(0), 0, sb, in, name)
+}
+
+// stubInode is returned beside an injected error, so that a handler which
+// stopped checking that error fails an assertion on the result instead of
+// dereferencing a nil inode and ending the test binary by a panic.
+func stubInode() *inode { return newTestInode(1, 0x4000, inodeFmtLocal, 0) }
+
 func TestDeleteFileAdditional(t *testing.T) {
 	sb := defaultSB()
 	rw := newMemRW(0)
@@ -14,7 +33,7 @@ func TestDeleteFileAdditional(t *testing.T) {
 
 	t.Run("missing parent is idempotent", func(t *testing.T) {
 		oldLookup := deletePathLookup
-		deletePathLookup = func(io.ReaderAt, int64, *superblock, string) (*inode, error) { return nil, ErrNotFound }
+		deletePathLookup = func(io.ReaderAt, int64, *superblock, string) (*inode, error) { return stubInode(), ErrNotFound }
 		t.Cleanup(func() { deletePathLookup = oldLookup })
 
 		if err := deleteFile(rw, 0, sb, "/file"); err != nil {
@@ -24,7 +43,7 @@ func TestDeleteFileAdditional(t *testing.T) {
 
 	t.Run("parent lookup error", func(t *testing.T) {
 		oldLookup := deletePathLookup
-		deletePathLookup = func(io.ReaderAt, int64, *superblock, string) (*inode, error) { return nil, errBoom }
+		deletePathLookup = func(io.ReaderAt, int64, *superblock, string) (*inode, error) { return stubInode(), errBoom }
 		t.Cleanup(func() { deletePathLookup = oldLookup })
 
 		if err := deleteFile(rw, 0, sb, "/file"); !errors.Is(err, errBoom) {
@@ -53,7 +72,7 @@ func TestDeleteFileAdditional(t *testing.T) {
 		oldRead := deleteReadInode
 		deletePathLookup = func(io.ReaderAt, int64, *superblock, string) (*inode, error) { return parent, nil }
 		deleteLookupInDir = func(io.ReaderAt, int64, *superblock, *inode, string) (uint64, error) { return 99, nil }
-		deleteReadInode = func(io.ReaderAt, int64, *superblock, uint64) (*inode, error) { return nil, errBoom }
+		deleteReadInode = func(io.ReaderAt, int64, *superblock, uint64) (*inode, error) { return stubInode(), errBoom }
 		t.Cleanup(func() {
 			deletePathLookup = oldLookup
 			deleteLookupInDir = oldDir
@@ -363,11 +382,11 @@ func TestDeleteDirRemainingBranches(t *testing.T) {
 
 	t.Run("idempotent and lookup errors", func(t *testing.T) {
 		restoreDeleteHooks(t)
-		deletePathLookup = func(_ io.ReaderAt, _ int64, _ *superblock, _ string) (*inode, error) { return nil, ErrNotFound }
+		deletePathLookup = func(_ io.ReaderAt, _ int64, _ *superblock, _ string) (*inode, error) { return stubInode(), ErrNotFound }
 		if err := deleteDir(rw, 0, sb, "/dir"); err != nil {
 			t.Fatalf("deleteDir missing parent: %v", err)
 		}
-		deletePathLookup = func(_ io.ReaderAt, _ int64, _ *superblock, _ string) (*inode, error) { return nil, errBoom }
+		deletePathLookup = func(_ io.ReaderAt, _ int64, _ *superblock, _ string) (*inode, error) { return stubInode(), errBoom }
 		if err := deleteDir(rw, 0, sb, "/dir"); !errors.Is(err, errBoom) {
 			t.Fatalf("expected parent lookup error %v, got %v", errBoom, err)
 		}
@@ -390,7 +409,9 @@ func TestDeleteDirRemainingBranches(t *testing.T) {
 
 	t.Run("target read and type errors", func(t *testing.T) {
 		setBaseHooks(t, nil)
-		deleteReadInode = func(_ io.ReaderAt, _ int64, _ *superblock, _ uint64) (*inode, error) { return nil, errBoom }
+		deleteReadInode = func(_ io.ReaderAt, _ int64, _ *superblock, _ uint64) (*inode, error) {
+			return newTestInode(71, 0x8000, inodeFmtLocal, 0), errBoom // a non-directory: the mutant answers another error
+		}
 		if err := deleteDir(rw, 0, sb, "/dir"); !errors.Is(err, errBoom) {
 			t.Fatalf("expected readInode error %v, got %v", errBoom, err)
 		}
@@ -434,7 +455,7 @@ func TestDeleteDirRemainingBranches(t *testing.T) {
 		deletePathLookup = func(_ io.ReaderAt, _ int64, _ *superblock, _ string) (*inode, error) {
 			pathCalls++
 			if pathCalls == 2 {
-				return nil, errBoom
+				return parent, errBoom
 			}
 			return parent, nil
 		}
@@ -453,7 +474,7 @@ func TestDeleteDirRemainingBranches(t *testing.T) {
 		deleteReadInode = func(_ io.ReaderAt, _ int64, _ *superblock, _ uint64) (*inode, error) {
 			readCalls++
 			if readCalls == 2 {
-				return nil, errBoom
+				return targetDir, errBoom
 			}
 			return targetDir, nil
 		}
@@ -502,14 +523,14 @@ func TestDeleteDirectoryHelpersRemainingBranches(t *testing.T) {
 		restoreDeleteHooks(t)
 		short := newTestInode(80, 0x4000, inodeFmtLocal, 0)
 		short.raw = short.raw[:inodeCoreSize+1]
-		if err := removeSFEntry(newMemRW(0), 0, sb, short, "x"); !errors.Is(err, ErrNotFound) {
+		if err := removeSFEntryNoPanic(t, sb, short, "x"); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("expected ErrNotFound for short fork, got %v", err)
 		}
 
 		trunc := newTestInode(81, 0x4000, inodeFmtLocal, 0)
 		trunc.raw = trunc.raw[:inodeCoreSize+6]
 		trunc.dataFork()[0] = 1
-		if err := removeSFEntry(newMemRW(0), 0, sb, trunc, "x"); !errors.Is(err, ErrNotFound) {
+		if err := removeSFEntryNoPanic(t, sb, trunc, "x"); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("expected ErrNotFound for truncated entry, got %v", err)
 		}
 
